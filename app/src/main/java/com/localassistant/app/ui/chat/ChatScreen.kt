@@ -317,8 +317,21 @@ fun ChatScreen(
                                 }
                             }
 
-                            val finalText = fullResponse.toString().trim()
+                            var finalText = fullResponse.toString().trim()
                             val reasoningText = reasoningContent.toString().trim()
+                            // Hands-free: the user cannot read a screen, so an
+                            // answer worth nothing on the display is still worth
+                            // hearing something from. Speech filtering (forbidden
+                            // characters, emoji) can also leave an otherwise fine
+                            // reply empty - either way, the silence gets a voice.
+                            val speakableText = if (settings.forbidNonLatinTts) finalText.filter { c ->
+                                c.isWhitespace() || c.code < 0x250
+                            }.trim() else finalText
+                            if (viewModel.dialogState.value.isVoiceCall &&
+                                (finalText.isEmpty() || speakableText.isEmpty())) {
+                                android.util.Log.d("ChatScreen", "LLM gave nothing speakable (${finalText.length} chars raw), filling with a spoken fallback")
+                                finalText = "Hmm, I'm not sure what to say to that."
+                            }
                             android.util.Log.d("ChatScreen", "Voice LLM response: ${finalText.length} chars, reasoning: ${reasoningText.length} chars")
 
                             withContext(Dispatchers.Main) {
