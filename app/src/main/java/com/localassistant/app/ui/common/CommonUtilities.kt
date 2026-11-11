@@ -827,10 +827,29 @@ fun beginCommunicationCapture(context: Context): (() -> Unit)? {
     // A2DP choice onto a real headset input is the whole point.
     try {
         audioManager.setCommunicationDevice(preferred)
-        // Routing is asynchronous on most builds, so the recorder is given a
-        // beat to start on the routed device instead of the phone mic.
-        Thread.sleep(150)
-        android.util.Log.d("VAD", "Communication route set: type=${preferred.type}")
+        // Routing is asynchronous and on Bluetooth it is not instant: the SCO
+        // link itself has to be established, which can take a second or two
+        // from a cold start. A fixed sleep races that link - the recorder would
+        // open on the phone mic, miss the first words, and only later turn on
+        // the headset. So poll until the route is actually reported active,
+        // with a generous cap; falling through just means the recorder starts
+        // a moment before the route lands rather than never.
+        val startedAt = System.currentTimeMillis()
+        val deadline = startedAt + 3000
+        var routed = false
+        while (System.currentTimeMillis() < deadline) {
+            val active = try { audioManager.getCommunicationDevice() } catch (e: Exception) { null }
+            if (active != null && active.type == preferred.type) {
+                routed = true
+                break
+            }
+            Thread.sleep(50)
+        }
+        android.util.Log.d(
+            "VAD",
+            "Communication route set: type=${preferred.type} routed=$routed " +
+                "waited=${System.currentTimeMillis() - startedAt}ms"
+        )
     } catch (e: Exception) {
         android.util.Log.w("VAD", "Could not set communication route: ${e.message}")
         return null
