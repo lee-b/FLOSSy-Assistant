@@ -1016,10 +1016,12 @@ fun beginCommunicationCapture(context: Context): (() -> Unit)? {
 fun playWaitingCue(): Boolean {
     val durationMs = 450
     val samples = FloatArray(WAITING_CUE_SAMPLE_RATE * durationMs / 1000)
-    // Three quick ticks, rising in pitch and dropping in level: tip, tip, tip.
-    addSoftTick(samples, 0, 60, 1900.0f, 0.06f)
-    addSoftTick(samples, 140, 60, 2300.0f, 0.05f)
-    addSoftTick(samples, 290, 60, 2800.0f, 0.04f)
+    // Three quick ticks, rising in pitch and dropping in level: tip, tip,
+    // tip. Kept subtle - about a third of the first version's loudness and
+    // a warmer pitch, so the cue sits in the background instead of beeping.
+    addSoftTick(samples, 0, 60, 1200.0f, 0.02f)
+    addSoftTick(samples, 140, 60, 1450.0f, 0.016f)
+    addSoftTick(samples, 290, 60, 1750.0f, 0.013f)
 
     val pcm = ByteArray(samples.size * 2)
     samples.forEachIndexed { index, value ->
