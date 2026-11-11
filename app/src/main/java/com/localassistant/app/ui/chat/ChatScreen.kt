@@ -41,6 +41,9 @@ import com.localassistant.app.ui.common.formatRelativeTime
 import com.localassistant.app.ui.common.isNonSpeechTranscript
 import com.localassistant.app.ui.common.loadPinnedMessages
 import com.localassistant.app.ui.common.playTTSAudio
+import com.localassistant.app.domain.model.DialogMode
+import com.localassistant.app.domain.model.DialogState
+import com.localassistant.app.domain.model.VoiceCallPhase
 import com.localassistant.app.ui.common.recordAudioWithVAD
 import com.localassistant.app.ui.common.shareMessage
 import kotlinx.coroutines.Dispatchers
@@ -66,7 +69,7 @@ fun ChatScreen(
     viewModel: ChatViewModel = viewModel()
 ) {
     val messages by viewModel.messages.collectAsState()
-    val serviceState by viewModel.serviceState.collectAsState()
+    val dialogState by viewModel.dialogState.collectAsState()
     val connectionWaiting by viewModel.connectionWaiting.collectAsState()
     val settings by viewModel.settings.collectAsState()
     
@@ -77,15 +80,15 @@ fun ChatScreen(
     val isSendingText by viewModel.isSendingText.collectAsState()
     val streamingContent = viewModel.streamingContent.collectAsState()
     val streamingReasoning = viewModel.streamingReasoning.collectAsState()
-    var isRecording by remember { mutableStateOf(false) }
+    // The dialog's mode and phase come from the one typed state machine; the
+    // recording/speaking flags the screen used to keep separately are derived
+    // from it, so they cannot disagree with the mode they belong to.
+    val isRecording = dialogState.isListening
+    val isTtsPlaying = dialogState.isSpeaking
+    val voiceCallMode = dialogState.isVoiceCall
     var showMenu by remember { mutableStateOf(false) }
     var menuExpanded by remember { mutableStateOf(false) }
     var lastAssistantMessage by remember { mutableStateOf<String?>(null) }
-    var isTtsPlaying by remember { mutableStateOf(false) }
-    // Voice call mode: the conversation runs hands-free (the mic re-arms after
-    // every reply and a misheard request is answered by voice). A tap on the
-    // mic ends the call and the app falls back to plain text messaging.
-    var voiceCallMode by remember { mutableStateOf(false) }
     var recordedAudioBytes by remember { mutableStateOf<ByteArray?>(null) }
     var isRecordingActive by remember { mutableStateOf(false) }
     val recordingStopSignal = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -130,7 +133,10 @@ fun ChatScreen(
                 coroutineScope.launch {
                     android.util.Log.d("ChatScreen", "Auto-playing TTS for completed message: ${lastMsg.content.take(50)}")
                     ttsAbortSignal.set(false)
-                    isTtsPlaying = true
+                    // Speaking is a phase of the call, not a separate flag -
+                    // but only a call speaks through this path; text-chat TTS
+                    // leaves the phase alone.
+                    if (viewModel.dialogState.value.isVoiceCall) viewModel.setDialogPhase(VoiceCallPhase.SPEAKING)
                     try {
                         playTTSAudio(
                             lastMsg.content,
@@ -143,7 +149,7 @@ fun ChatScreen(
                             abortSignal = ttsAbortSignal
                         )
                     } finally {
-                        isTtsPlaying = false
+                        if (viewModel.dialogState.value.isVoiceCall) viewModel.setDialogPhase(VoiceCallPhase.IDLE)
                     }
                     ttsPlayedMessageIndex = lastIdx
                 }
@@ -161,12 +167,13 @@ fun ChatScreen(
     // the large microphone on the empty-state screen, so both start the same
     // capture and the big icon is not decoration. Tapping either one again ends
     // the recording the same way.
-    fun startMicRecording() {
+    fun startMicRecording(announce: Boolean = true) {
         // A capture is already in flight - the re-arm after a spoken turn hands
         // back to this guard, and the user's own taps must not stack recorders.
-        if (isRecording) return
-        isRecording = true
-        voiceCallMode = true
+        if (viewModel.dialogState.value.isListening) return
+        // Opening the call is one typed transition; every derived flag falls
+        // out of it.
+        viewModel.setDialogState(DialogMode.VOICE_CALL, VoiceCallPhase.LISTENING)
         ttsAbortSignal.set(false)
         discardCurrentUtterance.set(false)
         // The background service would hear the same words and answer a second
@@ -189,10 +196,11 @@ fun ChatScreen(
 
         coroutineScope.launch {
             try {
-                viewModel.setServiceState("listening")
-
+                // The plop plays only when a call opens or closes - the re-arms
+                // between turns stay quiet, so the cues mark the call, not
+                // every turn inside it.
                 val wavBytes = withContext(Dispatchers.IO) {
-                    recordAudioWithVAD(context.applicationContext, recordingStopSignal)
+                    recordAudioWithVAD(context.applicationContext, recordingStopSignal, cue = announce)
                 }
 
                 if (wavBytes == null || wavBytes.isEmpty()) {
@@ -202,10 +210,10 @@ fun ChatScreen(
                     // to make, so the call quietly re-arms instead; only a
                     // blank transcript after real speech gets the spoken
                     // repeat prompt further down.
-                    if (voiceCallMode) {
+                    if (viewModel.dialogState.value.isVoiceCall) {
                         coroutineScope.launch {
                             delay(800)
-                            if (voiceCallMode) withContext(Dispatchers.Main) { startMicRecording() }
+                            if (viewModel.dialogState.value.isVoiceCall) withContext(Dispatchers.Main) { startMicRecording(announce = false) }
                         }
                     }
                     return@launch
@@ -216,13 +224,13 @@ fun ChatScreen(
                                                                  // Automatically process the recording after VAD stops
                 coroutineScope.launch {
                     try {
-                        viewModel.setServiceState("processing")
+                        viewModel.setDialogPhase(VoiceCallPhase.TRANSCRIBING)
 
                         // The user ended the call while this take was still being
                         // heard - the half-captured words are theirs to drop, not
                         // to send on to STT.
                         if (discardCurrentUtterance.get()) {
-                            viewModel.setServiceState("idle")
+                            viewModel.endVoiceCall()
                             return@launch
                         }
 
@@ -236,8 +244,6 @@ fun ChatScreen(
                             )
                         }
 
-                        isRecording = false
-
                         // whisper.cpp answers silence with markers like [BLANK_AUDIO]; they must not
                         // become a user message or reach the LLM (same guard as the other services).
                         val nonSpeech = isNonSpeechTranscript(transcribedText)
@@ -248,6 +254,7 @@ fun ChatScreen(
                         if (!nonSpeech && transcribedText.isNotBlank()) {
                             android.util.Log.d("ChatScreen", "STT result: $transcribedText")
                             viewModel.addMessage(com.localassistant.app.domain.model.MessageRole.USER, transcribedText)
+                            viewModel.setDialogPhase(VoiceCallPhase.THINKING)
 
                             var fullResponse = StringBuilder()
                             var reasoningContent = StringBuilder()
@@ -302,15 +309,14 @@ fun ChatScreen(
                                 // A voice call carries on: the answer is spoken
                                 // through the speaker, so the mic re-arms the
                                 // moment it has finished, like the wake chat.
-                                viewModel.setServiceState("idle")
-                                isRecording = false
-                                if (voiceCallMode) coroutineScope.launch {
+                                viewModel.setDialogPhase(VoiceCallPhase.IDLE)
+                                if (viewModel.dialogState.value.isVoiceCall) coroutineScope.launch {
                                     // The speaker is still ringing in the room
                                     // right after playback returns; a beat of
                                     // settle keeps the first capture from
                                     // hearing the answer's own echo.
                                     delay(500)
-                                    if (voiceCallMode) withContext(Dispatchers.Main) { startMicRecording() }
+                                    if (viewModel.dialogState.value.isVoiceCall) withContext(Dispatchers.Main) { startMicRecording(announce = false) }
                                 }
                             }
                         } else {
@@ -318,13 +324,12 @@ fun ChatScreen(
                             // spoken, not printed - the screen may be off or
                             // away, so a toast would never be seen.
                             withContext(Dispatchers.Main) {
-                                viewModel.setServiceState("idle")
-                                isRecording = false
+                                viewModel.setDialogPhase(VoiceCallPhase.IDLE)
                             }
-                            if (voiceCallMode) {
+                            if (viewModel.dialogState.value.isVoiceCall) {
                                 coroutineScope.launch {
                                     ttsAbortSignal.set(false)
-                                    isTtsPlaying = true
+                                    if (viewModel.dialogState.value.isVoiceCall) viewModel.setDialogPhase(VoiceCallPhase.SPEAKING)
                                     try {
                                         playTTSAudio(
                                             "Sorry, I misheard you. Please repeat.",
@@ -337,30 +342,28 @@ fun ChatScreen(
                                             abortSignal = ttsAbortSignal
                                         )
                                     } finally {
-                                        isTtsPlaying = false
+                                        if (viewModel.dialogState.value.isVoiceCall) viewModel.setDialogPhase(VoiceCallPhase.IDLE)
                                     }
                                 }
                                 coroutineScope.launch {
                                     // Re-arm the mic once the prompt has been spoken.
                                     delay(3000)
-                                    if (voiceCallMode) withContext(Dispatchers.Main) {
-                                        startMicRecording()
+                                    if (viewModel.dialogState.value.isVoiceCall) withContext(Dispatchers.Main) {
+                                        startMicRecording(announce = false)
                                     }
                                 }
                             }
                         }
                     } catch (e: Exception) {
                         withContext(Dispatchers.Main) {
-                            viewModel.setServiceState("idle")
-                            isRecording = false
+                            viewModel.setDialogPhase(VoiceCallPhase.IDLE)
                             android.util.Log.e("ChatScreen", "Voice interaction failed", e)
                             Toast.makeText(context.applicationContext, "Error: ${e.message}", Toast.LENGTH_LONG).show()
                         }
                     }
                 }
             } catch (e: Exception) {
-                viewModel.setServiceState("idle")
-                isRecording = false
+                viewModel.setDialogPhase(VoiceCallPhase.IDLE)
                 Toast.makeText(context.applicationContext, "Recording failed: ${e.message}", Toast.LENGTH_LONG).show()
             }
         }
@@ -371,7 +374,7 @@ fun ChatScreen(
      */
     fun stopMicRecording() {
         android.util.Log.d("ChatScreen", "Manual stop recording requested")
-        if (!isRecording) {
+        if (!viewModel.dialogState.value.isListening) {
             android.util.Log.w("ChatScreen", "Stop called but not recording!")
             return
         }
@@ -385,12 +388,12 @@ fun ChatScreen(
      */
     fun stopVoiceCall() {
         android.util.Log.d("ChatScreen", "Voice call ended by the mic button")
-        voiceCallMode = false
+        // One typed transition ends the call: the mode, its phase, the mic
+        // and the spoken output all fall away together.
+        viewModel.endVoiceCall()
         ttsAbortSignal.set(true)
-        isTtsPlaying = false
         discardCurrentUtterance.set(true)
         stopMicRecording()
-        viewModel.setServiceState("idle")
     }
 
     /**
@@ -400,8 +403,8 @@ fun ChatScreen(
      */
     fun onMicTapped() {
         when {
-            isTtsPlaying -> stopVoiceCall()
-            isRecording -> stopVoiceCall()
+            viewModel.dialogState.value.isSpeaking -> stopVoiceCall()
+            viewModel.dialogState.value.isListening -> stopVoiceCall()
             else -> startMicRecording()
         }
     }
@@ -431,12 +434,14 @@ fun ChatScreen(
         }
     }
 
-    // Track previous state to detect changes and play audio feedback tones
-    var prevState by remember { mutableStateOf<String?>(null) }
-    val currentState = serviceState.toString()
+    // Track the previous dialog state to detect changes and play audio feedback
+    // tones - the tones mark entering a call phase, so they key off the typed
+    // state and only sound inside a voice call.
+    var prevState by remember { mutableStateOf<DialogState?>(null) }
+    val currentState = dialogState
 
     LaunchedEffect(currentState) {
-        if (prevState != currentState && currentState in listOf("listening", "processing", "speaking")) {
+        if (prevState != currentState && currentState.isVoiceCall) {
             // Play a short beep using AudioTrack - no external resources needed
             try {
                 val audioManager = context.getSystemService(AudioManager::class.java)
@@ -606,7 +611,7 @@ fun ChatScreen(
             },
             bottomBar = {
                 VoiceControlsBar(
-                    serviceState = serviceState,
+                    dialogState = dialogState,
                     isSendingText = isSendingText,
                     connectionWaiting = connectionWaiting,
                     textInput = textInput,
@@ -614,7 +619,7 @@ fun ChatScreen(
                     onInputFocused = {
                         // Typing and voice capture are two ways of saying the same
                         // thing; the keyboard taking focus means the recording ends.
-                        if (isRecording) stopMicRecording()
+                        if (viewModel.dialogState.value.isListening) stopMicRecording()
                     },
                     onSendText = { text ->
                         if (text.isNotBlank()) {
@@ -627,7 +632,6 @@ fun ChatScreen(
                             textInput = ""
                         }
                     },
-                    isRecording = isRecording,
                     onStartRecording = {
                         onMicTapped()
                     },
@@ -1231,17 +1235,17 @@ internal fun StreamingResponseIndicator(
  */
 @Composable
 private fun VoiceControlsBar(
-    serviceState: String,
+    dialogState: DialogState,
     isSendingText: Boolean = false,
     connectionWaiting: Boolean = false,
     textInput: String = "",
     onTextInputChange: (String) -> Unit = {},
     onInputFocused: () -> Unit = {},
     onSendText: (String) -> Unit,
-    isRecording: Boolean = false,
     onStartRecording: () -> Unit = {},
     onStopRecording: () -> Unit = {}
 ) {
+    val isRecording = dialogState.isListening
 
     Surface(
         // The navigation bar insets have to be applied here: this is a custom
@@ -1265,9 +1269,10 @@ private fun VoiceControlsBar(
                 Text(
                     text = when {
                         connectionWaiting -> "Awaiting connection..."
-                        serviceState == "listening" -> "Listening..."
-                        serviceState == "processing" -> "Thinking..."
-                        serviceState == "speaking" -> "Speaking..."
+                        dialogState.phase == VoiceCallPhase.HEARD -> "Heard you..."
+                        dialogState.isListening -> "Listening..."
+                        dialogState.isThinking -> "Thinking..."
+                        dialogState.isSpeaking -> "Speaking..."
                         else -> ""
                     },
                     style = MaterialTheme.typography.bodySmall,
@@ -1294,7 +1299,7 @@ private fun VoiceControlsBar(
                             color = MaterialTheme.colorScheme.error
                         )
                     }
-                } else if (serviceState == "processing") {
+                } else if (dialogState.isThinking) {
                     CircularProgressIndicator(
                         modifier = Modifier.size(12.dp),
                         strokeWidth = 1.5.dp,
@@ -1346,20 +1351,9 @@ private fun VoiceControlsBar(
                     }
                 }
 
-                // Mic button - press to start, press again to stop and send
-                val micBackgroundColor = if (isRecording) {
-                    MaterialTheme.colorScheme.error
-                } else {
-                    MaterialTheme.colorScheme.primaryContainer
-                }
-
                 IconButton(
                     onClick = {
-                        if (!isRecording) {
-                            onStartRecording()
-                        } else {
-                            onStopRecording()
-                        }
+                        if (!isRecording) onStartRecording() else onStopRecording()
                     },
                     modifier = Modifier.size(40.dp)
                 ) {

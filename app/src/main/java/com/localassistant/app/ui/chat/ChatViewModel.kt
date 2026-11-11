@@ -13,7 +13,10 @@ import androidx.lifecycle.viewModelScope
 import com.localassistant.app.data.remote.ApiClient
 import com.localassistant.app.data.settings.SettingsRepository
 import com.localassistant.app.domain.model.ChatMessage
+import com.localassistant.app.domain.model.DialogMode
+import com.localassistant.app.domain.model.DialogState
 import com.localassistant.app.domain.model.MessageRole
+import com.localassistant.app.domain.model.VoiceCallPhase
 import com.localassistant.app.service.VoiceAssistantService
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
@@ -35,19 +38,38 @@ class ChatViewModel(application: android.app.Application) : AndroidViewModel(app
     private val _messages = MutableStateFlow<List<ChatMessage>>(emptyList())
     val messages: StateFlow<List<ChatMessage>> = _messages.asStateFlow()
     
-    // Voice assistant service state
-    private val _serviceState = MutableStateFlow("idle")
-    val serviceState: StateFlow<String> = _serviceState.asStateFlow()
+    // Dialog state - one typed machine instead of the stringly flags it used
+    // to be, so the mode and its phase can never disagree with each other.
+    private val _dialogState = MutableStateFlow(DialogState())
+    val dialogState: StateFlow<DialogState> = _dialogState.asStateFlow()
 
     // True while an LLM request is being retried after a 429: the API client
     // handles the backoff itself, the screen only has to say it once.
     val connectionWaiting: StateFlow<Boolean> = ApiClient.connectionWaiting
     
     /**
-     * Update the service state from outside (e.g., when voice recording starts/stops).
+     * Move the dialog into [mode]; in voice call mode it starts at [phase].
+     * In text-chat mode the phase is always IDLE - the phases belong to calls.
      */
-    fun setServiceState(state: String) {
-        _serviceState.value = state
+    fun setDialogState(mode: DialogMode, phase: VoiceCallPhase = VoiceCallPhase.IDLE) {
+        _dialogState.value = DialogState(mode, if (mode == DialogMode.VOICE_CALL) phase else VoiceCallPhase.IDLE)
+    }
+
+    /**
+     * Advance the phase within the current mode; a no-op in text-chat mode.
+     */
+    fun setDialogPhase(phase: VoiceCallPhase) {
+        val current = _dialogState.value
+        if (current.isVoiceCall) _dialogState.value = current.copy(phase = phase)
+    }
+
+    /**
+     * End a voice call: the mode drops back to text chat, and every part of
+     * the call that follows this state (End Call button, re-listening, spoken
+     * prompts) falls away with it in one place.
+     */
+    fun endVoiceCall() {
+        _dialogState.value = DialogState()
     }
 
     // Tracks whether a text message is currently being sent (for loading indicator)
@@ -108,10 +130,12 @@ class ChatViewModel(application: android.app.Application) : AndroidViewModel(app
     fun sendMessage(text: String, llmBaseUrl: String, apiKey: String?, model: String) {
         android.util.Log.d("ChatViewModel", "sendMessage called with text length: ${text.length}")
         addMessage(MessageRole.USER, text)
-        _serviceState.value = "processing"
         _isSendingText.value = true
         _streamingContent.value = ""
         _streamingReasoning.value = ""
+        // A text message is exactly that: text-chat mode. If a voice call was
+        // somehow still open, typing is the user choosing the keyboard.
+        _dialogState.value = DialogState()
 
         viewModelScope.launch {
             val contentBuilder = StringBuilder()
@@ -170,7 +194,6 @@ class ChatViewModel(application: android.app.Application) : AndroidViewModel(app
                 // Clear streaming state AFTER the final message is added
                 _streamingContent.value = ""
                 _streamingReasoning.value = ""
-                _serviceState.value = "idle"
                 _isSendingText.value = false
             }
         }
@@ -197,7 +220,7 @@ class ChatViewModel(application: android.app.Application) : AndroidViewModel(app
     fun startVoiceAssistant() {
         val intent = VoiceAssistantService.buildIntent(context, VoiceAssistantService.ACTION_START)
         context.startForegroundService(intent)
-        _serviceState.value = "listening"
+        _dialogState.value = DialogState(DialogMode.VOICE_CALL, VoiceCallPhase.LISTENING)
     }
     
     /**
@@ -206,7 +229,7 @@ class ChatViewModel(application: android.app.Application) : AndroidViewModel(app
     fun stopVoiceAssistant() {
         val intent = VoiceAssistantService.buildIntent(context, VoiceAssistantService.ACTION_STOP)
         context.startService(intent)
-        _serviceState.value = "idle"
+        _dialogState.value = DialogState()
     }
     
     /**

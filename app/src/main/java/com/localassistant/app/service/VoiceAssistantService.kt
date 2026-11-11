@@ -52,12 +52,15 @@ class VoiceAssistantService : Service() {
         const val ACTION_PAUSE = "com.localassistant.PAUSE"
         const val ACTION_RESUME = "com.localassistant.RESUME"
         
-        // Service states
-        const val STATE_IDLE = "idle"
-        const val STATE_LISTENING = "listening"
-        const val STATE_PROCESSING = "processing"
-        const val STATE_SPEAKING = "speaking"
-        const val STATE_ERROR = "error"
+        // Service states - the same typed phases the chat screen uses, so the
+        // background pipeline and the UI can never drift into different words
+        // for the same thing. There is no ERROR phase: a failure is a state of
+        // the whole pipeline, reported in the notification with its message,
+        // and the recovery below re-arms the loop from IDLE.
+        val STATE_IDLE = com.localassistant.app.domain.model.VoiceCallPhase.IDLE
+        val STATE_LISTENING = com.localassistant.app.domain.model.VoiceCallPhase.LISTENING
+        val STATE_PROCESSING = com.localassistant.app.domain.model.VoiceCallPhase.TRANSCRIBING
+        val STATE_SPEAKING = com.localassistant.app.domain.model.VoiceCallPhase.SPEAKING
         
         // Retry configuration for API calls
         private const val MAX_RETRIES = 3
@@ -89,7 +92,11 @@ class VoiceAssistantService : Service() {
 
     // Service state management - exposed as StateFlow for UI observation
     private val _state = MutableStateFlow(STATE_IDLE)
-    val state: StateFlow<String> = _state.asStateFlow()
+    val state: StateFlow<com.localassistant.app.domain.model.VoiceCallPhase> = _state.asStateFlow()
+    // Kept out of the phase: a failure is a state of the whole pipeline, and
+    // the notification needs the message, not the phase. Non-null marks an
+    // error recovery as pending.
+    private var errorText: String? = null
     
     private val _currentMessage = MutableStateFlow("")
     val currentMessage: StateFlow<String> = _currentMessage.asStateFlow()
@@ -379,8 +386,7 @@ class VoiceAssistantService : Service() {
                         }
                     }
                 } else {
-                    _state.value = STATE_ERROR
-                    throw RuntimeException("Failed to initialize audio recorder")
+                                        throw RuntimeException("Failed to initialize audio recorder")
                 }
             } catch (e: Exception) {
                 // The AudioRecord may already exist when a later step failed - native
@@ -388,8 +394,7 @@ class VoiceAssistantService : Service() {
                 audioRecord?.stop()
                 audioRecord?.release()
                 audioRecord = null
-                _state.value = STATE_ERROR
-                handleError(e.message ?: "Audio initialization failed")
+                                handleError(e.message ?: "Audio initialization failed")
             }
         }
     }
@@ -511,8 +516,7 @@ class VoiceAssistantService : Service() {
      */
     private fun checkNetworkAndHandle(): Boolean {
         if (!isNetworkAvailable()) {
-            _state.value = STATE_ERROR
-            updateNotification("⚠️ No network connection. Check your internet.")
+                        updateNotification("⚠️ No network connection. Check your internet.")
             android.util.Log.w("VoiceAssistantService", "API call attempted but no network available")
             scheduleErrorRecovery()
             return false
@@ -607,8 +611,7 @@ class VoiceAssistantService : Service() {
                     Thread.sleep(10)
                 }
             } catch (e: Exception) {
-                _state.value = STATE_ERROR
-                android.util.Log.e("VoiceAssistantService", "Audio processing error, restarting loop...", e)
+                                android.util.Log.e("VoiceAssistantService", "Audio processing error, restarting loop...", e)
                 updateNotification("Error: ${e.message}. Restarting...")
                 
                 // Brief pause before restart to avoid rapid crash loops
@@ -988,7 +991,7 @@ class VoiceAssistantService : Service() {
         notificationManager.createNotificationChannel(channel)
     }
 
-    private fun buildNotification(state: String): Notification {
+    private fun buildNotification(state: com.localassistant.app.domain.model.VoiceCallPhase): Notification {
         val intent = packageManager.getLaunchIntentForPackage(packageName)?.let { launchIntent ->
             PendingIntent.getActivity(
                 this, 0, launchIntent,
@@ -1019,19 +1022,17 @@ class VoiceAssistantService : Service() {
         notificationManager.notify(NOTIFICATION_ID, notification)
     }
 
-    private fun getStateText(state: String): String = when (state) {
+    private fun getStateText(state: com.localassistant.app.domain.model.VoiceCallPhase): String = when (state) {
         STATE_LISTENING -> "Listening..."
         STATE_PROCESSING -> "Processing..."
         STATE_SPEAKING -> "Speaking..."
-        STATE_ERROR -> "Error"
         else -> "Idle"
     }
 
     // ==================== Error Handling ====================
 
     private fun handleError(message: String) {
-        _state.value = STATE_ERROR
-        updateNotification("Error: $message")
+                updateNotification("Error: $message")
         scheduleErrorRecovery()
     }
 
@@ -1044,10 +1045,13 @@ class VoiceAssistantService : Service() {
         if (!serviceScope.isActive) return
         serviceScope.launch {
             delay(3000L)
-            if (_state.value == STATE_ERROR) {
+            // Only a pipeline that just failed is recovered - a plain IDLE
+            // means nothing went wrong and there is nothing to re-arm.
+            if (_state.value == STATE_IDLE && errorText != null) {
                 val resume = recordingThread?.isAlive() == true
                 _state.value = if (resume) STATE_LISTENING else STATE_IDLE
                 updateNotification(if (resume) "Listening..." else "Idle")
+                errorText = null
             }
         }
     }

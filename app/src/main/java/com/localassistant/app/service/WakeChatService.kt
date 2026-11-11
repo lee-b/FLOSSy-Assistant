@@ -74,12 +74,17 @@ class WakeChatService : VoiceInteractionService() {
         const val ACTION_TRIGGER_EXCHANGE = "com.localassistant.TRIGGER_WAKE_CHAT"
 
         // Phases an exchange is in
-        const val PHASE_IDLE = "idle"
-        const val PHASE_DETECTING = "detecting"
-        const val PHASE_LISTENING = "listening"
-        const val PHASE_THINKING = "thinking"
-        const val PHASE_SPEAKING = "speaking"
-        const val PHASE_ERROR = "error"
+        // The wake chat's exchange phases are the same typed phases the chat
+        // screen and the assistant service use, so all three pipelines speak
+        // one language. DETECTING maps to LISTENING (the mic is up, waiting
+        // for speech) and LISTENING maps to HEARD (the phrase matched, the
+        // request is being waited for); there is no ERROR phase - failures
+        // ride the status message, and the phase keeps doing its job.
+        val PHASE_IDLE = com.localassistant.app.domain.model.VoiceCallPhase.IDLE
+        val PHASE_DETECTING = com.localassistant.app.domain.model.VoiceCallPhase.LISTENING
+        val PHASE_LISTENING = com.localassistant.app.domain.model.VoiceCallPhase.HEARD
+        val PHASE_THINKING = com.localassistant.app.domain.model.VoiceCallPhase.THINKING
+        val PHASE_SPEAKING = com.localassistant.app.domain.model.VoiceCallPhase.SPEAKING
 
         // How many of the newest wake-chat turns are sent to the LLM as context.
         // Deliberately small: a follow-up turn re-sends the whole history, so the
@@ -155,7 +160,7 @@ class WakeChatService : VoiceInteractionService() {
         private val _lastActivity = MutableStateFlow(System.currentTimeMillis())
 
         val messages: StateFlow<List<ChatMessage>> = _messages.asStateFlow()
-        val phase: StateFlow<String> = _phase.asStateFlow()
+        val phase: StateFlow<com.localassistant.app.domain.model.VoiceCallPhase> = _phase.asStateFlow()
         val statusMessage: StateFlow<String> = _statusMessage.asStateFlow()
 
         /**
@@ -367,7 +372,7 @@ class WakeChatService : VoiceInteractionService() {
     }
 
     override fun onShowSessionFailed(args: android.os.Bundle) {
-        _phase.value = PHASE_ERROR
+        // Failures ride the status message; the phase keeps doing its job.
         _statusMessage.value = "The voice session could not be shown"
         updateNotification("The voice session could not be shown")
     }
@@ -1107,7 +1112,7 @@ class WakeChatService : VoiceInteractionService() {
         notificationManager.createNotificationChannel(channel)
     }
 
-    private fun buildNotification(phase: String): Notification {
+    private fun buildNotification(phase: com.localassistant.app.domain.model.VoiceCallPhase): Notification {
         val intent = packageManager.getLaunchIntentForPackage(packageName)?.let { launchIntent ->
             PendingIntent.getActivity(
                 this, 0, launchIntent,
@@ -1147,12 +1152,11 @@ class WakeChatService : VoiceInteractionService() {
         notificationManager.notify(NOTIFICATION_ID, notification)
     }
 
-    private fun getPhaseText(phase: String): String = when (phase) {
+    private fun getPhaseText(phase: com.localassistant.app.domain.model.VoiceCallPhase): String = when (phase) {
         PHASE_DETECTING -> "Listening for the wake word"
         PHASE_LISTENING -> "Heard it - go ahead"
         PHASE_THINKING -> "Thinking..."
         PHASE_SPEAKING -> "Speaking..."
-        PHASE_ERROR -> "Something went wrong"
         else -> "Idle"
     }
 
