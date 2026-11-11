@@ -129,16 +129,28 @@ fun ChatScreen(
         // scrolling back through the reply, which made the list unscrollable
         // exactly while a response was playing.
         if (layout.totalItemsCount > 0 && lazyListState.isNearBottom()) {
-            // Scroll by the distance the last item's bottom sits below the
-            // viewport bottom, not by item index: an absolute jump pins an
-            // item's *top*, so every line a growing response added past its
-            // previous end fell below the fold. Re-reading the layout each
-            // recomposition chases the bottom as the reply grows.
             val lastVisible = layout.visibleItemsInfo.lastOrNull() ?: return@LaunchedEffect
-            val overflow = lastVisible.offset + lastVisible.size - layout.viewportSize.height
-            if (overflow > 0) {
-                lazyListState.scroll {
-                    scrollBy(overflow.toFloat())
+            if (lastVisible.index < layout.totalItemsCount - 1) {
+                // The bottom item is entirely off-screen - LazyList only lays
+                // out what is visible, so no overflow is computable here and
+                // the old overflow-only check could never take the first step
+                // (nothing overflows, so nothing scrolls, so nothing ever
+                // becomes visible). Pull the last item into view once; its
+                // position clamps to the bottom when it is short, and pins
+                // its top when it is tall - which the branch below then
+                // chases on the next recomposition.
+                lazyListState.scrollToItem(layout.totalItemsCount - 1)
+            } else {
+                // Scroll by the distance the last item's bottom sits below the
+                // viewport bottom, not by item index: an absolute jump pins an
+                // item's *top*, so every line a growing response added past its
+                // previous end fell below the fold. Re-reading the layout each
+                // recomposition chases the bottom as the reply grows.
+                val overflow = lastVisible.offset + lastVisible.size - layout.viewportSize.height
+                if (overflow > 0) {
+                    lazyListState.scroll {
+                        scrollBy(overflow.toFloat())
+                    }
                 }
             }
         }
