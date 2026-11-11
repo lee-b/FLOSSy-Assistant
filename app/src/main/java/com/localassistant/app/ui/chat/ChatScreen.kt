@@ -44,6 +44,7 @@ import com.localassistant.app.ui.common.playTTSAudio
 import com.localassistant.app.ui.common.recordAudioWithVAD
 import com.localassistant.app.ui.common.shareMessage
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -145,6 +146,9 @@ fun ChatScreen(
     // capture and the big icon is not decoration. Tapping either one again ends
     // the recording the same way.
     fun startMicRecording() {
+        // A capture is already in flight - the re-arm after a spoken turn hands
+        // back to this guard, and the user's own taps must not stack recorders.
+        if (isRecording) return
         isRecording = true
         recordedAudioBytes = null
         recordingStopSignal.set(false)
@@ -158,8 +162,24 @@ fun ChatScreen(
                 }
 
                 if (wavBytes == null || wavBytes.isEmpty()) {
-                    Toast.makeText(context.applicationContext, "Failed to record audio", Toast.LENGTH_SHORT).show()
-                    isRecording = false
+                    // The recorder answers nothing when the mic cannot run at
+                    // all; hands-free means spoken, so the failure is voiced
+                    // like a misheard request.
+                    coroutineScope.launch {
+                        playTTSAudio(
+                            "Sorry, I could not hear you. Please repeat.",
+                            Pair(settings.ttsBaseUrl, if (settings.ttsApiKey.isBlank()) null else settings.ttsApiKey),
+                            model = settings.ttsModelName,
+                            voice = settings.ttsVoiceName,
+                            responseFormat = settings.ttsResponseFormat,
+                            enableStreaming = settings.enableTtsStreaming,
+                            timeoutSeconds = settings.httpTimeoutSeconds.toLong()
+                        )
+                    }
+                    coroutineScope.launch {
+                        delay(3000)
+                        withContext(Dispatchers.Main) { startMicRecording() }
+                    }
                     return@launch
                 }
 
@@ -243,12 +263,38 @@ fun ChatScreen(
                                 if (reasoningText.isNotEmpty()) {
                                     viewModel.updateStreamingReasoning("")
                                 }
+                                // A voice call carries on: the answer is spoken
+                                // through the speaker, so the mic re-arms the
+                                // moment it has finished, like the wake chat.
                                 viewModel.setServiceState("idle")
+                                isRecording = false
+                                startMicRecording()
                             }
                         } else {
+                            // Nothing intelligible came back: hands-free means
+                            // spoken, not printed - the screen may be off or
+                            // away, so a toast would never be seen.
                             withContext(Dispatchers.Main) {
                                 viewModel.setServiceState("idle")
-                                Toast.makeText(context.applicationContext, "Could not understand speech", Toast.LENGTH_SHORT).show()
+                                isRecording = false
+                            }
+                            coroutineScope.launch {
+                                playTTSAudio(
+                                    "Sorry, I misheard you. Please repeat.",
+                                    Pair(settings.ttsBaseUrl, if (settings.ttsApiKey.isBlank()) null else settings.ttsApiKey),
+                                    model = settings.ttsModelName,
+                                    voice = settings.ttsVoiceName,
+                                    responseFormat = settings.ttsResponseFormat,
+                                    enableStreaming = settings.enableTtsStreaming,
+                                    timeoutSeconds = settings.httpTimeoutSeconds.toLong()
+                                )
+                            }
+                            coroutineScope.launch {
+                                // Re-arm the mic once the prompt has been spoken.
+                                delay(3000)
+                                withContext(Dispatchers.Main) {
+                                    startMicRecording()
+                                }
                             }
                         }
                     } catch (e: Exception) {
