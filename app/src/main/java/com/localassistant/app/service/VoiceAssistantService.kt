@@ -55,6 +55,12 @@ class VoiceAssistantService : Service() {
         // Ends the call from the notification: the same stop path a mic tap
         // takes, with the end-listen plop and the route closed.
         const val ACTION_END_CALL = "com.localassistant.END_CALL"
+
+        // Raised when the notification's End Call is tapped. During a call the
+        // screen owns the microphone, so the service cannot hang up alone - it
+        // raises the event and the chat screen (collecting it while visible)
+        // ends the call through the same path a mic tap takes.
+        val hangUpEvents = kotlinx.coroutines.flow.MutableSharedFlow<Unit>(extraBufferCapacity = 1)
         
         // Service states - the same typed phases the chat screen uses, so the
         // background pipeline and the UI can never drift into different words
@@ -294,9 +300,15 @@ class VoiceAssistantService : Service() {
             ACTION_PAUSE -> pauseService()
             ACTION_RESUME -> resumeService()
             ACTION_END_CALL -> {
-                stopListening()
-                stopForeground(android.app.Service.STOP_FOREGROUND_REMOVE)
-                stopSelf()
+                // Off the main thread: stopListening() waits for TTS and joins
+                // the recording thread, and doing that here froze the input
+                // dispatch long enough to ANR the app.
+                serviceScope.launch {
+                    hangUpEvents.tryEmit(Unit)
+                    stopListening()
+                    stopForeground(android.app.Service.STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }
             }
         }
         

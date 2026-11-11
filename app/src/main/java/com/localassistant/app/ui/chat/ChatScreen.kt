@@ -44,6 +44,7 @@ import com.localassistant.app.ui.common.playTTSAudio
 import com.localassistant.app.domain.model.DialogMode
 import com.localassistant.app.domain.model.DialogState
 import com.localassistant.app.domain.model.VoiceCallPhase
+import com.localassistant.app.ui.common.playListenEndCue
 import com.localassistant.app.ui.common.recordAudioWithVAD
 import com.localassistant.app.ui.common.shareMessage
 import kotlinx.coroutines.Dispatchers
@@ -394,6 +395,9 @@ fun ChatScreen(
         ttsAbortSignal.set(true)
         discardCurrentUtterance.set(true)
         stopMicRecording()
+        // The downbeat is the call's closing sound - it plays once, here,
+        // never between the turns inside the call.
+        playListenEndCue()
     }
 
     /**
@@ -406,6 +410,17 @@ fun ChatScreen(
             viewModel.dialogState.value.isSpeaking -> stopVoiceCall()
             viewModel.dialogState.value.isListening -> stopVoiceCall()
             else -> startMicRecording()
+        }
+    }
+
+    // The notification's End Call action reaches the screen here: during a
+    // call the screen owns the microphone, so the service alone cannot end
+    // the call - it raises the event, and the screen does the hanging up
+    // (ending the capture, cutting TTS, dropping the half-heard utterance).
+    LaunchedEffect(Unit) {
+        com.localassistant.app.service.VoiceAssistantService.hangUpEvents.collect {
+            android.util.Log.d("ChatScreen", "Voice call ended from the notification")
+            stopVoiceCall()
         }
     }
 
@@ -434,89 +449,6 @@ fun ChatScreen(
         }
     }
 
-    // Track the previous dialog state to detect changes and play audio feedback
-    // tones - the tones mark entering a call phase, so they key off the typed
-    // state and only sound inside a voice call.
-    var prevState by remember { mutableStateOf<DialogState?>(null) }
-    val currentState = dialogState
-
-    LaunchedEffect(currentState) {
-        if (prevState != currentState && currentState.isVoiceCall) {
-            // Play a short beep using AudioTrack - no external resources needed
-            try {
-                val audioManager = context.getSystemService(AudioManager::class.java)
-                val maxVol = audioManager?.getStreamMaxVolume(AudioManager.STREAM_MUSIC) ?: 15
-                val curVol = audioManager?.getStreamVolume(AudioManager.STREAM_MUSIC) ?: (maxVol / 2)
-                val volumeLevel = if (maxVol > 0) curVol.toFloat() / maxVol else 0.5f
-
-                // Generate beep tone data (800Hz, 100ms at 16kHz)
-                val sampleRate = 16000
-                val numSamples = (sampleRate * 0.1).toInt()
-                val buffer = ShortArray(numSamples)
-                for (i in 0 until numSamples) {
-                    val t = i.toFloat() / sampleRate
-                    val amplitude = Math.sin(2.0 * Math.PI * 800.0 * t.toDouble()) * volumeLevel * Short.MAX_VALUE.toDouble()
-                    buffer[i] = amplitude.toInt().coerceIn(-Short.MAX_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
-                }
-
-                var audioTrack: android.media.AudioTrack? = null
-                val rates = listOf(16000, 22050, 24000, 8000)
-                
-                for (rate in rates) {
-                    try {
-                        val minBufferSize = android.media.AudioTrack.getMinBufferSize(
-                            rate,
-                            AudioFormat.CHANNEL_OUT_MONO,
-                            AudioFormat.ENCODING_PCM_16BIT
-                        )
-                        
-                        if (minBufferSize <= 0) continue
-
-                        audioTrack = android.media.AudioTrack(
-                            AudioAttributes.Builder()
-                                .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
-                                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                                .build(),
-                            AudioFormat.Builder()
-                                .setSampleRate(rate)
-                                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                                .build(),
-                            minBufferSize * 4,
-                            android.media.AudioTrack.MODE_STREAM,
-                            0
-                        )
-
-                        if (audioTrack?.state != android.media.AudioTrack.STATE_INITIALIZED) {
-                            audioTrack?.release()
-                            audioTrack = null
-                            continue
-                        }
-
-                        // write() only works while the track is PLAYING, and the tone is
-                        // longer than the internal buffer, so write it in chunks and let
-                        // flush() wait for playback instead of stalling the frame.
-                        audioTrack.play()
-                        var toneWritten = 0
-                        while (toneWritten < numSamples) {
-                            val written = audioTrack.write(buffer, toneWritten, numSamples - toneWritten)
-                            if (written <= 0) break
-                            toneWritten += written
-                        }
-                        audioTrack.flush()
-                        audioTrack.stop()
-                        audioTrack.release()
-                        break
-                    } catch (e: Exception) {
-                        try { audioTrack?.release() } catch (_: Exception) {}
-                    }
-                }
-            } catch (e: Exception) {
-                android.util.Log.w("ChatScreen", "Audio feedback failed: ${e.message}")
-            }
-        }
-        prevState = currentState
-    }
 
     if (!hasPermissions) {
         PermissionDeniedScreen()
@@ -636,7 +568,7 @@ fun ChatScreen(
                         onMicTapped()
                     },
                     onStopRecording = {
-                        stopMicRecording()
+                        stopVoiceCall()
                     },
                 )
             }
