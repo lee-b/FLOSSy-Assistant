@@ -139,6 +139,133 @@ fun ChatScreen(
         pinnedMessages = loadPinnedMessages(context.applicationContext)
     }
 
+    // One recording routine shared by the small mic button on the input bar and
+    // the large microphone on the empty-state screen, so both start the same
+    // capture and the big icon is not decoration.
+    fun startMicRecording() {
+        isRecording = true
+        recordedAudioBytes = null
+        recordingStopSignal.set(false)
+
+        coroutineScope.launch {
+            try {
+                viewModel.setServiceState("listening")
+
+                val wavBytes = withContext(Dispatchers.IO) {
+                    recordAudioWithVAD(context.applicationContext, recordingStopSignal)
+                }
+
+                if (wavBytes == null || wavBytes.isEmpty()) {
+                    Toast.makeText(context.applicationContext, "Failed to record audio", Toast.LENGTH_SHORT).show()
+                    isRecording = false
+                    return@launch
+                }
+
+                recordedAudioBytes = wavBytes
+
+                                                                 // Automatically process the recording after VAD stops
+                coroutineScope.launch {
+                    try {
+                        viewModel.setServiceState("processing")
+
+                        val transcribedText = withContext(Dispatchers.IO) {
+                            com.localassistant.app.data.remote.ApiClient.transcribeAudio(
+                                baseUrl = settings.sttBaseUrl,
+                                apiKey = if (settings.sttApiKey.isBlank()) null else settings.sttApiKey,
+                                audioData = wavBytes,
+                                model = settings.sttModelName,
+                                timeoutSeconds = settings.httpTimeoutSeconds.toLong()
+                            )
+                        }
+
+                        isRecording = false
+
+                        // whisper.cpp answers silence with markers like [BLANK_AUDIO]; they must not
+                        // become a user message or reach the LLM (same guard as the other services).
+                        val nonSpeech = isNonSpeechTranscript(transcribedText)
+                        if (nonSpeech) {
+                            android.util.Log.d("ChatScreen", "Ignoring non-speech transcript: $transcribedText")
+                        }
+
+                        if (!nonSpeech && transcribedText.isNotBlank()) {
+                            android.util.Log.d("ChatScreen", "STT result: $transcribedText")
+                            viewModel.addMessage(com.localassistant.app.domain.model.MessageRole.USER, transcribedText)
+
+                            var fullResponse = StringBuilder()
+                            var reasoningContent = StringBuilder()
+
+                            withContext(Dispatchers.IO) {
+                                // Include the full conversation history for context
+                                val history = viewModel.messages.value.map { msg ->
+                                    mapOf("role" to msg.role.name.lowercase(), "content" to msg.content)
+                                }
+
+                                com.localassistant.app.data.remote.ApiClient.chatCompletion(
+                                    baseUrl = settings.llmBaseUrl,
+                                    apiKey = if (settings.llmApiKey.isBlank()) null else settings.llmApiKey,
+                                    messages = history,
+                                    model = settings.llmModelName,
+                                    stream = true,
+                                    maxTokens = settings.llmMaxTokens,
+                                    reasoningBudgetTokens = settings.llmReasoningBudgetTokens,
+                                    chatTemplateKwargs = settings.llmChatTemplateKwargs,
+                                    systemPrompt = settings.systemPrompt,
+                                    timeoutSeconds = settings.httpTimeoutSeconds.toLong()
+                                ) { chunk: String ->
+                                    if (chunk.startsWith("\u0001")) {
+                                        reasoningContent.append(chunk.substring(1))
+                                        viewModel.updateStreamingReasoning(reasoningContent.toString())
+                                    } else {
+                                        fullResponse.append(chunk)
+                                        viewModel.updateStreamingContent(fullResponse.toString())
+                                    }
+                                }
+                            }
+
+                            val finalText = fullResponse.toString().trim()
+                            val reasoningText = reasoningContent.toString().trim()
+                            android.util.Log.d("ChatScreen", "Voice LLM response: ${finalText.length} chars, reasoning: ${reasoningText.length} chars")
+
+                            withContext(Dispatchers.Main) {
+                                if (finalText.isNotEmpty()) {
+                                    viewModel.addMessage(
+                                        com.localassistant.app.domain.model.MessageRole.ASSISTANT,
+                                        finalText,
+                                        if (reasoningText.isNotEmpty()) reasoningText else null
+                                    )
+                                } else {
+                                    Toast.makeText(context, "No response from LLM", Toast.LENGTH_SHORT).show()
+                                }
+                                // Clear streaming state AFTER the final message is added
+                                viewModel.updateStreamingContent("")
+                                if (reasoningText.isNotEmpty()) {
+                                    viewModel.updateStreamingReasoning("")
+                                }
+                                viewModel.setServiceState("idle")
+                            }
+                        } else {
+                            withContext(Dispatchers.Main) {
+                                viewModel.setServiceState("idle")
+                                Toast.makeText(context.applicationContext, "Could not understand speech", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    } catch (e: Exception) {
+                        withContext(Dispatchers.Main) {
+                            viewModel.setServiceState("idle")
+                            isRecording = false
+                            android.util.Log.e("ChatScreen", "Voice interaction failed", e)
+                            Toast.makeText(context.applicationContext, "Error: ${e.message}", Toast.LENGTH_LONG).show()
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                viewModel.setServiceState("idle")
+                isRecording = false
+                Toast.makeText(context.applicationContext, "Recording failed: ${e.message}", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
     // Conversation summarization state - trigger when message count exceeds threshold
     var showSummarizedNotification by remember { mutableStateOf(false) }
 
@@ -348,127 +475,7 @@ fun ChatScreen(
                     },
                     isRecording = isRecording,
                     onStartRecording = {
-                        isRecording = true
-                        recordedAudioBytes = null
-                        recordingStopSignal.set(false)
-
-                        coroutineScope.launch {
-                            try {
-                                viewModel.setServiceState("listening")
-                                
-                                val wavBytes = withContext(Dispatchers.IO) {
-                                    recordAudioWithVAD(context.applicationContext, recordingStopSignal)
-                                }
-                                
-                                if (wavBytes == null || wavBytes.isEmpty()) {
-                                    Toast.makeText(context.applicationContext, "Failed to record audio", Toast.LENGTH_SHORT).show()
-                                    isRecording = false
-                                    return@launch
-                                }
-                                
-                                recordedAudioBytes = wavBytes
-                                
-                                                                 // Automatically process the recording after VAD stops
-                                coroutineScope.launch {
-                                    try {
-                                        viewModel.setServiceState("processing")
-
-                                        val transcribedText = withContext(Dispatchers.IO) {
-                                            com.localassistant.app.data.remote.ApiClient.transcribeAudio(
-                                                baseUrl = settings.sttBaseUrl,
-                                                apiKey = if (settings.sttApiKey.isBlank()) null else settings.sttApiKey,
-                                                audioData = wavBytes,
-                                                model = settings.sttModelName,
-                                                timeoutSeconds = settings.httpTimeoutSeconds.toLong()
-                                            )
-                                        }
-
-                                        isRecording = false
-
-                                        // whisper.cpp answers silence with markers like [BLANK_AUDIO]; they must not
-                                        // become a user message or reach the LLM (same guard as the other services).
-                                        val nonSpeech = isNonSpeechTranscript(transcribedText)
-                                        if (nonSpeech) {
-                                            android.util.Log.d("ChatScreen", "Ignoring non-speech transcript: $transcribedText")
-                                        }
-
-                                        if (!nonSpeech && transcribedText.isNotBlank()) {
-                                            android.util.Log.d("ChatScreen", "STT result: $transcribedText")
-                                            viewModel.addMessage(com.localassistant.app.domain.model.MessageRole.USER, transcribedText)
-
-                                            var fullResponse = StringBuilder()
-                                            var reasoningContent = StringBuilder()
-
-                                            withContext(Dispatchers.IO) {
-                                                // Include the full conversation history for context
-                                                val history = viewModel.messages.value.map { msg ->
-                                                    mapOf("role" to msg.role.name.lowercase(), "content" to msg.content)
-                                                }
-
-                                                com.localassistant.app.data.remote.ApiClient.chatCompletion(
-                                                    baseUrl = settings.llmBaseUrl,
-                                                    apiKey = if (settings.llmApiKey.isBlank()) null else settings.llmApiKey,
-                                                    messages = history,
-                                                    model = settings.llmModelName,
-                                                    stream = true,
-                                                    maxTokens = settings.llmMaxTokens,
-                                                    reasoningBudgetTokens = settings.llmReasoningBudgetTokens,
-                                                    chatTemplateKwargs = settings.llmChatTemplateKwargs,
-                                                    systemPrompt = settings.systemPrompt,
-                                                    timeoutSeconds = settings.httpTimeoutSeconds.toLong()
-                                                ) { chunk: String ->
-                                                    if (chunk.startsWith("\u0001")) {
-                                                        reasoningContent.append(chunk.substring(1))
-                                                        viewModel.updateStreamingReasoning(reasoningContent.toString())
-                                                    } else {
-                                                        fullResponse.append(chunk)
-                                                        viewModel.updateStreamingContent(fullResponse.toString())
-                                                    }
-                                                }
-                                            }
-
-                                            val finalText = fullResponse.toString().trim()
-                                            val reasoningText = reasoningContent.toString().trim()
-                                            android.util.Log.d("ChatScreen", "Voice LLM response: ${finalText.length} chars, reasoning: ${reasoningText.length} chars")
-
-                                            withContext(Dispatchers.Main) {
-                                                if (finalText.isNotEmpty()) {
-                                                    viewModel.addMessage(
-                                                        com.localassistant.app.domain.model.MessageRole.ASSISTANT,
-                                                        finalText,
-                                                        if (reasoningText.isNotEmpty()) reasoningText else null
-                                                    )
-                                                } else {
-                                                    Toast.makeText(context, "No response from LLM", Toast.LENGTH_SHORT).show()
-                                                }
-                                                // Clear streaming state AFTER the final message is added
-                                                viewModel.updateStreamingContent("")
-                                                if (reasoningText.isNotEmpty()) {
-                                                    viewModel.updateStreamingReasoning("")
-                                                }
-                                                viewModel.setServiceState("idle")
-                                            }
-                                        } else {
-                                            withContext(Dispatchers.Main) {
-                                                viewModel.setServiceState("idle")
-                                                Toast.makeText(context.applicationContext, "Could not understand speech", Toast.LENGTH_SHORT).show()
-                                            }
-                                        }
-                                    } catch (e: Exception) {
-                                        withContext(Dispatchers.Main) {
-                                            viewModel.setServiceState("idle")
-                                            isRecording = false
-                                            android.util.Log.e("ChatScreen", "Voice interaction failed", e)
-                                            Toast.makeText(context.applicationContext, "Error: ${e.message}", Toast.LENGTH_LONG).show()
-                                        }
-                                    }
-                                }
-                            } catch (e: Exception) {
-                                viewModel.setServiceState("idle")
-                                isRecording = false
-                                Toast.makeText(context.applicationContext, "Recording failed: ${e.message}", Toast.LENGTH_LONG).show()
-                            }
-                        }
+                        startMicRecording()
                     },
                     onStopRecording = {
                         android.util.Log.d("ChatScreen", "Manual stop recording requested")
@@ -508,13 +515,15 @@ fun ChatScreen(
                 if (messages.isEmpty()) {
                     Spacer(modifier = Modifier.weight(1f))
                     Box(
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { startMicRecording() },
                         contentAlignment = Alignment.Center
                     ) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
                             Icon(
                                 imageVector = Icons.Default.Mic,
-                                contentDescription = null,
+                                contentDescription = "Start recording",
                                 modifier = Modifier.size(64.dp),
                                 tint = MaterialTheme.colorScheme.primary
                             )
