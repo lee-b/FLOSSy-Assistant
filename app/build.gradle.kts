@@ -52,7 +52,8 @@ android {
 
 dependencies {
     // Core Android
-    implementation(libs.androidx.core.ktx)
+    // Runs the bundled Silero VAD model; NNAPI gives it the Pixel's NPU.
+    implementation(libs.onnxruntime.android)
     implementation(libs.material)
 
     // Compose BOM (Bill of Materials for consistent versions)

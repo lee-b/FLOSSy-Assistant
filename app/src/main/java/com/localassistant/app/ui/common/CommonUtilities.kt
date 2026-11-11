@@ -141,6 +141,9 @@ class StreamingCallCapture(
     private val context: android.content.Context,
     private val stopSignal: java.util.concurrent.atomic.AtomicBoolean,
     private val listeningGate: java.util.concurrent.atomic.AtomicBoolean,
+    // The bundled Silero network decides what is speech; one instance is
+    // shared by every capture in the process.
+    private val vad: SileroVad,
     private val onUtterance: (ByteArray) -> Unit
 ) {
     companion object {
@@ -203,59 +206,51 @@ class StreamingCallCapture(
 
     private fun run() {
         val rec = record ?: return
-        val buffer = ShortArray(SAMPLE_RATE / 8) // 80ms chunks
+        // Silero scores 512-sample (32ms) chunks, so the recorder reads 32ms
+        // at a time and every chunk goes through the network: a tap or a fan
+        // is "loud" but is not speech, and this is what tells them apart.
+        val buffer = ShortArray(SileroVad.CHUNK)
         val utterance = mutableListOf<Short>()
+        // One probability per accumulated chunk, parallel to [utterance]:
+        // the network's own speech scores, kept so the cut can be made on
+        // the neural decision instead of an energy span.
+        val utteranceProbs = mutableListOf<Float>()
         var inUtterance = false
         var silenceChunks = 0
-        var peakRms = 0
-        // The same adaptive floor as the per-turn recorder: a fixed gate
-        // cannot fit every device and every room, and a gate too low for the
-        // room turns noise into utterances that STT then mishears.
-        var noiseFloor = 12.0
-        val floorWindow = ArrayDeque<Int>()
-        val speechAboveFloor = 3.5
-        val minEnergy = 300
+        val stream = vad.Stream()
+        val chunkF = FloatArray(SileroVad.CHUNK)
         try {
             rec.startRecording()
             while (!stopSignal.get()) {
                 val read = rec.read(buffer, 0, buffer.size)
                 if (read <= 0) continue
-                var energy = 0.0
-                for (i in 0 until read) energy += buffer[i].toDouble() * buffer[i]
-                val rms = kotlin.math.sqrt(energy / read)
-                if (rms > peakRms) peakRms = rms.toInt()
-                // Track the room from the quietest recent chunk, like the
-                // per-turn recorder, and gate against it by factor.
-                floorWindow.add(rms.toInt())
-                if (floorWindow.size > 75) {
-                    val min = floorWindow.min()
-                    noiseFloor = noiseFloor * 0.7 + min * 0.3
-                    floorWindow.removeFirst()
-                }
-                val gate = maxOf(minEnergy, (noiseFloor * speechAboveFloor).toInt())
-                val voiced = rms > gate
+                for (i in 0 until read) chunkF[i] = buffer[i] / 32768f
+                val prob = stream.score(chunkF.copyOf(read))
 
                 // While the assistant speaks, this stream hears its own reply:
                 // the gate is closed and nothing here may become an utterance.
                 if (!listeningGate.get()) {
                     utterance.clear()
+                    utteranceProbs.clear()
                     inUtterance = false
                     silenceChunks = 0
                     continue
                 }
 
                 for (i in 0 until read) utterance.add(buffer[i])
-                if (voiced) {
+                utteranceProbs.add(prob)
+                if (prob >= SileroVad.START_PROB) {
                     silenceChunks = 0
                     inUtterance = true
                 } else if (inUtterance) {
-                    silenceChunks++
-                    // One chunk of silence closes the utterance; a short
-                    // span is noise, not a word.
-                    if (silenceChunks * 80 >= UTTERANCE_SILENCE_MS) {
-                        val clip = trimToWav(utterance)
+                    if (prob < SileroVad.END_PROB) silenceChunks++
+                    // Sustained quiet closes the utterance; the network saw
+                    // speech inside, so a short span is still cut by span.
+                    if (silenceChunks * 32 >= UTTERANCE_SILENCE_MS) {
+                        val clip = trimToWav(utterance, utteranceProbs)
                         if (clip != null) onUtterance(clip)
                         utterance.clear()
+                        utteranceProbs.clear()
                         inUtterance = false
                         silenceChunks = 0
                     }
@@ -267,22 +262,51 @@ class StreamingCallCapture(
             try { rec.stop() } catch (_: Exception) {}
             try { rec.release() } catch (_: Exception) {}
             restoreRoute?.invoke()
-            android.util.Log.d("VAD", "Streaming capture ended (peak RMS $peakRms)")
+            android.util.Log.d("VAD", "Streaming capture ended")
         }
     }
 
-    /** Cuts the utterance to its voiced span, as the per-turn recorder did. */
-    private fun trimToWav(samples: MutableList<Short>): ByteArray? {
-        val window = SAMPLE_RATE * 120 / 1000
-        val (from, to) = voicedSpan(samples, window, VOICED_TRIM_FRACTION)
-        if (to - from < SAMPLE_RATE / 4) {
-            android.util.Log.d("VAD", "Voiced span ${(to - from) / (SAMPLE_RATE / 1000)}ms is under 250ms, treating as noise")
+    /**
+     * Cuts the utterance to the span the network itself marked as speech,
+     * then rolls back and forward around that span: the clip keeps 300ms of
+     * lead rising out of the noise before the onset and 500ms of decay after
+     * it, so the word's first consonants are never clipped by the detector's
+     * own reaction time.
+     *
+     * [probs] holds one Silero probability per 32ms chunk of [samples],
+     * accumulated by the capture loop from the very first kept chunk - the
+     * pre-roll is implicit, since nothing is dropped before the cut.
+     */
+    private fun trimToWav(samples: MutableList<Short>, probs: List<Float>): ByteArray? {
+        val chunk = SileroVad.CHUNK
+        // The network's own span: onset is the first chunk it scored as
+        // speech, the offset is the last chunk it still counted as voiced
+        // (END_PROB is the "quiet counts toward ending" line, so anything
+        // at or above it is part of the word's decay).
+        val onset = probs.indexOfFirst { it >= SileroVad.START_PROB }
+        var fromSample = -1
+        var toSample = -1
+        if (onset >= 0) {
+            val offset = maxOf(onset, probs.indexOfLast { it >= SileroVad.END_PROB })
+            fromSample = onset * chunk
+            toSample = (offset + 1) * chunk
+        } else {
+            // The network marked nothing: fall back to the energy span, as
+            // the per-turn recorder cut, so one bad model run does not
+            // silently swallow a real utterance.
+            val window = SAMPLE_RATE * 120 / 1000
+            val (from, to) = voicedSpan(samples, window, VOICED_TRIM_FRACTION)
+            fromSample = from
+            toSample = to
+        }
+        if (toSample - fromSample < SAMPLE_RATE / 4) {
+            android.util.Log.d("VAD", "Speech span ${(toSample - fromSample) / (SAMPLE_RATE / 1000)}ms is under 250ms, treating as noise")
             return null
         }
         val lead = SAMPLE_RATE * 3 / 10
         val trail = SAMPLE_RATE / 2
-        val lo = maxOf(0, from - lead)
-        val hi = minOf(samples.size, to + trail)
+        val lo = maxOf(0, fromSample - lead)
+        val hi = minOf(samples.size, toSample + trail)
         val pcm = ByteArray((hi - lo) * 2)
         for (i in lo until hi) {
             val v = samples[i].toInt()

@@ -109,6 +109,9 @@ fun ChatScreen(
     // act: closed while the assistant speaks, so the mic never hears its own
     // reply as an utterance.
     val captureGate = java.util.concurrent.atomic.AtomicBoolean(true)
+    // Serializes exchanges: one utterance is being carried through STT ->
+    // LLM -> TTS at a time, so replies can never speak over each other.
+    val exchangeRunning = java.util.concurrent.atomic.AtomicBoolean(false)
     var streamingCapture: com.localassistant.app.ui.common.StreamingCallCapture? = null
     // Assigned once handleUtterance exists: the capture thread invokes this
     // to hand an utterance to the screen's pipeline.
@@ -126,6 +129,11 @@ fun ChatScreen(
         return job
     }
     val context = LocalContext.current
+    // The bundled Silero network: speech or not, whatever the device, the
+    // input or the room. Loaded once for the whole screen's lifetime.
+    val sileroVad = remember {
+        com.localassistant.app.ui.common.SileroVad(context.applicationContext)
+    }
     val lazyListState = rememberLazyListState()
 
     // Auto-scroll to bottom when new messages or streaming content arrives
@@ -249,10 +257,19 @@ fun ChatScreen(
         // and no re-arm that can silently fail.
         launchVoiceJob {
             if (announce) withContext(Dispatchers.IO) { playListenStartCue() }
+            // The call may have ended between the tap and this job's turn on
+            // the queue: a capture opened then would outlive the call, hear
+            // the room (or the reply's own echo) and keep trading utterances
+            // with a person who has already hung up.
+            if (!viewModel.dialogState.value.isVoiceCall || recordingStopSignal.get()) {
+                android.util.Log.d("ChatScreen", "Call ended before capture opened, not starting")
+                return@launchVoiceJob
+            }
             val capture = com.localassistant.app.ui.common.StreamingCallCapture(
                 context.applicationContext,
                 recordingStopSignal,
-                captureGate
+                captureGate,
+                sileroVad
             ) { clip ->
                 // Invoked on the capture thread: hop to the screen scope and
                 // carry the utterance through STT -> LLM -> TTS as before.
@@ -263,11 +280,12 @@ fun ChatScreen(
         }
     }
 
-    // The gate follows the phase: while the assistant speaks, the mic would
-    // hear its own reply, so VAD must not act; every other phase listens.
-    LaunchedEffect(dialogState.phase, dialogState.isVoiceCall) {
-        captureGate.set(!viewModel.dialogState.value.isSpeaking)
-    }
+    // One exchange at a time, and while one runs the gate is closed: the
+    // mic must not hear its own reply as a new utterance. Setting the gate
+    // here, on the exchange's own entry and exit, is race-free - a phase
+    // effect on recomposition can lag a frame and let the reply's first
+    // echo back in as a "new" utterance, which is exactly the overlap two
+    // concurrent exchanges used to produce.
 
     /**
      * Carries one complete utterance from the streaming capture through the
@@ -275,6 +293,14 @@ fun ChatScreen(
      * up cancels it mid-flight.
      */
     suspend fun handleUtterance(wavBytes: ByteArray) {
+        // A second utterance while one exchange runs is either self-echo or
+        // the user talking over the reply; both are dropped, and the capture
+        // keeps listening for the next real turn after this one ends.
+        if (!exchangeRunning.compareAndSet(false, true)) {
+            android.util.Log.d("ChatScreen", "Exchange already running, dropping the new utterance")
+            return
+        }
+        captureGate.set(false)
         try {
             viewModel.setDialogPhase(VoiceCallPhase.TRANSCRIBING)
 
@@ -419,6 +445,12 @@ fun ChatScreen(
                             Toast.makeText(context.applicationContext, "Error: ${e.message}", Toast.LENGTH_LONG).show()
                         }
                     }
+        finally {
+            exchangeRunning.set(false)
+            // Reopen only if the call is still on; a hung-up call has a
+            // closed capture, and a closed gate cannot hear anything.
+            captureGate.set(viewModel.dialogState.value.isVoiceCall)
+        }
     }
     // The capture thread has no Compose scope: it calls through this
     // property, which launchVoiceJob hops back onto the screen's scope.
@@ -431,10 +463,10 @@ fun ChatScreen(
      */
     fun stopMicRecording() {
         android.util.Log.d("ChatScreen", "Manual stop recording requested")
-        if (!viewModel.dialogState.value.isListening) {
-            android.util.Log.w("ChatScreen", "Stop called but not recording!")
-            return
-        }
+        // Set unconditionally: the capture may still be *opening* (its job
+        // queued behind the hang-up), and a signal set before it checks is
+        // the only thing standing between it and a capture that outlives
+        // the call.
         recordingStopSignal.set(true)
     }
 
