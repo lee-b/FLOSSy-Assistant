@@ -166,8 +166,11 @@ fun recordAudioWithVAD(
     var lastSpeechTime: Long = 0
     // This absolute energy only gates "did anything happen at all" and the
     // silence break. It must not decide where the utterance starts and ends:
-    // see voicedSpan, which cuts on the clip's own loudness instead.
-    val minEnergy = 800
+    // see voicedSpan, which cuts on the clip's own loudness instead. The old
+    // 800 sat above normal speech through a headset mic - whole sentences
+    // peaked under 500 RMS in the logs - so detection needed shouting, then
+    // stopping, before anything was heard.
+    val minEnergy = 300
     val recordingStart = System.currentTimeMillis()
 
     android.util.Log.d("VAD", "Starting recording with energy threshold $minEnergy...")
