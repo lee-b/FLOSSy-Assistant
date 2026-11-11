@@ -85,6 +85,10 @@ data class AppSettings(
     // Open the app as a live voice session: launching the app starts the voice
     // pipeline listening straight away instead of waiting for the mic button.
     val autoStartVoiceOnLaunch: Boolean = true,
+    // Swiping the app away from recents also closes the voice services when
+    // this is on; off leaves the hands-free listening alive, which is what a
+    // voice assistant needs to hear the wake phrase at any time.
+    val stopServicesOnTaskRemoved: Boolean = false,
     val batteryOptimizationExempted: Boolean = false,
     // Chat Display Settings
     val autoTtsEnabled: Boolean = true,

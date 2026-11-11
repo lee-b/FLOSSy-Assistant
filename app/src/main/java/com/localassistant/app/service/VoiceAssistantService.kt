@@ -77,6 +77,14 @@ class VoiceAssistantService : Service() {
                 this.action = action
             }
         }
+
+        /**
+         * True while the process hosts a live service. Callers that would only
+         * pause an already-running service check this first, because sending a
+         * command intent to a stopped service starts it fresh - and raising
+         * its foreground notification just to pause it would be absurd.
+         */
+        @JvmStatic var isRunning = false
     }
 
     // Service state management - exposed as StateFlow for UI observation
@@ -174,6 +182,7 @@ class VoiceAssistantService : Service() {
         
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification(STATE_IDLE))
+        isRunning = true
 
         // One "Awaiting connection..." per rate-limit episode, not per retry: the
         // client retries 429s internally on an exponential backoff, so the
@@ -1072,7 +1081,18 @@ class VoiceAssistantService : Service() {
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
-        // Don't stop foreground service when task is removed
+        // A voice assistant lives through the app being swiped away - the
+        // hands-free path is the whole point of a foreground service. The user
+        // can ask for the opposite with the swipe-away switch in the settings,
+        // and then the task being removed ends the listening instead.
+        val stop = runCatching { settingsRepository.loadSettings().stopServicesOnTaskRemoved }
+            .getOrDefault(false)
+        if (stop) {
+            android.util.Log.d("VoiceAssistantService", "Task removed: stopping the service as the settings ask")
+            stopListening()
+            stopForeground(android.app.Service.STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
     }
 
     /**
@@ -1083,6 +1103,7 @@ class VoiceAssistantService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         android.util.Log.d("VoiceAssistantService", "Service destroying - performing graceful shutdown")
+        isRunning = false
         try {
             unregisterReceiver(batteryReceiver)
         } catch (e: Exception) {

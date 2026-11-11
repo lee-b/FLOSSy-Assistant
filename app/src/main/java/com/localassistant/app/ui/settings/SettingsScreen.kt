@@ -372,6 +372,16 @@ fun SettingsScreen(onNavigateBack: () -> Unit, viewModel: SettingsViewModel = vi
                 // Launching the app is a voice interaction: the pipeline starts
                 // listening immediately rather than waiting for the mic button.
                 SettingSwitch("Voice on Launch", settings.autoStartVoiceOnLaunch, { viewModel.updateSetting("autoStartVoiceOnLaunch", it) })
+                SettingSwitch(
+                    "Close services when the app is swiped away",
+                    settings.stopServicesOnTaskRemoved,
+                    { viewModel.updateSetting("stopServicesOnTaskRemoved", it) }
+                )
+                Text(
+                    text = "Off keeps the voice services running after the app is swiped from recents - a voice assistant has to stay alive to hear the wake phrase. Turning this on ends the listening when the app is swiped away.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
 
             SettingsSection("Wake Word", "🔑", "Say the phrase to start a conversation without tapping") {

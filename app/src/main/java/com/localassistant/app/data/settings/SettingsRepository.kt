@@ -82,6 +82,7 @@ class SettingsRepository(private val context: Context) {
             enableForegroundService = sharedPreferences.getBoolean("enable_foreground_service", defaults.enableForegroundService),
             autoStartOnBoot = sharedPreferences.getBoolean("auto_start_on_boot", defaults.autoStartOnBoot),
             autoStartVoiceOnLaunch = sharedPreferences.getBoolean("auto_start_voice_on_launch", defaults.autoStartVoiceOnLaunch),
+            stopServicesOnTaskRemoved = sharedPreferences.getBoolean("stop_services_on_task_removed", defaults.stopServicesOnTaskRemoved),
             batteryOptimizationExempted = sharedPreferences.getInt("battery_optimization_exempted", if (defaults.batteryOptimizationExempted) 1 else 0) == 1,
             darkModeEnabled = sharedPreferences.getBoolean("dark_mode_enabled", defaults.darkModeEnabled),
 
@@ -139,6 +140,7 @@ class SettingsRepository(private val context: Context) {
             putBoolean("enable_foreground_service", settings.enableForegroundService)
             putBoolean("auto_start_on_boot", settings.autoStartOnBoot)
             putBoolean("auto_start_voice_on_launch", settings.autoStartVoiceOnLaunch)
+            putBoolean("stop_services_on_task_removed", settings.stopServicesOnTaskRemoved)
             putInt("battery_optimization_exempted", if (settings.batteryOptimizationExempted) 1 else 0)
             putBoolean("dark_mode_enabled", settings.darkModeEnabled)
 
@@ -265,6 +267,7 @@ class SettingsRepository(private val context: Context) {
         appendBool(sb, "enableForegroundService", settings.enableForegroundService)
         appendBool(sb, "autoStartOnBoot", settings.autoStartOnBoot)
         appendBool(sb, "autoStartVoiceOnLaunch", settings.autoStartVoiceOnLaunch)
+        appendBool(sb, "stopServicesOnTaskRemoved", settings.stopServicesOnTaskRemoved)
         appendBool(sb, "batteryOptimizationExempted", settings.batteryOptimizationExempted)
         appendBool(sb, "autoTtsEnabled", settings.autoTtsEnabled)
         appendBool(sb, "autoExpandReasoning", settings.autoExpandReasoning)
@@ -362,6 +365,7 @@ class SettingsRepository(private val context: Context) {
                 enableForegroundService = extractBool("enableForegroundService", base.enableForegroundService),
                 autoStartOnBoot = extractBool("autoStartOnBoot", base.autoStartOnBoot),
                 autoStartVoiceOnLaunch = extractBool("autoStartVoiceOnLaunch", base.autoStartVoiceOnLaunch),
+                stopServicesOnTaskRemoved = extractBool("stopServicesOnTaskRemoved", base.stopServicesOnTaskRemoved),
                 batteryOptimizationExempted = extractBool("batteryOptimizationExempted", base.batteryOptimizationExempted),
                 autoTtsEnabled = extractBool("autoTtsEnabled", base.autoTtsEnabled),
                 autoExpandReasoning = extractBool("autoExpandReasoning", base.autoExpandReasoning),

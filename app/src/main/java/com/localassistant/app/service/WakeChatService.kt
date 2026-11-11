@@ -1165,8 +1165,16 @@ class WakeChatService : VoiceInteractionService() {
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
-        // The whole point of this service is that minimizing the app must not stop
-        // the conversation, so the task being removed is deliberately ignored.
+        // Minimizing the app must not stop the conversation - that is the whole
+        // point of this service - so the task being removed is ignored unless
+        // the user asked for swipe-away to close the services too.
+        val stop = runCatching { SettingsRepository(applicationContext).loadSettings().stopServicesOnTaskRemoved }
+            .getOrDefault(false)
+        if (stop) {
+            android.util.Log.d("WakeChatService", "Task removed: stopping the service as the settings ask")
+            stopForeground(android.app.Service.STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
     }
 
     override fun onDestroy() {

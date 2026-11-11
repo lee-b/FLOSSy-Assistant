@@ -132,6 +132,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
             "autoStartOnBoot" -> _settings.update { it.copy(autoStartOnBoot = value as Boolean) }
             "darkModeEnabled" -> _settings.update { it.copy(darkModeEnabled = value as Boolean) }
             "autoStartVoiceOnLaunch" -> _settings.update { it.copy(autoStartVoiceOnLaunch = value as Boolean) }
+            "stopServicesOnTaskRemoved" -> _settings.update { it.copy(stopServicesOnTaskRemoved = value as Boolean) }
             "autoTtsEnabled" -> _settings.update { it.copy(autoTtsEnabled = value as Boolean) }
             "autoExpandReasoning" -> _settings.update { it.copy(autoExpandReasoning = value as Boolean) }
 
