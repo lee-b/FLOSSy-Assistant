@@ -1,5 +1,7 @@
 # Local Assistant - On-Device AI Voice Assistant
 
+<img src="docs/images/app-icon.webp" alt="Local Assistant logo" width="128" align="left" />
+
 A privacy-first, fully local AI voice assistant for Android that connects to your own running
 services. No cloud dependencies, no telemetry, no data leaves your device.
 
