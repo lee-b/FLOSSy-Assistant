@@ -123,23 +123,23 @@ fun ChatScreen(
     var ttsPlayedMessageIndex by remember { mutableIntStateOf(-1) }
 
     LaunchedEffect(messages.size, streamingContent.value, streamingReasoning.value, settings) {
-        val totalItems = lazyListState.layoutInfo.totalItemsCount
+        val layout = lazyListState.layoutInfo
         // Auto-scroll to the bottom only while the user is already near it -
         // chasing every streamed chunk would yank the list away from somebody
         // scrolling back through the reply, which made the list unscrollable
         // exactly while a response was playing.
-        if (totalItems > 0 && lazyListState.isNearBottom()) {
-            // Scrolling to the last item only pins its *top* at the viewport top, so
-            // every new streamed line of a growing response falls below the fold.
-            // Offsetting that item by its own overflow past the viewport puts its
-            // bottom at the bottom instead, which is where the newest text is.
-            val layout = lazyListState.layoutInfo
-            val lastIndex = totalItems - 1
-            val lastVisible = layout.visibleItemsInfo.lastOrNull()
-            if (lastVisible != null && lastVisible.index == lastIndex) {
-                lazyListState.animateScrollToItem(lastIndex, lastVisible.size - layout.viewportSize.height)
-            } else {
-                lazyListState.animateScrollToItem(lastIndex)
+        if (layout.totalItemsCount > 0 && lazyListState.isNearBottom()) {
+            // Scroll by the distance the last item's bottom sits below the
+            // viewport bottom, not by item index: an absolute jump pins an
+            // item's *top*, so every line a growing response added past its
+            // previous end fell below the fold. Re-reading the layout each
+            // recomposition chases the bottom as the reply grows.
+            val lastVisible = layout.visibleItemsInfo.lastOrNull() ?: return@LaunchedEffect
+            val overflow = lastVisible.offset + lastVisible.size - layout.viewportSize.height
+            if (overflow > 0) {
+                lazyListState.scroll {
+                    scrollBy(overflow.toFloat())
+                }
             }
         }
 

@@ -446,6 +446,115 @@ fun parseWavBytes(data: ByteArray): Pair<Int, ByteArray>? {
 }
 
 /**
+ * One AudioTrack carrying a whole reply.
+ *
+ * Per-chunk playback used to build and tear down a track for every sentence
+ * and drain each with a timed poll - which truncated long sentences, left a
+ * gap between sentences, and computed frames against a guessed rate. Here the
+ * reply's sentences are written into a single track: the blocking write is
+ * what throttles the pipeline, so the buffer stays primed and no sentence
+ * boundary is audible, and the track is drained once, against the frame count
+ * it actually received, at the end of the reply.
+ *
+ * @param abortSignal raised to cut the reply short mid-stream.
+ */
+class ReplyAudioPlayer(private val abortSignal: java.util.concurrent.atomic.AtomicBoolean?) {
+    private var track: android.media.AudioTrack? = null
+    private var rate: Int = 0
+    private var totalFrames: Long = 0
+    private var aborted: Boolean = false
+
+    /** Writes [byteCount] bytes of mono 16-bit PCM; false means stop (abort). */
+    fun write(pcmBytes: ByteArray, byteCount: Int, sampleRate: Int): Boolean {
+        if (aborted) return false
+        if (rate != sampleRate) {
+            drain()
+            open(sampleRate)
+            rate = sampleRate
+            if (track == null) return false
+        }
+        val t = track ?: return false
+        var written = 0
+        while (written < byteCount) {
+            if (abortSignal?.get() == true) {
+                cutNow()
+                aborted = true
+                return false
+            }
+            val toWrite = minOf(byteCount - written, 32768)
+            val n = try { t.write(pcmBytes, written, toWrite) } catch (e: Exception) { break }
+            if (n <= 0) break
+            written += n
+        }
+        totalFrames += written / 2
+        return true
+    }
+
+    /** End of the reply: play out what was written, then let the track go. */
+    fun finish() {
+        drain()
+    }
+
+    private fun open(sampleRate: Int) {
+        val channelMask = AudioFormat.CHANNEL_OUT_MONO
+        val minBuffer = android.media.AudioTrack.getMinBufferSize(sampleRate, channelMask, AudioFormat.ENCODING_PCM_16BIT)
+        if (minBuffer <= 0) return
+        track = android.media.AudioTrack(
+            android.media.AudioAttributes.Builder()
+                .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build(),
+            AudioFormat.Builder()
+                .setSampleRate(sampleRate)
+                .setChannelMask(channelMask)
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .build(),
+            minBuffer * 4,
+            android.media.AudioTrack.MODE_STREAM,
+            0
+        )
+        if (track?.state != android.media.AudioTrack.STATE_INITIALIZED) {
+            try { track?.release() } catch (_: Exception) {}
+            track = null
+            return
+        }
+        track?.play()
+    }
+
+    private fun drain() {
+        val t = track ?: return
+        try {
+            t.stop()
+            // The poll is only a release guard - its deadline is the audio's
+            // own length plus slack, and the frame count it waits for is the
+            // count the track actually received, so nothing is cut.
+            val drainMs = if (rate > 0) totalFrames * 1000 / rate + 500 else 500L
+            val deadline = System.currentTimeMillis() + drainMs
+            while (System.currentTimeMillis() < deadline) {
+                if (t.playbackHeadPosition >= totalFrames) break
+                Thread.sleep(20)
+            }
+        } catch (e: Exception) {
+            android.util.Log.w("TTS", "Drain failed: ${e.message}")
+        }
+        try { t.release() } catch (_: Exception) {}
+        track = null
+        totalFrames = 0
+    }
+
+    private fun cutNow() {
+        val t = track ?: return
+        try {
+            t.pause()
+            t.flush()
+        } catch (_: Exception) {}
+        try { t.release() } catch (_: Exception) {}
+        track = null
+        totalFrames = 0
+    }
+}
+
+/**
  * Plays raw 16-bit mono PCM audio through AudioTrack, blocking until playback
  * completes. Tries the preferred sample rate first, then falls back to common
  * rates for device compatibility.
@@ -456,8 +565,9 @@ fun parseWavBytes(data: ByteArray): Pair<Int, ByteArray>? {
  *   wake word can take over mid-reply.
  * @return true if any audio was played.
  */
-fun playPcmAudio(pcmBytes: ByteArray, sampleRate: Int, abortSignal: AtomicBoolean? = null): Boolean {
+fun playPcmAudio(pcmBytes: ByteArray, sampleRate: Int, abortSignal: AtomicBoolean? = null, player: ReplyAudioPlayer? = null): Boolean {
     if (pcmBytes.isEmpty()) return false
+    if (player != null) return player.write(pcmBytes, pcmBytes.size, sampleRate)
 
     val preferredRate = if (sampleRate in 8000..96000) sampleRate else 22050
     val rates = (listOf(preferredRate) + listOf(22050, 16000, 24000, 44100, 8000, 11025))
@@ -633,6 +743,11 @@ fun splitIntoSentences(text: String): List<String> {
          return
      }
 
+     // One track carries the whole reply - every sentence, however many -
+     // so sentence boundaries are inaudible and only one drain happens at
+     // the end.
+     val player = ReplyAudioPlayer(abortSignal)
+
      val ttsBaseUrl = ttsSettings.first!!
      val ttsApiKey = ttsSettings.second?.takeIf { it.isNotBlank() }
 
@@ -666,10 +781,11 @@ fun splitIntoSentences(text: String): List<String> {
                      android.util.Log.d("TTS", "Playback cut short by the wake word")
                      return
                  }
-                 if (chunk != null && chunk.isNotEmpty() && playAudioBytes(chunk, abortSignal)) {
+                 if (chunk != null && chunk.isNotEmpty() && playAudioBytes(chunk, abortSignal, player)) {
                      played = true
                  }
              }
+             player.finish()
              if (played) return
              android.util.Log.w("TTS", "Streaming playback failed, falling back to a single request")
          }
@@ -687,7 +803,10 @@ fun splitIntoSentences(text: String): List<String> {
              return
          }
 
-         if (playAudioBytes(audioBytes, abortSignal)) return
+         if (playAudioBytes(audioBytes, abortSignal, player)) {
+             player.finish()
+             return
+         }
 
          // Some endpoints advertise mp3 but only produce a container this device can
          // decode as wav, so retry once in the format the player is known to handle.
@@ -695,8 +814,9 @@ fun splitIntoSentences(text: String): List<String> {
              android.util.Log.w("TTS", "Could not play $responseFormat, retrying as wav")
              val wav = fetchTtsAudio(ttsBaseUrl, ttsApiKey, cleanText, model, null, "wav", timeoutSeconds)
              if (wav != null && wav.isNotEmpty()) {
-                 playAudioBytes(wav, abortSignal)
+                 playAudioBytes(wav, abortSignal, player)
              }
+             player.finish()
          }
      } catch (e: Exception) {
          android.util.Log.e("TTS", "TTS playback failed: ${e.message}", e)
@@ -886,18 +1006,20 @@ fun beginCommunicationCapture(context: Context): (() -> Unit)? {
 
 
 /**
- * Plays one soft "footstep" tick - the low, muted busy sound an online assistant
- * makes while it is still working. The connection retry loop plays one per
- * attempt, so at a two-second cadence the cue reads as footsteps pacing away and
- * back rather than as an alarm, and at lowish volume it never interrupts speech
- * or the TTS reply.
+ * Plays the busy cue: three light, quick "tippy-tap" ticks, like a small
+ * creature typing away at its work. Bright wood-block pitches rather than low
+ * thuds - the low footstep version read as an ominous heartbeat while the
+ * connection retried - and the rising tick-tick-tick reads as activity moving
+ * along, never as an alarm. At lowish volume it never interrupts speech or the
+ * TTS reply.
  */
 fun playWaitingCue(): Boolean {
     val durationMs = 450
     val samples = FloatArray(WAITING_CUE_SAMPLE_RATE * durationMs / 1000)
-    // Two muffled thuds, a pace apart: a low heel-toe rather than a beep.
-    addSoftStep(samples, 0, 130, 85.0f, 0.10f)
-    addSoftStep(samples, 250, 130, 70.0f, 0.08f)
+    // Three quick ticks, rising in pitch and dropping in level: tip, tip, tip.
+    addSoftTick(samples, 0, 60, 1900.0f, 0.06f)
+    addSoftTick(samples, 140, 60, 2300.0f, 0.05f)
+    addSoftTick(samples, 290, 60, 2800.0f, 0.04f)
 
     val pcm = ByteArray(samples.size * 2)
     samples.forEachIndexed { index, value ->
@@ -909,10 +1031,11 @@ fun playWaitingCue(): Boolean {
 }
 
 /**
- * Adds one muffled step to the buffer: a fast attack into an exponential decay
- * at a low frequency, so the tick sounds like a footfall rather than a tone.
+ * Adds one light tick to the buffer: a short sine blip at a bright frequency
+ * with a quick decay, so it sounds like a finger tapping wood rather than a
+ * tone or a thud.
  */
-private fun addSoftStep(
+private fun addSoftTick(
     samples: FloatArray,
     startMs: Int,
     durationMs: Int,
@@ -927,7 +1050,7 @@ private fun addSoftStep(
         // click, then decays like a struck drum - a constant amplitude would
         // sound like a beep instead of a footstep.
         val attack = minOf(1f, (t / 0.004).toFloat())
-        val fade = kotlin.math.exp(-t / (durationMs / 2500.0)).toFloat()
+        val fade = kotlin.math.exp(-t / (durationMs / 900.0)).toFloat()
         samples[index] += peak * attack * fade *
             kotlin.math.sin(2.0 * kotlin.math.PI * frequencyHz.toDouble() * t).toFloat()
     }
@@ -1027,7 +1150,7 @@ fun isNonSpeechTranscript(text: String): Boolean {
  *   played to the end, so the wake word can take over mid-reply.
  * @return true if audio was played.
  */
-suspend fun playAudioBytes(data: ByteArray, abortSignal: AtomicBoolean? = null): Boolean {
+suspend fun playAudioBytes(data: ByteArray, abortSignal: AtomicBoolean? = null, player: ReplyAudioPlayer? = null): Boolean {
     android.util.Log.e("TTS", "playAudioBytes: size=${data.size}")
     if (data.isEmpty()) return false
 
@@ -1044,11 +1167,11 @@ suspend fun playAudioBytes(data: ByteArray, abortSignal: AtomicBoolean? = null):
             // playing the header bytes as PCM at a guessed rate.
             return playMp3Audio(data, abortSignal)
         }
-        return playPcmAudio(parsed.second, parsed.first, abortSignal)
+        return playPcmAudio(parsed.second, parsed.first, abortSignal, player)
     }
 
     // MP3 / OGG / FLAC / other - decode via MediaCodec and play via AudioTrack.
-    return playMp3Audio(data, abortSignal)
+    return playMp3Audio(data, abortSignal, player)
 }
 
 /**
@@ -1059,13 +1182,14 @@ suspend fun playAudioBytes(data: ByteArray, abortSignal: AtomicBoolean? = null):
  *
  * @return true if audio was played.
  */
- private suspend fun playMp3Audio(data: ByteArray, abortSignal: AtomicBoolean? = null): Boolean =
+ private suspend fun playMp3Audio(data: ByteArray, abortSignal: AtomicBoolean? = null, player: ReplyAudioPlayer? = null): Boolean =
      withContext(Dispatchers.IO) {
          android.util.Log.e("TTS", "playMp3Audio: size=${data.size}")
          val firstBytes = data.take(12).joinToString(" ") { String.format("%02x", it) }
          android.util.Log.e("TTS", "first bytes: $firstBytes")
          var codec: android.media.MediaCodec? = null
         var track: android.media.AudioTrack? = null
+        var decodedRate = 24000
         try {
             val sampleRate = 24000
             val channelMask = AudioFormat.CHANNEL_OUT_MONO
@@ -1075,6 +1199,11 @@ suspend fun playAudioBytes(data: ByteArray, abortSignal: AtomicBoolean? = null):
                 .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                 .build()
 
+            // A shared ReplyAudioPlayer carries the sound across the whole
+            // reply, so this function only decodes into it and creates no
+            // track of its own. The guess rate stays only as a fallback when
+            // the decoder's output format declines to name one.
+            if (player == null) {
             val minBufferSize = android.media.AudioTrack.getMinBufferSize(
                 sampleRate, channelMask, AudioFormat.ENCODING_PCM_16BIT
             )
@@ -1094,6 +1223,7 @@ suspend fun playAudioBytes(data: ByteArray, abortSignal: AtomicBoolean? = null):
                 track.release()
                 track = null
                 return@withContext false
+            }
             }
 
             // List available decoders and find an MP3-compatible MIME type
@@ -1136,7 +1266,7 @@ suspend fun playAudioBytes(data: ByteArray, abortSignal: AtomicBoolean? = null):
             // dequeueInputBuffer answers "queue full" partway through and the rest of
             // the payload never reaches the decoder, which is what made a long mp3 reply
             // play as silence.
-            track.play()
+            track?.play()
             android.util.Log.e("TTS", "Track playing, starting feed/decode loop")
             val bufInfo = android.media.MediaCodec.BufferInfo()
             val outBuf = ByteArray(8192)
@@ -1174,11 +1304,23 @@ suspend fun playAudioBytes(data: ByteArray, abortSignal: AtomicBoolean? = null):
                         if (ob != null) {
                             ob.position(bufInfo.offset)
                             ob.limit(bufInfo.offset + bufInfo.size)
+                            // The decoder, not the container guess, names the
+                            // rate its PCM actually plays at - the hardcoded
+                            // guess here is what made the drain math cut long
+                            // sentences short.
+                            decodedRate = codec.outputFormat.getInteger(android.media.MediaFormat.KEY_SAMPLE_RATE, decodedRate)
                             var pos = 0
                             while (pos < bufInfo.size) {
                                 val chunk = minOf(outBuf.size, bufInfo.size - pos)
                                 ob.get(outBuf, 0, chunk)
-                                track.write(outBuf, 0, chunk)
+                                if (player != null) {
+                                    if (!player.write(outBuf, chunk, decodedRate)) {
+                                        codec.releaseOutputBuffer(idx, false)
+                                        return@withContext false
+                                    }
+                                } else {
+                                    track!!.write(outBuf, 0, chunk)
+                                }
                                 pos += chunk
                             }
                             totalWritten += bufInfo.size
@@ -1199,14 +1341,24 @@ suspend fun playAudioBytes(data: ByteArray, abortSignal: AtomicBoolean? = null):
                 "Feed/decode finished: fed=$offset/${data.size} bytes, chunks=$feedCount, pcm=$totalWritten"
             )
 
+            // The reply-level player drains once for the whole reply, so a
+            // per-chunk drain here would truncate every sentence again.
+            // A reply-level player drains once for the whole reply, so a
+            // per-chunk drain here would truncate every sentence again; its
+            // caller decides what a decode that produced nothing means.
+            if (player != null) {
+                codec.stop()
+                codec.release()
+                return@withContext true
+            }
             // An abort cuts the sound out of the speaker immediately - the
             // drain discipline below exists to protect a reply's tail, and an
             // abort exists to silence it, so it must not play out what was
             // already written.
             if (abortSignal?.get() == true) {
-                track.pause()
-                track.flush()
-                track.release()
+                track?.pause()
+                track?.flush()
+                track?.release()
                 codec.stop()
                 codec.release()
                 android.util.Log.d("TTS", "MediaCodec playback cut short by abort (written=$totalWritten)")
@@ -1216,17 +1368,19 @@ suspend fun playAudioBytes(data: ByteArray, abortSignal: AtomicBoolean? = null):
             // Same drain discipline as playPcmAudio: stop() plays out what is
             // already written (flush() would cut the reply's tail), and the head
             // position is polled until the speaker has actually finished.
-            track.stop()
+            track?.stop()
             val totalFrames = totalWritten / 2L
             // Duration-scaled, like playPcmAudio: a fixed cap amputates the
-            // tail of every sentence that outlives it.
-            val drainMs = totalFrames * 1000L / sampleRate + 500
+            // tail of every sentence that outlives it. The decoder names the
+            // rate its PCM really plays at - the old hardcoded guess is what
+            // cut long sentences short.
+            val drainMs = totalFrames * 1000L / decodedRate + 500
             val drainDeadline = System.currentTimeMillis() + drainMs
             while (System.currentTimeMillis() < drainDeadline) {
-                if (track.playbackHeadPosition >= totalFrames) break
+                if (track?.playbackHeadPosition ?: 0 >= totalFrames) break
                 Thread.sleep(20)
             }
-            track.release()
+            track?.release()
             codec.stop()
             codec.release()
             if (totalWritten == 0) {
