@@ -510,7 +510,11 @@ class WakeChatService : VoiceInteractionService() {
                 // like stopping the service.
                 stopSignal = wakeAbortSignal,
                 maxSeconds = WAKE_CLIP_SECONDS,
-                noSpeechTimeoutMs = WAKE_IDLE_SECONDS * 1000L
+                noSpeechTimeoutMs = WAKE_IDLE_SECONDS * 1000L,
+                // No plop here: the wake pass is always listening, so a start cue
+                // would fire every idle clip, and the exchange already has the
+                // chime as its "the phrase was heard" sound.
+                cue = false
             )
         }
         if (!listening) return false

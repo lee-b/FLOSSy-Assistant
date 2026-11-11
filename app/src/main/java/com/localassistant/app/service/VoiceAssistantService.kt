@@ -20,6 +20,8 @@ import com.localassistant.app.LocalAssistantApplication
 import com.localassistant.app.data.remote.ApiClient
 import com.localassistant.app.data.remote.McpClient
 import com.localassistant.app.ui.common.isNonSpeechTranscript
+import com.localassistant.app.ui.common.playListenEndCue
+import com.localassistant.app.ui.common.playListenStartCue
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -317,7 +319,10 @@ class VoiceAssistantService : Service() {
                     MediaRecorder.AudioSource.VOICE_COMMUNICATION,
                     sampleRate, channelConfig, audioFormat, bufferSize * 4
                 )
-                
+
+                // The start cue blocks, so it plays before the mic opens.
+                playListenStartCue()
+
                 if (audioRecord != null) {
                     audioRecord?.startRecording()
                     
@@ -380,7 +385,10 @@ class VoiceAssistantService : Service() {
         }
         audioRecord = null
         audioTrack = null
-        
+
+        // The matched downbeat closes the listening window.
+        playListenEndCue()
+
         recordingThread?.join(5000)
         recordingThread = null
         

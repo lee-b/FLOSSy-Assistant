@@ -2,8 +2,11 @@ package com.localassistant.app.ui.common
 
 import android.content.Context
 import android.content.Intent
+import android.media.AudioDeviceInfo
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.MediaRecorder
+import android.os.Build
 import android.widget.Toast
 import kotlinx.coroutines.*
 import java.io.ByteArrayOutputStream
@@ -126,7 +129,8 @@ fun recordAudioWithVAD(
     stopSignal: java.util.concurrent.atomic.AtomicBoolean,
     maxSeconds: Int = 60,
     silenceThresholdMs: Long = 1000L,
-    noSpeechTimeoutMs: Long = 0L
+    noSpeechTimeoutMs: Long = 0L,
+    cue: Boolean = true
 ): ByteArray? {
     val sampleRate = 16000
     val channelConfig = AudioFormat.CHANNEL_IN_MONO
@@ -162,6 +166,9 @@ fun recordAudioWithVAD(
 
     android.util.Log.d("VAD", "Starting recording with energy threshold $minEnergy...")
 
+    // The start cue blocks until it has finished, so it must be played before
+    // the microphone opens, like the wake chime is.
+    if (cue) playListenStartCue()
     try {
         audioRecord.startRecording()
 
@@ -237,6 +244,9 @@ fun recordAudioWithVAD(
     } finally {
         try { audioRecord.release() } catch (_: Exception) {}
     }
+    // The matched downbeat closes the window whatever ended it - a manual stop,
+    // silence after speech, or the utterance cap.
+    if (cue) playListenEndCue()
 
     android.util.Log.d("VAD", "Recording completed, ${audioBuffers.size} samples (${audioBuffers.size / sampleRate.toFloat()}s)")
 
@@ -706,6 +716,55 @@ private const val WAKE_CUE_SAMPLE_RATE = 16000
 
 // Sample rate the synthesised waiting cue is played at.
 private const val WAITING_CUE_SAMPLE_RATE = 16000
+
+/**
+ * Plays the rising plop that tells the user the microphone is now listening -
+ * the same up-chirp ChatGPT plays when its voice session opens. Synthesised so
+ * it needs no asset and still plays while the app is minimized.
+ */
+fun playListenStartCue(): Boolean = playPlopCue(240.0, 900.0)
+
+/**
+ * The falling downbeat that closes a listening window - a drop chirp paired
+ * with [playListenStartCue], so opening and closing the mic read as a matched
+ * pair like a ChatGPT-style voice session.
+ */
+fun playListenEndCue(): Boolean = playPlopCue(900.0, 240.0)
+
+/**
+ * Renders one bubble-like chirp sweeping between two frequencies.
+ *
+ * The phase is integrated from the frequency curve rather than sampled per
+ * sample, because an instantaneous-frequency sine would click wherever the
+ * sweep passes through; a cumulative phase makes the plop continuous.
+ */
+private fun playPlopCue(fromHz: Double, toHz: Double): Boolean {
+    val durationMs = 160
+    val seconds = durationMs / 1000.0
+    val samples = FloatArray(WAITING_CUE_SAMPLE_RATE * durationMs / 1000)
+    for (index in samples.indices) {
+        val t = index.toDouble() / WAITING_CUE_SAMPLE_RATE
+        val progress = (t / seconds).coerceIn(0.0, 1.0)
+        // Quadratic ease makes the plop spend more time at its start pitch,
+        // which is what gives a bubble its "blip" rather than a plain sweep.
+        val eased = progress * progress
+        val phase = 2.0 * Math.PI *
+            (fromHz * t + (toHz - fromHz) * t * t / (2.0 * seconds))
+        // Fast attack so the chirp has no click, then decay like a bubble
+        // popping - a constant amplitude would sound like a test tone.
+        val attack = minOf(1.0, t / 0.003)
+        val fade = kotlin.math.exp(-t / (durationMs / 1400.0))
+        samples[index] = (0.16 * attack * fade * kotlin.math.sin(phase)).toFloat()
+    }
+
+    val pcm = ByteArray(samples.size * 2)
+    samples.forEachIndexed { index, value ->
+        val sample = (value * Short.MAX_VALUE).toInt().coerceIn(-Short.MAX_VALUE.toInt(), Short.MAX_VALUE.toInt())
+        pcm[index * 2] = (sample and 0xFF).toByte()
+        pcm[index * 2 + 1] = ((sample shr 8) and 0xFF).toByte()
+    }
+    return playPcmAudio(pcm, WAITING_CUE_SAMPLE_RATE)
+}
 
 /**
  * Plays one soft "footstep" tick - the low, muted busy sound an online assistant
