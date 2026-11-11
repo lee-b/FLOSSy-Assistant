@@ -116,6 +116,169 @@ fun recordAudioForSTT(
 }
 
 /**
+ * One AudioRecord held open for a whole voice call.
+ *
+ * The per-turn recorder opened and released a capture for every utterance and
+ * the caller re-armed it with a sleep between turns, which left a dead zone
+ * after every reply and a re-arm that could silently fail. Here the capture
+ * persists: VAD gates the same stream continuously, speech onset starts an
+ * utterance buffer, and the end of the utterance hands the clip to the caller
+ * (STT) while the stream keeps running - so the next turn begins the instant
+ * the previous one ends.
+ *
+ * The gate is phase-aware: while the assistant speaks, the mic hears its own
+ * reply, so the gate is suspended and any samples taken during playback are
+ * dropped rather than turned into a phantom utterance.
+ *
+ * @param context used to open the communication route and the recorder.
+ * @param stopSignal raised to end the capture and close the call.
+ * @param listeningGate polled each chunk: true means VAD may act (the call is
+ *   not speaking), false means the stream is recorded but ignored.
+ * @param onUtterance invoked on the capture thread with a WAV clip of one
+ *   complete utterance.
+ */
+class StreamingCallCapture(
+    private val context: android.content.Context,
+    private val stopSignal: java.util.concurrent.atomic.AtomicBoolean,
+    private val listeningGate: java.util.concurrent.atomic.AtomicBoolean,
+    private val onUtterance: (ByteArray) -> Unit
+) {
+    companion object {
+        private const val SAMPLE_RATE = 16000
+        // How long one chunk of silence ends an utterance, like the per-turn
+        // recorder's pause.
+        private const val UTTERANCE_SILENCE_MS = 1000L
+        // Absolute energy that only gates "did anything happen at all" - the
+        // utterance boundaries are relative, cut by voicedSpan.
+        private const val MIN_ENERGY = 300
+    }
+
+    private var record: android.media.AudioRecord? = null
+    private var restoreRoute: (() -> Unit)? = null
+    private var thread: Thread? = null
+
+    /** Opens the route and starts streaming. True when capture is live. */
+    fun start(): Boolean {
+        val restore = beginCommunicationCapture(context)
+        restoreRoute = restore
+        val minBuffer = android.media.AudioRecord.getMinBufferSize(
+            SAMPLE_RATE, android.media.AudioFormat.CHANNEL_IN_MONO,
+            android.media.AudioFormat.ENCODING_PCM_16BIT
+        )
+        if (minBuffer <= 0) {
+            restore?.invoke()
+            return false
+        }
+        val rec = try {
+            android.media.AudioRecord(
+                android.media.MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+                SAMPLE_RATE,
+                android.media.AudioFormat.CHANNEL_IN_MONO,
+                android.media.AudioFormat.ENCODING_PCM_16BIT,
+                minBuffer * 4
+            )
+        } catch (e: Exception) {
+            android.util.Log.e("VAD", "Streaming capture failed to open: ${e.message}")
+            restore?.invoke()
+            return false
+        }
+        if (rec.state != android.media.AudioRecord.STATE_INITIALIZED) {
+            rec.release()
+            restore?.invoke()
+            return false
+        }
+        record = rec
+        rec.startRecording()
+        thread = Thread {
+            run()
+        }.also { it.start() }
+        return true
+    }
+
+    /** Ends the stream and releases the recorder and the route. */
+    fun stop() {
+        stopSignal.set(true)
+        thread?.join(2000)
+        thread = null
+    }
+
+    private fun run() {
+        val rec = record ?: return
+        val buffer = ShortArray(SAMPLE_RATE / 8) // 80ms chunks
+        val utterance = mutableListOf<Short>()
+        var inUtterance = false
+        var silenceChunks = 0
+        var peakRms = 0
+        try {
+            rec.startRecording()
+            while (!stopSignal.get()) {
+                val read = rec.read(buffer, 0, buffer.size)
+                if (read <= 0) continue
+                var energy = 0.0
+                for (i in 0 until read) energy += buffer[i].toDouble() * buffer[i]
+                val rms = kotlin.math.sqrt(energy / read)
+                val voiced = rms > MIN_ENERGY
+                if (rms > peakRms) peakRms = rms.toInt()
+
+                // While the assistant speaks, this stream hears its own reply:
+                // the gate is closed and nothing here may become an utterance.
+                if (!listeningGate.get()) {
+                    utterance.clear()
+                    inUtterance = false
+                    silenceChunks = 0
+                    continue
+                }
+
+                for (i in 0 until read) utterance.add(buffer[i])
+                if (voiced) {
+                    silenceChunks = 0
+                    inUtterance = true
+                } else if (inUtterance) {
+                    silenceChunks++
+                    // One chunk of silence closes the utterance; a short
+                    // span is noise, not a word.
+                    if (silenceChunks * 80 >= UTTERANCE_SILENCE_MS) {
+                        val clip = trimToWav(utterance)
+                        if (clip != null) onUtterance(clip)
+                        utterance.clear()
+                        inUtterance = false
+                        silenceChunks = 0
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("VAD", "Streaming capture error: ${e.message}")
+        } finally {
+            try { rec.stop() } catch (_: Exception) {}
+            try { rec.release() } catch (_: Exception) {}
+            restoreRoute?.invoke()
+            android.util.Log.d("VAD", "Streaming capture ended (peak RMS $peakRms)")
+        }
+    }
+
+    /** Cuts the utterance to its voiced span, as the per-turn recorder did. */
+    private fun trimToWav(samples: MutableList<Short>): ByteArray? {
+        val window = SAMPLE_RATE * 120 / 1000
+        val (from, to) = voicedSpan(samples, window, VOICED_TRIM_FRACTION)
+        if (to - from < SAMPLE_RATE / 4) {
+            android.util.Log.d("VAD", "Voiced span ${(to - from) / (SAMPLE_RATE / 1000)}ms is under 250ms, treating as noise")
+            return null
+        }
+        val lead = SAMPLE_RATE * 3 / 10
+        val trail = SAMPLE_RATE / 2
+        val lo = maxOf(0, from - lead)
+        val hi = minOf(samples.size, to + trail)
+        val pcm = ByteArray((hi - lo) * 2)
+        for (i in lo until hi) {
+            val v = samples[i].toInt()
+            pcm[(i - lo) * 2] = (v and 0xFF).toByte()
+            pcm[(i - lo) * 2 + 1] = ((v shr 8) and 0xFF).toByte()
+        }
+        return convertPcmToWav(pcm, SAMPLE_RATE)
+    }
+}
+
+/**
  * Records audio with Voice Activity Detection (VAD).
  * Uses energy-based VAD to detect speech breaks and automatically stop recording.
  *

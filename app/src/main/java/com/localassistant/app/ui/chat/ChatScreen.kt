@@ -104,6 +104,15 @@ fun ChatScreen(
     // pipeline, its re-arms, the spoken prompts. Hanging up cancels them all,
     // so a call can neither answer nor speak a word after its user ended it.
     val voiceJobs = java.util.concurrent.ConcurrentLinkedQueue<kotlinx.coroutines.Job>()
+
+    // One capture held open for the whole call. The gate says when VAD may
+    // act: closed while the assistant speaks, so the mic never hears its own
+    // reply as an utterance.
+    val captureGate = java.util.concurrent.atomic.AtomicBoolean(true)
+    var streamingCapture: com.localassistant.app.ui.common.StreamingCallCapture? = null
+    // Assigned once handleUtterance exists: the capture thread invokes this
+    // to hand an utterance to the screen's pipeline.
+    var onUtteranceReady: ((ByteArray) -> Unit)? = null
     val coroutineScope = rememberCoroutineScope()
 
     /**
@@ -234,49 +243,50 @@ fun ChatScreen(
         recordedAudioBytes = null
         recordingStopSignal.set(false)
 
+        // One capture for the whole call: it streams continuously, and each
+        // complete utterance lands here while the stream keeps running, so a
+        // turn begins the instant the previous one ends - no re-arm sleep,
+        // and no re-arm that can silently fail.
         launchVoiceJob {
-            try {
-                // The upbeat is the call's opening sound, played once before the
-                // microphone opens. The re-arms between turns pass announce =
-                // false and stay quiet - the cues mark the call, not the turns
-                // inside it.
-                if (announce) withContext(Dispatchers.IO) { playListenStartCue() }
-                val wavBytes = withContext(Dispatchers.IO) {
-                    recordAudioWithVAD(context.applicationContext, recordingStopSignal)
-                }
+            if (announce) withContext(Dispatchers.IO) { playListenStartCue() }
+            val capture = com.localassistant.app.ui.common.StreamingCallCapture(
+                context.applicationContext,
+                recordingStopSignal,
+                captureGate
+            ) { clip ->
+                // Invoked on the capture thread: hop to the screen scope and
+                // carry the utterance through STT -> LLM -> TTS as before.
+                onUtteranceReady?.invoke(clip)
+            }
+            streamingCapture = capture
+            withContext(Dispatchers.IO) { capture.start() }
+        }
+    }
 
-                if (wavBytes == null || wavBytes.isEmpty()) {
-                    // Nothing voiced enough to be a word came back - silence,
-                    // a door click or the speaker's own tail. Apologising to
-                    // somebody who said nothing is exactly the noise this used
-                    // to make, so the call quietly re-arms instead; only a
-                    // blank transcript after real speech gets the spoken
-                    // repeat prompt further down.
-                    if (viewModel.dialogState.value.isVoiceCall) {
-                        launchVoiceJob {
-                            delay(800)
-                            if (viewModel.dialogState.value.isVoiceCall) withContext(Dispatchers.Main) { startMicRecording(announce = false) }
-                        }
-                    }
-                    return@launchVoiceJob
-                }
+    // The gate follows the phase: while the assistant speaks, the mic would
+    // hear its own reply, so VAD must not act; every other phase listens.
+    LaunchedEffect(dialogState.phase, dialogState.isVoiceCall) {
+        captureGate.set(!viewModel.dialogState.value.isSpeaking)
+    }
 
-                recordedAudioBytes = wavBytes
+    /**
+     * Carries one complete utterance from the streaming capture through the
+     * exchange: transcribe, answer, speak. Runs as a voice job, so hanging
+     * up cancels it mid-flight.
+     */
+    suspend fun handleUtterance(wavBytes: ByteArray) {
+        try {
+            viewModel.setDialogPhase(VoiceCallPhase.TRANSCRIBING)
 
-                                                                 // Automatically process the recording after VAD stops
-                launchVoiceJob {
-                    try {
-                        viewModel.setDialogPhase(VoiceCallPhase.TRANSCRIBING)
+            // The user ended the call while this take was still being
+            // heard - the half-captured words are theirs to drop, not
+            // to send on to STT.
+            if (discardCurrentUtterance.get()) {
+                viewModel.endVoiceCall()
+                return
+            }
 
-                        // The user ended the call while this take was still being
-                        // heard - the half-captured words are theirs to drop, not
-                        // to send on to STT.
-                        if (discardCurrentUtterance.get()) {
-                            viewModel.endVoiceCall()
-                            return@launchVoiceJob
-                        }
-
-                        val transcribedText = withContext(Dispatchers.IO) {
+            val transcribedText = withContext(Dispatchers.IO) {
                             com.localassistant.app.data.remote.ApiClient.transcribeAudio(
                                 baseUrl = settings.sttBaseUrl,
                                 apiKey = if (settings.sttApiKey.isBlank()) null else settings.sttApiKey,
@@ -361,18 +371,11 @@ fun ChatScreen(
                                 if (reasoningText.isNotEmpty()) {
                                     viewModel.updateStreamingReasoning("")
                                 }
-                                // A voice call carries on: the answer is spoken
-                                // through the speaker, so the mic re-arms the
-                                // moment it has finished, like the wake chat.
+                                // A voice call carries on: the capture never
+                                // stopped, so once playback ends the gate
+                                // re-opens and the next utterance can start
+                                // the instant the user begins speaking.
                                 viewModel.setDialogPhase(VoiceCallPhase.IDLE)
-                                if (viewModel.dialogState.value.isVoiceCall) launchVoiceJob {
-                                    // The speaker is still ringing in the room
-                                    // right after playback returns; a beat of
-                                    // settle keeps the first capture from
-                                    // hearing the answer's own echo.
-                                    delay(500)
-                                    if (viewModel.dialogState.value.isVoiceCall) withContext(Dispatchers.Main) { startMicRecording(announce = false) }
-                                }
                             }
                         } else {
                             // Nothing intelligible came back: hands-free means
@@ -400,13 +403,8 @@ fun ChatScreen(
                                         if (viewModel.dialogState.value.isVoiceCall) viewModel.setDialogPhase(VoiceCallPhase.IDLE)
                                     }
                                 }
-                                launchVoiceJob {
-                                    // Re-arm the mic once the prompt has been spoken.
-                                    delay(3000)
-                                    if (viewModel.dialogState.value.isVoiceCall) withContext(Dispatchers.Main) {
-                                        startMicRecording(announce = false)
-                                    }
-                                }
+                                // The capture is continuous: the gate re-opens
+                                // when the prompt finishes speaking.
                             }
                         }
                     } catch (e: java.util.concurrent.CancellationException) {
@@ -421,14 +419,11 @@ fun ChatScreen(
                             Toast.makeText(context.applicationContext, "Error: ${e.message}", Toast.LENGTH_LONG).show()
                         }
                     }
-                }
-            } catch (e: java.util.concurrent.CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                viewModel.setDialogPhase(VoiceCallPhase.IDLE)
-                Toast.makeText(context.applicationContext, "Recording failed: ${e.message}", Toast.LENGTH_LONG).show()
-            }
-        }
+    }
+    // The capture thread has no Compose scope: it calls through this
+    // property, which launchVoiceJob hops back onto the screen's scope.
+    onUtteranceReady = { clip ->
+        launchVoiceJob { handleUtterance(clip) }
     }
 
     /**
@@ -456,6 +451,9 @@ fun ChatScreen(
         ttsAbortSignal.set(true)
         discardCurrentUtterance.set(true)
         stopMicRecording()
+        // Close the persistent capture: its thread ends with the call.
+        streamingCapture?.stop()
+        streamingCapture = null
         // Cancel every coroutine still carrying the call - the exchange
         // pipeline, its re-arms, any spoken prompt it was about to give - so
         // nothing can transcribe, answer, or speak after the user hung up.
