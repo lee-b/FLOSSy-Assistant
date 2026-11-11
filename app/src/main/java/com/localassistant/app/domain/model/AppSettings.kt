@@ -8,6 +8,16 @@ const val DEFAULT_LLM_BASE_URL = "http://127.0.0.1:8086/v1"
 const val DEFAULT_STT_BASE_URL = "http://127.0.0.1:8088/v1"
 const val DEFAULT_TTS_BASE_URL = "http://127.0.0.1:8089/v1"
 
+// The language Android says the user speaks: the device's own configured
+// default locale, baked into the shipped system prompt so it is in force at
+// the start of every session on every call path, and overridden only by an
+// explicit user request.
+private val userLocale: java.util.Locale =
+    (android.os.LocaleList.getDefault().takeIf { it.size() > 0 }?.get(0))
+        ?: java.util.Locale.getDefault()
+private val userLanguage: String =
+    userLocale.getDisplayLanguage(userLocale).ifBlank { userLocale.language }
+
 /**
  * Application settings for the Local Assistant.
  *
@@ -55,8 +65,10 @@ data class AppSettings(
     // the context window.
     val mcpLazyTools: Boolean = true,
     
-    // System Prompt
+    // System Prompt - the language rule is part of the shipped default, named
+    // by the device's own locale, not by whatever the conversation is in.
     val systemPrompt: String = """You are LocalAssistant, running on the user's Android device.
+|Respond in $userLanguage unless the user explicitly requests a different language.
 |Answer in one or two short sentences, in plain words that will be read aloud.
 |Give the answer directly: do not explain your reasoning, list steps, repeat the question or greet the user.
 |Never use markdown, bullet points, numbering or emoji.
