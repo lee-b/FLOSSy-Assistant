@@ -29,13 +29,21 @@ const val TRANSPARENT = 0x00000000
 // error red as the only warm colour on screen - the one that should be loud.
 const val GRUVBOX_PRIMARY = 0xFF9BB7D4.toInt() // Soft steel blue (accent)
 const val GRUVBOX_ON_PRIMARY = 0xFF2B2B2B.toInt()
-const val GRUVBOX_PRIMARY_CONTAINER = 0xFF86A3C2.toInt()
+// Container roles are dark, low-saturation surfaces, not accents: a container
+// carries body text, so it must sit near the background in luminance and let a
+// light foreground (0xFFE8E8E8, ~7:1 contrast) read on it. The previous
+// 0xFF86A3C2 was a bright mid-tone - accent luminance in a container role -
+// and the dark on-color it forced left the user's own bubble unreadable.
+const val GRUVBOX_PRIMARY_CONTAINER = 0xFF3D5266.toInt()
+const val GRUVBOX_ON_PRIMARY_CONTAINER = 0xFFE8E8E8.toInt()
 const val GRUVBOX_SECONDARY = 0xFF86A3C2.toInt() // Muted slate blue (secondary accent)
 const val GRUVBOX_ON_SECONDARY = 0xFF2B2B2B.toInt()
-const val GRUVBOX_SECONDARY_CONTAINER = 0xFF5E7C9E.toInt()
+const val GRUVBOX_SECONDARY_CONTAINER = 0xFF38485A.toInt()
+const val GRUVBOX_ON_SECONDARY_CONTAINER = 0xFFE8E8E8.toInt()
 const val GRUVBOX_TERTIARY = 0xFF7E9CB8.toInt() // Blue-gray (tertiary accent)
 const val GRUVBOX_ON_TERTIARY = 0xFF333333.toInt()
-const val GRUVBOX_TERTIARY_CONTAINER = 0xFF56708A.toInt()
+const val GRUVBOX_TERTIARY_CONTAINER = 0xFF324356.toInt()
+const val GRUVBOX_ON_TERTIARY_CONTAINER = 0xFFE8E8E8.toInt()
 const val GRUVBOX_BACKGROUND = 0xFF2B2B2B.toInt() // Neutral dark gray
 const val GRUVBOX_ON_BACKGROUND = 0xFFE8E8E8.toInt()
 const val GRUVBOX_SURFACE = 0xFF333333.toInt() // Neutral gray

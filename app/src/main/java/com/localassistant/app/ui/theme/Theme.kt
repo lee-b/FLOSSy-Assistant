@@ -40,17 +40,17 @@ val GruvboxDarkColorScheme = darkColorScheme(
     primary = GruvboxDarkPrimary,
     onPrimary = GruvboxDarkBackground,
     primaryContainer = paint(GRUVBOX_PRIMARY_CONTAINER),
-    onPrimaryContainer = GruvboxDarkBackground,
+    onPrimaryContainer = paint(GRUVBOX_ON_PRIMARY_CONTAINER),
 
     secondary = GruvboxDarkSecondary,
     onSecondary = GruvboxDarkBackground,
     secondaryContainer = paint(GRUVBOX_SECONDARY_CONTAINER),
-    onSecondaryContainer = GruvboxDarkBackground,
+    onSecondaryContainer = paint(GRUVBOX_ON_SECONDARY_CONTAINER),
 
     tertiary = GruvboxDarkTertiary,
     onTertiary = GruvboxDarkSurface,
     tertiaryContainer = paint(GRUVBOX_TERTIARY_CONTAINER),
-    onTertiaryContainer = GruvboxDarkSurface,
+    onTertiaryContainer = paint(GRUVBOX_ON_TERTIARY_CONTAINER),
 
     background = GruvboxDarkBackground,
     onBackground = paint(GRUVBOX_ON_BACKGROUND),
