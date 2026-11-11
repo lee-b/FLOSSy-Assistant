@@ -7,6 +7,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.ArrowDropUp
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -159,27 +161,60 @@ fun EndpointStatusLine(
  */
 @Composable
 fun EndpointChoices(title: String, options: List<String>, current: String, onSelect: (String) -> Unit) {
-    if (options.isEmpty()) return
-    Text(text = title, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-    Spacer(modifier = Modifier.height(6.dp))
-    // One full-width choice per line: model ids are long ("llama/local/medium"
-    // and friends), and a three-column chip grid both truncates them badly and
-    // makes tapping the right one fiddly. The text wraps over two lines rather
-    // than clipping, so the whole id stays readable.
-    options.take(20).forEach { option ->
-        val active = option.equals(current, ignoreCase = true)
-        Button(
-            onClick = { onSelect(option) },
-            shape = RoundedCornerShape(8.dp),
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(vertical = 2.dp),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant,
-                contentColor = if (active) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Text(text = title, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(modifier = Modifier.height(6.dp))
+
+        var expanded by remember { mutableStateOf(false) }
+        Box(modifier = Modifier.fillMaxWidth()) {
+            OutlinedTextField(
+                modifier = Modifier.fillMaxWidth(),
+                value = current,
+                onValueChange = onSelect,
+                singleLine = true,
+                shape = RoundedCornerShape(8.dp),
+                placeholder = { Text("Type or pick from the list") },
+                // Typing is always available: the list is a suggestion, not a
+                // gate. A server whose id is missing from its own listing can
+                // still be entered by hand.
+                trailingIcon = {
+                    IconButton(onClick = { expanded = !expanded }) {
+                        Icon(
+                            imageVector = if (expanded) Icons.Default.ArrowDropUp else Icons.Default.ArrowDropDown,
+                            contentDescription = if (expanded) "Collapse list" else "Expand list"
+                        )
+                    }
+                }
             )
-        ) {
-            Text(text = option, maxLines = 2)
+            DropdownMenu(
+                expanded = expanded,
+                onDismissRequest = { expanded = false },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    // A long listing scrolls inside the dropdown instead of
+                    // unrolling into a wall of buttons across the screen.
+                    .heightIn(max = 240.dp)
+            ) {
+                Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                    options.forEach { option ->
+                        val active = option.equals(current, ignoreCase = true)
+                        DropdownMenuItem(
+                            text = {
+                                Text(
+                                    text = option,
+                                    maxLines = 2,
+                                    color = if (active) MaterialTheme.colorScheme.primary
+                                            else MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            },
+                            onClick = {
+                                onSelect(option)
+                                expanded = false
+                            }
+                        )
+                    }
+                }
+            }
         }
     }
 }
