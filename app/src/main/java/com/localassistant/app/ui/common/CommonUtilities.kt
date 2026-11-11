@@ -65,7 +65,7 @@ fun recordAudioForSTT(
 
     // Capture may have to ride the Bluetooth headset; the route is closed
     // whichever way the recording ends.
-    val restoreRoute = beginBluetoothCapture(context)
+    val restoreRoute = beginCommunicationCapture(context)
     try {
         try {
             audioRecord.startRecording()
@@ -176,7 +176,7 @@ fun recordAudioWithVAD(
     // Capture may have to ride a Bluetooth headset; the route is closed when
     // the recorder is released. The start cue blocks until it has finished, so
     // it must be played before the microphone opens, like the wake chime is.
-    val restoreRoute = beginBluetoothCapture(context)
+    val restoreRoute = beginCommunicationCapture(context)
     if (cue) playListenStartCue()
     try {
         audioRecord.startRecording()
@@ -777,69 +777,65 @@ private fun playPlopCue(fromHz: Double, toHz: Double): Boolean {
 }
 
 /**
- * Routes microphone capture to a Bluetooth headset when one is connected.
+ * Routes microphone capture through the audio manager's communication routing,
+ * which is the meta input that follows whatever the user is actually using -
+ * Bluetooth headphones, a wired headset, or the phone's own mic.
  *
  * AudioSource.VOICE_COMMUNICATION keeps recording the phone's own mic unless
  * the audio manager is told where communication audio belongs, so with modern
  * Bluetooth headphones (Sony XM5 and friends) the recorder either reads the
- * phone mic or silence - the STT then hears nothing or hears the room. This
- * opens a communication route to the headset and returns a restore runnable
- * that callers run in a finally block. Null means no Bluetooth audio device
- * is connected, in which case nothing has to be routed and the caller skips
- * the call.
+ * phone mic or silence - the STT then hears nothing or hears the room.
+ *
+ * The framework is trusted first: when [AudioManager.getCommunicationDevice]
+ * already reports a device, that IS the route the system wants, so nothing is
+ * set and the returned restore is a no-op. Only when the framework has not
+ * picked one is a device chosen from the available candidates - preferring a
+ * headset, falling back to the built-in mic - and set explicitly; that choice
+ * is the only thing the restore undoes.
+ *
+ * Returns a restore runnable callers run in a finally block. It is null when
+ * the framework had already picked a device (nothing to undo) or when routing
+ * failed.
  */
-fun beginBluetoothCapture(context: Context): (() -> Unit)? {
+fun beginCommunicationCapture(context: Context): (() -> Unit)? {
     val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return null
-    val bluetoothMic = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).firstOrNull {
-        // The capture side of a headset is always the SCO type - the A2DP type
-        // is the media output only and never takes a microphone.
-        it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
-    } ?: return null
-
-    try {
-        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            // The modern route: one call decides both the mic and the speaker
-            // side of the communication link.
-            audioManager.setCommunicationDevice(bluetoothMic)
-        } else {
-            // The legacy route: SCO is opened by hand on older builds.
-            @Suppress("DEPRECATION")
-            audioManager.startBluetoothSco()
-            @Suppress("DEPRECATION")
-            audioManager.setBluetoothScoOn(true)
-        }
-        // Routing a headset is asynchronous on most builds, so the recorder is
-        // given a beat to start on the routed device instead of the phone mic.
-        Thread.sleep(150)
-    } catch (e: Exception) {
-        android.util.Log.w("VAD", "Could not route capture to Bluetooth: ${e.message}")
-        restoreDefaultCapture(context)
+    val framework = audioManager.getCommunicationDevice()
+    if (framework != null && framework.type != AudioDeviceInfo.TYPE_UNKNOWN) {
+        // The framework has already routed communication audio somewhere - a
+        // headset the user connected, or the phone mic it prefers. Setting a
+        // device here would only override a decision the system had already
+        // made, so keep its choice and record that nothing was changed.
+        android.util.Log.d("VAD", "Communication route already set: type=${framework.type}")
         return null
     }
-    return { restoreDefaultCapture(context) }
-}
 
-/**
- * Closes the communication route [beginBluetoothCapture] opened, so playback
- * and the phone mic go back to their normal routing afterwards.
- */
-private fun restoreDefaultCapture(context: Context) {
+    val candidates = audioManager.getAvailableCommunicationDevices()
+    val preferred = candidates.firstOrNull {
+        it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+            it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+            it.type == AudioDeviceInfo.TYPE_USB_HEADSET
+    } ?: candidates.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC } ?: return null
+
     try {
-        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            audioManager.clearCommunicationDevice()
-        } else {
-            @Suppress("DEPRECATION")
-            audioManager.stopBluetoothSco()
-            @Suppress("DEPRECATION")
-            audioManager.setBluetoothScoOn(false)
-        }
-        audioManager.mode = AudioManager.MODE_NORMAL
+        audioManager.setCommunicationDevice(preferred)
+        // Routing is asynchronous on most builds, so the recorder is given a
+        // beat to start on the routed device instead of the phone mic.
+        Thread.sleep(150)
+        android.util.Log.d("VAD", "Communication route set: type=${preferred.type}")
     } catch (e: Exception) {
-        android.util.Log.w("VAD", "Could not restore audio routing: ${e.message}")
+        android.util.Log.w("VAD", "Could not set communication route: ${e.message}")
+        return null
+    }
+    return {
+        try {
+            audioManager.clearCommunicationDevice()
+        } catch (e: Exception) {
+            android.util.Log.w("VAD", "Could not clear communication route: ${e.message}")
+        }
     }
 }
+
+
 
 /**
  * Plays one soft "footstep" tick - the low, muted busy sound an online assistant

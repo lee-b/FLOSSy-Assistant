@@ -5,7 +5,10 @@ import android.app.*
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.media.AudioDeviceCallback
+import android.media.AudioDeviceInfo
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.net.ConnectivityManager
@@ -19,7 +22,7 @@ import androidx.core.app.NotificationCompat
 import com.localassistant.app.LocalAssistantApplication
 import com.localassistant.app.data.remote.ApiClient
 import com.localassistant.app.data.remote.McpClient
-import com.localassistant.app.ui.common.beginBluetoothCapture
+import com.localassistant.app.ui.common.beginCommunicationCapture
 import com.localassistant.app.ui.common.isNonSpeechTranscript
 import com.localassistant.app.ui.common.playListenEndCue
 import com.localassistant.app.ui.common.playListenStartCue
@@ -136,9 +139,29 @@ class VoiceAssistantService : Service() {
     // Notification manager
     private lateinit var notificationManager: NotificationManager
 
-    // The restore runnable for a Bluetooth capture route opened in
+    // Audio manager, for the capture-route watch.
+    private lateinit var audioManager: AudioManager
+
+    // The restore runnable for a communication capture route opened in
     // startListening(); closed again in stopListening().
     private var audioRouteRestore: (() -> Unit)? = null
+
+    // Watches the input devices while listening, so pulling or connecting a
+    // headset mid-utterance re-routes capture instead of leaving the recorder
+    // on a device that has gone away. One instance, registered per listen.
+    private val captureDeviceCallback = object : AudioDeviceCallback() {
+        private fun rerouteIfListening() {
+            if (_state.value == STATE_LISTENING) {
+                serviceScope.launch { rerouteCapture() }
+            }
+        }
+        override fun onAudioDevicesAdded(addedDevices: Array<AudioDeviceInfo>) {
+            rerouteIfListening()
+        }
+        override fun onAudioDevicesRemoved(removedDevices: Array<AudioDeviceInfo>) {
+            rerouteIfListening()
+        }
+    }
 
     // Watches the API client's rate-limit waiting state for the whole service
     // lifetime; a cancelled serviceScope would kill the watch on every restart.
@@ -147,6 +170,7 @@ class VoiceAssistantService : Service() {
     override fun onCreate() {
         super.onCreate()
         notificationManager = getSystemService(NotificationManager::class.java)
+        audioManager = getSystemService(AudioManager::class.java)
         
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification(STATE_IDLE))
@@ -325,11 +349,12 @@ class VoiceAssistantService : Service() {
                     sampleRate, channelConfig, audioFormat, bufferSize * 4
                 )
 
-                // With Bluetooth headphones the recorder would otherwise stay on
+                // With a headset connected the recorder would otherwise stay on
                 // the phone mic, so the route is opened before the microphone
                 // does. The start cue blocks, so it plays before the mic opens.
-                audioRouteRestore = beginBluetoothCapture(applicationContext)
+                audioRouteRestore = beginCommunicationCapture(applicationContext)
                 playListenStartCue()
+                audioManager.registerAudioDeviceCallback(captureDeviceCallback, android.os.Handler(android.os.Looper.getMainLooper()))
 
                 if (audioRecord != null) {
                     audioRecord?.startRecording()
@@ -393,6 +418,7 @@ class VoiceAssistantService : Service() {
         }
         audioRecord = null
         audioTrack = null
+        audioManager.unregisterAudioDeviceCallback(captureDeviceCallback)
 
         // The matched downbeat closes the listening window, and the Bluetooth
         // route goes with the microphone it served.
@@ -410,6 +436,44 @@ class VoiceAssistantService : Service() {
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
     private fun resumeService() {
         startListening()
+    }
+
+    /**
+     * Re-resolves the capture route after the input devices changed while
+     * listening - a headset was pulled or connected mid-utterance.
+     *
+     * The recorder swap follows the same pattern as [applySampleRate]: the new
+     * AudioRecord is started before the old one is released, so the audio loop
+     * that reads [audioRecord] keeps going without a gap to notice.
+     */
+    private suspend fun rerouteCapture() {
+        val bufferSize = AudioRecord.getMinBufferSize(
+            sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+        )
+        if (bufferSize <= 0) return
+
+        try {
+            audioRouteRestore?.invoke()
+            audioRouteRestore = beginCommunicationCapture(applicationContext)
+            val replacement = AudioRecord(
+                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+                sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufferSize * 4
+            )
+            if (replacement.state != AudioRecord.STATE_INITIALIZED) {
+                replacement.release()
+                return
+            }
+            replacement.startRecording()
+            val previous = audioRecord
+            try {
+                previous?.stop()
+                previous?.release()
+            } catch (_: Exception) {}
+            audioRecord = replacement
+            android.util.Log.d("VoiceAssistantService", "Capture re-routed after audio device change")
+        } catch (e: Exception) {
+            android.util.Log.w("VoiceAssistantService", "Could not re-route capture: ${e.message}")
+        }
     }
 
     private fun pauseService() {
