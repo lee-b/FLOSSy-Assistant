@@ -513,8 +513,11 @@ class ReplyAudioPlayer(
         return true
     }
 
-    /** End of the reply: play out what was written, then let the track go. */
-    fun finish() {
+    /** End of the reply: play out what was written, then let the track go.
+     *  Runs on the IO dispatcher - the drain waits on the playback head, and
+     *  a caller on the main thread (a Compose voice job) must never sleep in
+     *  that wait, which is exactly what the ANR trace showed. */
+    suspend fun finish() = withContext(Dispatchers.IO) {
         drain()
     }
 
@@ -559,8 +562,21 @@ class ReplyAudioPlayer(
             // count the track actually received, so nothing is cut.
             val drainMs = if (rate > 0) totalFrames * 1000 / rate + 500 else 500L
             val deadline = System.currentTimeMillis() + drainMs
+            var lastHead = -1L
+            var stalledFor = 0L
             while (System.currentTimeMillis() < deadline) {
-                if (t.playbackHeadPosition >= totalFrames) break
+                val head = t.playbackHeadPosition.toLong()
+                if (head >= totalFrames) break
+                if (head == lastHead) {
+                    stalledFor += 20
+                    // A head that has not moved for a second will never move
+                    // again - waiting out the full deadline of a dead track
+                    // is what froze the UI here before the dispatcher fix.
+                    if (stalledFor >= 1000) break
+                } else {
+                    stalledFor = 0
+                    lastHead = head
+                }
                 Thread.sleep(20)
             }
         } catch (e: Exception) {
@@ -1065,9 +1081,9 @@ fun playWaitingCue(): Boolean {
     // Three quick ticks, rising in pitch and dropping in level: tip, tip,
     // tip. Kept subtle - about a third of the first version's loudness and
     // a warmer pitch, so the cue sits in the background instead of beeping.
-    addSoftTick(samples, 0, 60, 1200.0f, 0.02f)
-    addSoftTick(samples, 140, 60, 1450.0f, 0.016f)
-    addSoftTick(samples, 290, 60, 1750.0f, 0.013f)
+    addSoftTick(samples, 0, 60, 620.0f, 0.02f)
+    addSoftTick(samples, 140, 60, 740.0f, 0.016f)
+    addSoftTick(samples, 290, 60, 880.0f, 0.013f)
 
     val pcm = ByteArray(samples.size * 2)
     samples.forEachIndexed { index, value ->
