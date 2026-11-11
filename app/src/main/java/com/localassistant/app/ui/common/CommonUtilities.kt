@@ -798,36 +798,33 @@ private fun playPlopCue(fromHz: Double, toHz: Double): Boolean {
  * Bluetooth headphones (Sony XM5 and friends) the recorder either reads the
  * phone mic or silence - the STT then hears nothing or hears the room.
  *
- * The framework is trusted first: when [AudioManager.getCommunicationDevice]
- * already reports a device, that IS the route the system wants, so nothing is
- * set and the returned restore is a no-op. Only when the framework has not
- * picked one is a device chosen from the available candidates - preferring a
- * headset, falling back to the built-in mic - and set explicitly; that choice
- * is the only thing the restore undoes.
+ * A headset mic is always claimed explicitly when one is available. Trusting
+ * the framework's [AudioManager.getCommunicationDevice] is not enough: on a
+ * modern Bluetooth headset the framework reports the A2DP output as the
+ * "active communication device" (audio_flinger then shows Input device:
+ * AUDIO_DEVICE_IN_BUILTIN_MIC), so the output plays through the headphones
+ * while the input rides the phone mic - the mismatch this function exists to
+ * fix. Only when no headset candidate exists at all does the built-in mic
+ * carry the capture.
  *
- * Returns a restore runnable callers run in a finally block. It is null when
- * the framework had already picked a device (nothing to undo) or when routing
- * failed.
+ * Returns a restore runnable callers run in a finally block; it undoes
+ * exactly what was set here.
  */
 fun beginCommunicationCapture(context: Context): (() -> Unit)? {
     val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return null
-    val framework = audioManager.getCommunicationDevice()
-    if (framework != null && framework.type != AudioDeviceInfo.TYPE_UNKNOWN) {
-        // The framework has already routed communication audio somewhere - a
-        // headset the user connected, or the phone mic it prefers. Setting a
-        // device here would only override a decision the system had already
-        // made, so keep its choice and record that nothing was changed.
-        android.util.Log.d("VAD", "Communication route already set: type=${framework.type}")
-        return null
-    }
 
     val candidates = audioManager.getAvailableCommunicationDevices()
+    // Prefer the headset the user is actually wearing; fall back to the
+    // built-in mic only when there is nothing else.
     val preferred = candidates.firstOrNull {
         it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
             it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
             it.type == AudioDeviceInfo.TYPE_USB_HEADSET
     } ?: candidates.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC } ?: return null
 
+    // Re-routing to the same device object the framework already reports is a
+    // no-op and costs nothing; re-routing away from the framework's phantom
+    // A2DP choice onto a real headset input is the whole point.
     try {
         audioManager.setCommunicationDevice(preferred)
         // Routing is asynchronous on most builds, so the recorder is given a
