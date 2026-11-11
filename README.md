@@ -17,6 +17,11 @@ mostly around making voice mode genuinely hands-free and resilient:
 - **Voice calls keep going** - the mic re-arms automatically after every spoken reply, and a
   misheard request is answered by voice ("Sorry, I misheard you. Please repeat.") rather than a
   toast a user with the screen off would never see
+- **No broken speech, no silent stalls** - a reply's sentences play through one AudioTrack that
+  stays fed ahead of the playback head (two TTS fetches in flight, a ~1-2s ring buffer), so
+  sentence boundaries are inaudible; hanging up cuts sound out immediately instead of draining,
+  and when the TTS server falls behind real-time speech, the waiting tippy-taps fill the gap and
+  a display-only note in the chat says the server or connection is too slow
 - **Listening is audible** - a matched pair of synthesized plop cues plays as the microphone opens
   and closes, in voice mode and hands-free alike
 - **Bluetooth and wired headsets work** - microphone capture routes through Android's

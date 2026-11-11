@@ -55,7 +55,8 @@ never commit it and never copy its specifics into this file.
 Device launch/install commands are in `AGENTS.local.md`.
 
 ## Important Patterns & Idioms
-- **Streaming**: `ApiClient.chatCompletion()` delivers deltas through `onChunk`; the full text is finalised after the `[DONE]` marker. Reasoning is separated by a `\u0001` chunk separator and by `parseReasoningAndContent()` (`<think>`/`<reasoning>`/`<thinking>`, plus OpenAI `reasoning_content`).
+- **Streaming**: `ApiClient.chatCompletion()` delivers deltas through `onChunk`; the full text is finalised after the `[DONE]` marker.
+- **Playback is one AudioTrack per reply**: `ReplyAudioPlayer` (`CommonUtilities.kt`) carries every TTS sentence on a single track created on first write; blocking `write()` throttles the producer, the ring is `minBufferSize * 16`, and `finish()` drains once against the frame count actually received - never drain per sentence and never guess the rate (the decoder names it). Starvation (lead < 250ms) fires the player's `onStarving` callback, rate-limited to one warning per 3 seconds; ChatScreen fills that gap with `playWaitingCue()` and appends a `MessageRole.SYSTEM` note that renders in the chat but is never sent to the LLM. Reasoning is separated by a `\u0001` chunk separator and by `parseReasoningAndContent()` (`<think>`/`<reasoning>`/`<thinking>`, plus OpenAI `reasoning_content`).
 - **Wake chat holds one exchange, not a log**: turns accumulate while the card is open and are cleared when the exchange ends.
 - **Close clock**: `touchChat()` stamps activity (each streamed chunk, the user's tap, the start of an exchange); the service waits until real silence reaches `wakeChatCloseSeconds`.
 - **Retry**: `executeWithRetry(operationName, maxRetries = 3, delayMs = 1000)` wraps API calls in `VoiceAssistantService`.
