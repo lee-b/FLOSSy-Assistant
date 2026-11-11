@@ -531,7 +531,12 @@ fun playPcmAudio(pcmBytes: ByteArray, sampleRate: Int, abortSignal: AtomicBoolea
             // every frame has actually left the speaker.
             audioTrack.stop()
             val totalFrames = totalWritten / 2L
-            val deadline = System.currentTimeMillis() + 2000
+            // The drain waits as long as the audio itself lasts plus a beat of
+            // slack - a fixed cap truncates every sentence longer than the cap,
+            // which is exactly the "reply cut off at the end of each portion"
+            // a fixed two-second deadline used to produce on long sentences.
+            val drainMs = totalFrames * 1000L / rate + 500
+            val deadline = System.currentTimeMillis() + drainMs
             while (System.currentTimeMillis() < deadline) {
                 if (audioTrack.playbackHeadPosition >= totalFrames) break
                 Thread.sleep(20)
@@ -1210,7 +1215,10 @@ suspend fun playAudioBytes(data: ByteArray, abortSignal: AtomicBoolean? = null):
             // position is polled until the speaker has actually finished.
             track.stop()
             val totalFrames = totalWritten / 2L
-            val drainDeadline = System.currentTimeMillis() + 2000
+            // Duration-scaled, like playPcmAudio: a fixed cap amputates the
+            // tail of every sentence that outlives it.
+            val drainMs = totalFrames * 1000L / sampleRate + 500
+            val drainDeadline = System.currentTimeMillis() + drainMs
             while (System.currentTimeMillis() < drainDeadline) {
                 if (track.playbackHeadPosition >= totalFrames) break
                 Thread.sleep(20)
