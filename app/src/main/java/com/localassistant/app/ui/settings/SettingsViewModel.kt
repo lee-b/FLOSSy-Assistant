@@ -138,6 +138,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
             // TTS Settings
             "enableTtsStreaming" -> _settings.update { it.copy(enableTtsStreaming = value as Boolean) }
+            "forbidNonLatinTts" -> _settings.update { it.copy(forbidNonLatinTts = value as Boolean) }
 
             // MCP tool servers
             "enableMcpTools" -> _settings.update { it.copy(enableMcpTools = value as Boolean) }

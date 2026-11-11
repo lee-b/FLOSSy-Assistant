@@ -164,6 +164,11 @@ fun recordAudioWithVAD(
 
     var speechDetected = false
     var lastSpeechTime: Long = 0
+    // The loudest chunk seen before speech was detected. When the capture
+    // ends with nothing heard, this is the number that says whether a real
+    // utterance was missed below the threshold or the room was just quiet -
+    // without it, "no speech" hides the evidence in its own log.
+    var peakRms = 0
     // This absolute energy only gates "did anything happen at all" and the
     // silence break. It must not decide where the utterance starts and ends:
     // see voicedSpan, which cuts on the clip's own loudness instead. The old
@@ -194,7 +199,7 @@ fun recordAudioWithVAD(
                 // Nothing was heard within the window the caller allows, so this
                 // is silence, not a late utterance - the caller decides what to
                 // say about it.
-                android.util.Log.d("VAD", "No speech within ${noSpeechTimeoutMs}ms, giving up")
+                android.util.Log.d("VAD", "No speech within ${noSpeechTimeoutMs}ms, giving up (peak RMS $peakRms vs threshold $minEnergy)")
                 break
             }
             val bytesRead = audioRecord.read(buffer, 0, buffer.size)
@@ -219,6 +224,7 @@ fun recordAudioWithVAD(
             val rms = Math.sqrt(totalEnergy.toDouble() / bytesRead).toInt()
 
             // Reset hasSpeechInChunk based on RMS energy, not individual samples
+            if (rms > peakRms) peakRms = rms
             var hasSpeechInChunk = rms > minEnergy
 
             android.util.Log.d("VAD", "Chunk $chunkCount: bytesRead=$bytesRead, RMS=$rms, speechDetected=$speechDetected")
@@ -756,14 +762,25 @@ fun splitIntoSentences(text: String): List<String> {
      enableStreaming: Boolean = false,
      timeoutSeconds: Long,
      abortSignal: AtomicBoolean? = null,
-     onTtsTooSlow: (() -> Unit)? = null
+     onTtsTooSlow: (() -> Unit)? = null,
+     forbidNonLatin: Boolean = true
  ) {
      if (text == null || ttsSettings?.first == null) {
          return
      }
 
-     val cleanText = text.trim()
-     if (cleanText.isEmpty()) {
+     // Even with the language rule in the system prompt, a model can slip a
+     // run of foreign characters into a reply, and the TTS then reads each
+     // one out - "Chinese letter, chinese letter...". Anything outside the
+     // Latin alphabet (and the punctuation and whitespace around it) is
+     // dropped before synthesis; the visible text keeps it, only speech
+     // does not. Latin script ends at U+024F, and Greek, Cyrillic and CJK
+     // all live past it, so a single range check covers every script the
+     // model is likely to leak.
+     val cleanText = if (forbidNonLatin) text.trim().filter { c ->
+         c.isWhitespace() || c.code < 0x250
+     }.trim() else text.trim()
+if (cleanText.isEmpty()) {
          return
      }
 

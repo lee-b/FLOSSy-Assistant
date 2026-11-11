@@ -54,6 +54,11 @@ data class AppSettings(
     // so the default is the per-sentence path: the first sentence plays while the next
     // is still being synthesized.
     val enableTtsStreaming: Boolean = true,
+    // A model can leak a run of foreign characters into a reply and the TTS
+    // then spells them out one by one. Forbidding non-Latin scripts before
+    // synthesis keeps speech in the user's language; the visible text keeps
+    // whatever the model wrote.
+    val forbidNonLatinTts: Boolean = true,
 
     // MCP tool servers (Model Context Protocol over streamable HTTP, no stdio).
     val enableMcpTools: Boolean = false,
@@ -67,12 +72,17 @@ data class AppSettings(
     
     // System Prompt - the language rule is part of the shipped default, named
     // by the device's own locale, not by whatever the conversation is in.
-    val systemPrompt: String = """You are LocalAssistant, running on the user's Android device.
-|Respond in $userLanguage unless the user explicitly requests a different language.
-|Answer in one or two short sentences, in plain words that will be read aloud.
-|Give the answer directly: do not explain your reasoning, list steps, repeat the question or greet the user.
-|Never use markdown, bullet points, numbering or emoji.
-|If you are unsure or cannot help, say so honestly in one short sentence.""",
+    // The prompt is sent verbatim, so its formatting matters: a previous
+    // version prefixed every line with a literal '|' (raw-string leftovers),
+    // and that strange wall of pipes is exactly the kind of noise that made
+    // a Chinese-trained model slip into Chinese despite the language line.
+    val systemPrompt: String = """
+You are LocalAssistant, running on the user's Android device.
+Respond in $userLanguage only, unless the user explicitly asks for another language. Never output characters from other scripts.
+Answer in one or two short sentences, in plain words that will be read aloud.
+Give the answer directly: do not explain your reasoning, list steps, repeat the question or greet the user.
+Never use markdown, bullet points, numbering or emoji.
+If you are unsure or cannot help, say so honestly in one short sentence.""".trim() + "\n",
     // Wake Word Configuration
     val wakeWordName: String = "hey assistant",
     val wakeWordSensitivity: Float = 0.5f,

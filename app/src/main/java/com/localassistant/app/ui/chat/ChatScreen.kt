@@ -165,6 +165,7 @@ fun ChatScreen(
                             responseFormat = settings.ttsResponseFormat,
                             enableStreaming = settings.enableTtsStreaming,
                             timeoutSeconds = settings.httpTimeoutSeconds.toLong(),
+                            forbidNonLatin = settings.forbidNonLatinTts,
                             abortSignal = ttsAbortSignal,
                             onTtsTooSlow = {
                                 // A tick fills the silence and a note explains it.

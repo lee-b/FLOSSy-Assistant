@@ -60,6 +60,7 @@ class SettingsRepository(private val context: Context) {
             ttsApiKey = sharedPreferences.getString("tts_api_key", defaults.ttsApiKey) ?: defaults.ttsApiKey,
             ttsResponseFormat = sharedPreferences.getString("tts_response_format", defaults.ttsResponseFormat) ?: defaults.ttsResponseFormat,
             enableTtsStreaming = sharedPreferences.getBoolean("enable_tts_streaming", defaults.enableTtsStreaming),
+            forbidNonLatinTts = sharedPreferences.getBoolean("forbid_non_latin_tts", defaults.forbidNonLatinTts),
             enableMcpTools = sharedPreferences.getBoolean("enable_mcp_tools", defaults.enableMcpTools),
             mcpServerUrls = sharedPreferences.getString("mcp_server_urls", defaults.mcpServerUrls) ?: defaults.mcpServerUrls,
             mcpLazyTools = sharedPreferences.getBoolean("mcp_lazy_tools", defaults.mcpLazyTools),
@@ -118,6 +119,7 @@ class SettingsRepository(private val context: Context) {
             putString("tts_api_key", settings.ttsApiKey)
             putString("tts_response_format", settings.ttsResponseFormat)
             putBoolean("enable_tts_streaming", settings.enableTtsStreaming)
+            putBoolean("forbid_non_latin_tts", settings.forbidNonLatinTts)
             putBoolean("enable_mcp_tools", settings.enableMcpTools)
             putString("mcp_server_urls", settings.mcpServerUrls)
             putBoolean("mcp_lazy_tools", settings.mcpLazyTools)

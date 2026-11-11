@@ -382,6 +382,9 @@ fun SettingsScreen(onNavigateBack: () -> Unit, viewModel: SettingsViewModel = vi
                 }
                 SettingSwitch("Auto TTS Playback", settings.autoTtsEnabled, { viewModel.updateSetting("autoTtsEnabled", it) })
                 SettingSwitch("Enable Streaming TTS", settings.enableTtsStreaming, { viewModel.updateSetting("enableTtsStreaming", it) })
+                // The TTS spells out leaked foreign characters one by one; this
+                // drops them before synthesis so speech stays in the user's language.
+                SettingSwitch("Forbid non-Latin characters in speech", settings.forbidNonLatinTts, { viewModel.updateSetting("forbidNonLatinTts", it) })
                 TestButton("Test TTS", true, ttsTesting) { viewModel.runEndpointTest("tts") }
             }
 
