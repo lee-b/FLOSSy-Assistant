@@ -136,8 +136,7 @@ fun recordAudioWithVAD(
     stopSignal: java.util.concurrent.atomic.AtomicBoolean,
     maxSeconds: Int = 60,
     silenceThresholdMs: Long = 1000L,
-    noSpeechTimeoutMs: Long = 0L,
-    cue: Boolean = true
+    noSpeechTimeoutMs: Long = 0L
 ): ByteArray? {
     val sampleRate = 16000
     val channelConfig = AudioFormat.CHANNEL_IN_MONO
@@ -174,10 +173,10 @@ fun recordAudioWithVAD(
     android.util.Log.d("VAD", "Starting recording with energy threshold $minEnergy...")
 
     // Capture may have to ride a Bluetooth headset; the route is closed when
-    // the recorder is released. The start cue blocks until it has finished, so
-    // it must be played before the microphone opens, like the wake chime is.
+    // the recorder is released. No cues here: they used to mark every capture,
+    // which put a plonk between listening and responding on every turn - the
+    // callers that open and close a call play the matched pair themselves.
     val restoreRoute = beginCommunicationCapture(context)
-    if (cue) playListenStartCue()
     try {
         audioRecord.startRecording()
 
@@ -254,10 +253,6 @@ fun recordAudioWithVAD(
         try { audioRecord.release() } catch (_: Exception) {}
         restoreRoute?.invoke()
     }
-    // The matched downbeat closes the window whatever ended it - a manual stop,
-    // silence after speech, or the utterance cap.
-    if (cue) playListenEndCue()
-
     android.util.Log.d("VAD", "Recording completed, ${audioBuffers.size} samples (${audioBuffers.size / sampleRate.toFloat()}s)")
 
     if (!speechDetected) {

@@ -45,6 +45,7 @@ import com.localassistant.app.domain.model.DialogMode
 import com.localassistant.app.domain.model.DialogState
 import com.localassistant.app.domain.model.VoiceCallPhase
 import com.localassistant.app.ui.common.playListenEndCue
+import com.localassistant.app.ui.common.playListenStartCue
 import com.localassistant.app.ui.common.recordAudioWithVAD
 import com.localassistant.app.ui.common.shareMessage
 import kotlinx.coroutines.Dispatchers
@@ -107,10 +108,11 @@ fun ChatScreen(
 
     LaunchedEffect(messages.size, streamingContent.value, streamingReasoning.value, settings) {
         val totalItems = lazyListState.layoutInfo.totalItemsCount
-        val isStreaming = streamingContent.value.isNotEmpty() || streamingReasoning.value.isNotEmpty()
-        // Auto-scroll to the bottom while the AI is responding, and whenever the
-        // user is already near the bottom (so we don't yank them away from history).
-        if (totalItems > 0 && (isStreaming || lazyListState.isNearBottom())) {
+        // Auto-scroll to the bottom only while the user is already near it -
+        // chasing every streamed chunk would yank the list away from somebody
+        // scrolling back through the reply, which made the list unscrollable
+        // exactly while a response was playing.
+        if (totalItems > 0 && lazyListState.isNearBottom()) {
             // Scrolling to the last item only pins its *top* at the viewport top, so
             // every new streamed line of a growing response falls below the fold.
             // Offsetting that item by its own overflow past the viewport puts its
@@ -197,11 +199,13 @@ fun ChatScreen(
 
         coroutineScope.launch {
             try {
-                // The plop plays only when a call opens or closes - the re-arms
-                // between turns stay quiet, so the cues mark the call, not
-                // every turn inside it.
+                // The upbeat is the call's opening sound, played once before the
+                // microphone opens. The re-arms between turns pass announce =
+                // false and stay quiet - the cues mark the call, not the turns
+                // inside it.
+                if (announce) withContext(Dispatchers.IO) { playListenStartCue() }
                 val wavBytes = withContext(Dispatchers.IO) {
-                    recordAudioWithVAD(context.applicationContext, recordingStopSignal, cue = announce)
+                    recordAudioWithVAD(context.applicationContext, recordingStopSignal)
                 }
 
                 if (wavBytes == null || wavBytes.isEmpty()) {
@@ -397,7 +401,9 @@ fun ChatScreen(
         stopMicRecording()
         // The downbeat is the call's closing sound - it plays once, here,
         // never between the turns inside the call.
-        playListenEndCue()
+        coroutineScope.launch {
+            withContext(Dispatchers.IO) { playListenEndCue() }
+        }
     }
 
     /**
