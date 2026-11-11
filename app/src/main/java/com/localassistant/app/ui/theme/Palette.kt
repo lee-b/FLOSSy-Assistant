@@ -23,16 +23,19 @@ package com.localassistant.app.ui.theme
  */
 const val TRANSPARENT = 0x00000000
 
-// Gruvbox dark scheme.
-const val GRUVBOX_PRIMARY = 0xFFF2A94C.toInt() // Warm yellow/orange (Gruvbox accent)
+// Gruvbox dark scheme. The accents are a cool slate blue-gray: a low-saturation
+// steel hue sits quietly on the dark neutral surfaces, keeps the user bubble and
+// the action buttons calm instead of shouting in warm orange, and leaves the
+// error red as the only warm colour on screen - the one that should be loud.
+const val GRUVBOX_PRIMARY = 0xFF9BB7D4.toInt() // Soft steel blue (accent)
 const val GRUVBOX_ON_PRIMARY = 0xFF2B2B2B.toInt()
-const val GRUVBOX_PRIMARY_CONTAINER = 0xFFD48A30.toInt()
-const val GRUVBOX_SECONDARY = 0xFFD75D00.toInt() // Deep orange (Gruvbox accent)
+const val GRUVBOX_PRIMARY_CONTAINER = 0xFF86A3C2.toInt()
+const val GRUVBOX_SECONDARY = 0xFF86A3C2.toInt() // Muted slate blue (secondary accent)
 const val GRUVBOX_ON_SECONDARY = 0xFF2B2B2B.toInt()
-const val GRUVBOX_SECONDARY_CONTAINER = 0xFFB54E00.toInt()
-const val GRUVBOX_TERTIARY = 0xFFCC8836.toInt() // Golden brown (Gruvbox accent)
+const val GRUVBOX_SECONDARY_CONTAINER = 0xFF5E7C9E.toInt()
+const val GRUVBOX_TERTIARY = 0xFF7E9CB8.toInt() // Blue-gray (tertiary accent)
 const val GRUVBOX_ON_TERTIARY = 0xFF333333.toInt()
-const val GRUVBOX_TERTIARY_CONTAINER = 0xFFA86C1A.toInt()
+const val GRUVBOX_TERTIARY_CONTAINER = 0xFF56708A.toInt()
 const val GRUVBOX_BACKGROUND = 0xFF2B2B2B.toInt() // Neutral dark gray
 const val GRUVBOX_ON_BACKGROUND = 0xFFE8E8E8.toInt()
 const val GRUVBOX_SURFACE = 0xFF333333.toInt() // Neutral gray
@@ -46,28 +49,28 @@ const val GRUVBOX_ERROR = 0xFFCC3D2B.toInt() // Red-orange for errors (Gruvbox s
 const val GRUVBOX_ON_ERROR = 0xFF2B2B2B.toInt()
 
 // Gruvbox light scheme (fallback palette).
-const val GRUVBOX_LIGHT_PRIMARY = 0xFFB57617.toInt() // Golden brown
-const val GRUVBOX_LIGHT_ON_PRIMARY = 0xFF333333.toInt()
-const val GRUVBOX_LIGHT_PRIMARY_CONTAINER = 0xFFD7A66E.toInt()
-const val GRUVBOX_LIGHT_SECONDARY = 0xFF8F6300.toInt() // Darker orange
-const val GRUVBOX_LIGHT_ON_SECONDARY = 0xFFFBF1DE.toInt()
-const val GRUVBOX_LIGHT_SECONDARY_CONTAINER = 0xFFE8B878.toInt()
-const val GRUVBOX_LIGHT_TERTIARY = 0xFFA47D52.toInt() // Warm gray-brown
-const val GRUVBOX_LIGHT_ON_TERTIARY = 0xFFFBF1DE.toInt()
-const val GRUVBOX_LIGHT_TERTIARY_CONTAINER = 0xFFD4A673.toInt()
-const val GRUVBOX_LIGHT_BACKGROUND = 0xFFFDF6E3.toInt() // Cream/beige
+const val GRUVBOX_LIGHT_PRIMARY = 0xFF5C7C9E.toInt() // Steel blue (accent)
+const val GRUVBOX_LIGHT_ON_PRIMARY = 0xFFF7FAFD.toInt()
+const val GRUVBOX_LIGHT_PRIMARY_CONTAINER = 0xFFB9CDE3.toInt()
+const val GRUVBOX_LIGHT_SECONDARY = 0xFF4A6A8C.toInt() // Deeper slate blue
+const val GRUVBOX_LIGHT_ON_SECONDARY = 0xFFF7FAFD.toInt()
+const val GRUVBOX_LIGHT_SECONDARY_CONTAINER = 0xFFA9C0D8.toInt()
+const val GRUVBOX_LIGHT_TERTIARY = 0xFF54708D.toInt() // Blue-gray
+const val GRUVBOX_LIGHT_ON_TERTIARY = 0xFFF7FAFD.toInt()
+const val GRUVBOX_LIGHT_TERTIARY_CONTAINER = 0xFF9FB4C9.toInt()
+const val GRUVBOX_LIGHT_BACKGROUND = 0xFFF2F5F8.toInt() // Cool off-white
 const val GRUVBOX_LIGHT_ON_BACKGROUND = 0xFF333333.toInt()
-const val GRUVBOX_LIGHT_SURFACE = 0xFFFBF1DE.toInt() // Lighter cream
-const val GRUVBOX_LIGHT_SURFACE_VARIANT = 0xFFF2E8D5.toInt()
-const val GRUVBOX_LIGHT_ON_SURFACE_VARIANT = 0xFFA47D52.toInt()
+const val GRUVBOX_LIGHT_SURFACE = 0xFFE9EEF3.toInt() // Lighter cool gray
+const val GRUVBOX_LIGHT_SURFACE_VARIANT = 0xFFDDE4EB.toInt()
+const val GRUVBOX_LIGHT_ON_SURFACE_VARIANT = 0xFF5C7286.toInt()
 const val GRUVBOX_LIGHT_ERROR = 0xFFAF3A1B.toInt()
-const val GRUVBOX_LIGHT_ON_ERROR = 0xFFFBF1DE.toInt()
-const val GRUVBOX_LIGHT_SURFACE_DIM = 0xFFEFE2CC.toInt()
-const val GRUVBOX_LIGHT_SURFACE_BRIGHT = 0xFFFBF1DE.toInt()
-const val GRUVBOX_LIGHT_SURFACE_CONTAINER_LOW = 0xFFF5E9D4.toInt()
-const val GRUVBOX_LIGHT_SURFACE_CONTAINER = 0xFFF2E8D5.toInt()
-const val GRUVBOX_LIGHT_SURFACE_CONTAINER_HIGH = 0xFFECE1CB.toInt()
-const val GRUVBOX_LIGHT_SURFACE_CONTAINER_HIGHEST = 0xFFE8D9C1.toInt()
+const val GRUVBOX_LIGHT_ON_ERROR = 0xFFF7FAFD.toInt()
+const val GRUVBOX_LIGHT_SURFACE_DIM = 0xFFDCE3E9.toInt()
+const val GRUVBOX_LIGHT_SURFACE_BRIGHT = 0xFFE9EEF3.toInt()
+const val GRUVBOX_LIGHT_SURFACE_CONTAINER_LOW = 0xFFE4EAF0.toInt()
+const val GRUVBOX_LIGHT_SURFACE_CONTAINER = 0xFFDDE4EB.toInt()
+const val GRUVBOX_LIGHT_SURFACE_CONTAINER_HIGH = 0xFFD5DEE5.toInt()
+const val GRUVBOX_LIGHT_SURFACE_CONTAINER_HIGHEST = 0xFFCFD9E2.toInt()
 
 /**
  * The card the wake session draws.
@@ -101,7 +104,7 @@ const val WAKE_USER_BUBBLE = GRUVBOX_SURFACE_MED
  * accent itself, so the card stays Gruvbox while the answer is still obvious
  * against the user's gray.
  */
-const val WAKE_REPLY_BUBBLE = 0xFF342A1F.toInt()
+const val WAKE_REPLY_BUBBLE = 0xFF26303B.toInt()
 
 /**
  * The rule drawn between the two bubbles.
@@ -121,5 +124,5 @@ const val WAKE_DIVIDER = 0x2AE8E8E8.toInt()
  * service does not name is taken as a fault and wears [GRUVBOX_ERROR].
  */
 const val WAKE_PHASE_LISTENING = 0xFF67B744.toInt()
-const val WAKE_PHASE_THINKING = 0xFFEF7E3B.toInt()
+const val WAKE_PHASE_THINKING = 0xFF7A94A8.toInt()
 const val WAKE_PHASE_ANSWERING = GRUVBOX_PRIMARY

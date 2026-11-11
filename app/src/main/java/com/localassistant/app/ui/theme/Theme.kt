@@ -113,7 +113,8 @@ val GruvboxLightColorScheme = lightColorScheme(
 
 /**
  * Custom Gruvbox-themed Material3 theme.
- * Uses Gruvbox dark colors by default with yellow (#F2A94C), orange (#D75D00), and gray (#A89A8C).
+ * Dark by default; the accents are a cool slate blue-gray over neutral gray
+ * surfaces, so only the error red carries a warm hue.
  */
 @Composable
 fun LocalAssistantTheme(

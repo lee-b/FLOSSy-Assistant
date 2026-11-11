@@ -511,6 +511,18 @@ fun playPcmAudio(pcmBytes: ByteArray, sampleRate: Int, abortSignal: AtomicBoolea
                 continue
             }
 
+            // The caller hung up mid-sentence: cut the sound out of the speaker
+            // right now instead of playing the already-written buffer out. The
+            // drain discipline below exists to protect a reply's tail; an abort
+            // exists to silence it.
+            if (abortSignal?.get() == true) {
+                audioTrack.pause()
+                audioTrack.flush()
+                audioTrack.release()
+                android.util.Log.d("TTS", "Playback cut short by abort (written=$totalWritten)")
+                return false
+            }
+
             // The write is blocking but only until the buffer accepts the data,
             // so returning here would leave the speaker still sounding the tail
             // - which the freshly re-armed microphone then hears as speech and
@@ -1178,6 +1190,20 @@ suspend fun playAudioBytes(data: ByteArray, abortSignal: AtomicBoolean? = null):
                 "TTS",
                 "Feed/decode finished: fed=$offset/${data.size} bytes, chunks=$feedCount, pcm=$totalWritten"
             )
+
+            // An abort cuts the sound out of the speaker immediately - the
+            // drain discipline below exists to protect a reply's tail, and an
+            // abort exists to silence it, so it must not play out what was
+            // already written.
+            if (abortSignal?.get() == true) {
+                track.pause()
+                track.flush()
+                track.release()
+                codec.stop()
+                codec.release()
+                android.util.Log.d("TTS", "MediaCodec playback cut short by abort (written=$totalWritten)")
+                return@withContext false
+            }
 
             // Same drain discipline as playPcmAudio: stop() plays out what is
             // already written (flush() would cut the reply's tail), and the head

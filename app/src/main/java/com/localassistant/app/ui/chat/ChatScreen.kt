@@ -99,7 +99,23 @@ fun ChatScreen(
     // Raised when the user ends a call mid-listen, so the half-heard utterance
     // is discarded instead of sent on to STT.
     val discardCurrentUtterance = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    // Every coroutine that carries a piece of a voice call - the exchange
+    // pipeline, its re-arms, the spoken prompts. Hanging up cancels them all,
+    // so a call can neither answer nor speak a word after its user ended it.
+    val voiceJobs = java.util.concurrent.ConcurrentLinkedQueue<kotlinx.coroutines.Job>()
     val coroutineScope = rememberCoroutineScope()
+
+    /**
+     * Launches a coroutine on the screen scope and registers it as a voice
+     * job so [stopVoiceCall] can cancel it.
+     */
+    fun launchVoiceJob(block: suspend kotlinx.coroutines.CoroutineScope.() -> Unit): kotlinx.coroutines.Job {
+        val job = coroutineScope.launch { block() }
+        voiceJobs.add(job)
+        job.invokeOnCompletion { voiceJobs.remove(job) }
+        return job
+    }
     val context = LocalContext.current
     val lazyListState = rememberLazyListState()
 
@@ -133,7 +149,7 @@ fun ChatScreen(
             val lastIdx = messages.indexOf(lastMsg)
             if (lastIdx != ttsPlayedMessageIndex && lastMsg.content != lastAssistantMessage) {
                 lastAssistantMessage = lastMsg.content
-                coroutineScope.launch {
+                launchVoiceJob {
                     android.util.Log.d("ChatScreen", "Auto-playing TTS for completed message: ${lastMsg.content.take(50)}")
                     ttsAbortSignal.set(false)
                     // Speaking is a phase of the call, not a separate flag -
@@ -197,7 +213,7 @@ fun ChatScreen(
         recordedAudioBytes = null
         recordingStopSignal.set(false)
 
-        coroutineScope.launch {
+        launchVoiceJob {
             try {
                 // The upbeat is the call's opening sound, played once before the
                 // microphone opens. The re-arms between turns pass announce =
@@ -216,18 +232,18 @@ fun ChatScreen(
                     // blank transcript after real speech gets the spoken
                     // repeat prompt further down.
                     if (viewModel.dialogState.value.isVoiceCall) {
-                        coroutineScope.launch {
+                        launchVoiceJob {
                             delay(800)
                             if (viewModel.dialogState.value.isVoiceCall) withContext(Dispatchers.Main) { startMicRecording(announce = false) }
                         }
                     }
-                    return@launch
+                    return@launchVoiceJob
                 }
 
                 recordedAudioBytes = wavBytes
 
                                                                  // Automatically process the recording after VAD stops
-                coroutineScope.launch {
+                launchVoiceJob {
                     try {
                         viewModel.setDialogPhase(VoiceCallPhase.TRANSCRIBING)
 
@@ -236,7 +252,7 @@ fun ChatScreen(
                         // to send on to STT.
                         if (discardCurrentUtterance.get()) {
                             viewModel.endVoiceCall()
-                            return@launch
+                            return@launchVoiceJob
                         }
 
                         val transcribedText = withContext(Dispatchers.IO) {
@@ -315,7 +331,7 @@ fun ChatScreen(
                                 // through the speaker, so the mic re-arms the
                                 // moment it has finished, like the wake chat.
                                 viewModel.setDialogPhase(VoiceCallPhase.IDLE)
-                                if (viewModel.dialogState.value.isVoiceCall) coroutineScope.launch {
+                                if (viewModel.dialogState.value.isVoiceCall) launchVoiceJob {
                                     // The speaker is still ringing in the room
                                     // right after playback returns; a beat of
                                     // settle keeps the first capture from
@@ -332,7 +348,7 @@ fun ChatScreen(
                                 viewModel.setDialogPhase(VoiceCallPhase.IDLE)
                             }
                             if (viewModel.dialogState.value.isVoiceCall) {
-                                coroutineScope.launch {
+                                launchVoiceJob {
                                     ttsAbortSignal.set(false)
                                     if (viewModel.dialogState.value.isVoiceCall) viewModel.setDialogPhase(VoiceCallPhase.SPEAKING)
                                     try {
@@ -350,7 +366,7 @@ fun ChatScreen(
                                         if (viewModel.dialogState.value.isVoiceCall) viewModel.setDialogPhase(VoiceCallPhase.IDLE)
                                     }
                                 }
-                                coroutineScope.launch {
+                                launchVoiceJob {
                                     // Re-arm the mic once the prompt has been spoken.
                                     delay(3000)
                                     if (viewModel.dialogState.value.isVoiceCall) withContext(Dispatchers.Main) {
@@ -359,6 +375,11 @@ fun ChatScreen(
                                 }
                             }
                         }
+                    } catch (e: java.util.concurrent.CancellationException) {
+                        // Hanging up cancelled this job on purpose - falling
+                        // through to the error toast would greet the person
+                        // who just ended the call with an error popup.
+                        throw e
                     } catch (e: Exception) {
                         withContext(Dispatchers.Main) {
                             viewModel.setDialogPhase(VoiceCallPhase.IDLE)
@@ -367,6 +388,8 @@ fun ChatScreen(
                         }
                     }
                 }
+            } catch (e: java.util.concurrent.CancellationException) {
+                throw e
             } catch (e: Exception) {
                 viewModel.setDialogPhase(VoiceCallPhase.IDLE)
                 Toast.makeText(context.applicationContext, "Recording failed: ${e.message}", Toast.LENGTH_LONG).show()
@@ -399,6 +422,13 @@ fun ChatScreen(
         ttsAbortSignal.set(true)
         discardCurrentUtterance.set(true)
         stopMicRecording()
+        // Cancel every coroutine still carrying the call - the exchange
+        // pipeline, its re-arms, any spoken prompt it was about to give - so
+        // nothing can transcribe, answer, or speak after the user hung up.
+        // The abort signal above only silences what is already on the speaker;
+        // the cancellations stop the rest of the pipeline that hasn't spoken
+        // yet.
+        for (job in voiceJobs) job.cancel()
         // The downbeat is the call's closing sound - it plays once, here,
         // never between the turns inside the call.
         coroutineScope.launch {
@@ -511,6 +541,27 @@ fun ChatScreen(
                                         )
                                     },
                                     onClick = { menuExpanded = false }
+                                )
+
+                                HorizontalDivider()
+
+                                // The exports live in the menu, not the main
+                                // window - exporting is rare, so it has no
+                                // business occupying a row of prime screen
+                                // space above the history.
+                                DropdownMenuItem(
+                                    text = { Text(context.getString(R.string.chat_export_button)) },
+                                    onClick = {
+                                        exportChatToTextFile(context, messages)
+                                        menuExpanded = false
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Export JSON") },
+                                    onClick = {
+                                        exportChatToJsonFile(context, messages)
+                                        menuExpanded = false
+                                    }
                                 )
 
                                 HorizontalDivider()
@@ -639,30 +690,6 @@ fun ChatScreen(
                             messages
                         } else {
                             messages.filter { it.content.contains(searchQuery, ignoreCase = true) }
-                        }
-
-                        // Export buttons row
-                        item {
-                            val exportContext = LocalContext.current
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                Button(
-                                    onClick = { exportChatToTextFile(exportContext, messages) },
-                                    modifier = Modifier.weight(1f),
-                                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer)
-                                ) {
-                                    Text(context.getString(R.string.chat_export_button))
-                                }
-                                Button(
-                                    onClick = { exportChatToJsonFile(exportContext, messages) },
-                                    modifier = Modifier.weight(1f),
-                                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
-                                ) {
-                                    Text("📤 Export JSON")
-                                }
-                            }
                         }
 
                         // Show pinned messages at the top
