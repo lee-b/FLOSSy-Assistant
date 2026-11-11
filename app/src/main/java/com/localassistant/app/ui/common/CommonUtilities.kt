@@ -148,9 +148,8 @@ class StreamingCallCapture(
         // How long one chunk of silence ends an utterance, like the per-turn
         // recorder's pause.
         private const val UTTERANCE_SILENCE_MS = 1000L
-        // Absolute energy that only gates "did anything happen at all" - the
-        // utterance boundaries are relative, cut by voicedSpan.
-        private const val MIN_ENERGY = 300
+        // The utterance boundaries are relative, cut by voicedSpan; the gate
+        // itself is adaptive (see run()).
     }
 
     private var record: android.media.AudioRecord? = null
@@ -209,6 +208,13 @@ class StreamingCallCapture(
         var inUtterance = false
         var silenceChunks = 0
         var peakRms = 0
+        // The same adaptive floor as the per-turn recorder: a fixed gate
+        // cannot fit every device and every room, and a gate too low for the
+        // room turns noise into utterances that STT then mishears.
+        var noiseFloor = 12.0
+        val floorWindow = ArrayDeque<Int>()
+        val speechAboveFloor = 3.5
+        val minEnergy = 300
         try {
             rec.startRecording()
             while (!stopSignal.get()) {
@@ -217,8 +223,17 @@ class StreamingCallCapture(
                 var energy = 0.0
                 for (i in 0 until read) energy += buffer[i].toDouble() * buffer[i]
                 val rms = kotlin.math.sqrt(energy / read)
-                val voiced = rms > MIN_ENERGY
                 if (rms > peakRms) peakRms = rms.toInt()
+                // Track the room from the quietest recent chunk, like the
+                // per-turn recorder, and gate against it by factor.
+                floorWindow.add(rms.toInt())
+                if (floorWindow.size > 75) {
+                    val min = floorWindow.min()
+                    noiseFloor = noiseFloor * 0.7 + min * 0.3
+                    floorWindow.removeFirst()
+                }
+                val gate = maxOf(minEnergy, (noiseFloor * speechAboveFloor).toInt())
+                val voiced = rms > gate
 
                 // While the assistant speaks, this stream hears its own reply:
                 // the gate is closed and nothing here may become an utterance.
@@ -338,7 +353,19 @@ fun recordAudioWithVAD(
     // 800 sat above normal speech through a headset mic - whole sentences
     // peaked under 500 RMS in the logs - so detection needed shouting, then
     // stopping, before anything was heard.
-    val minEnergy = 300
+    //
+    // A fixed gate also fails the other direction: a noisy room (fan, street,
+    // a loud TV) sits far above any quiet-room threshold, and chunks of pure
+    // noise read as speech, so the recorder fills with noise and mishears.
+    // The gate is therefore adaptive: a running noise floor tracks the
+    // quietest recent chunks (the room's own level, whatever device and
+    // environment it is), and speech must clear the floor by a factor, not
+    // by a constant. The floor only rises from quiet samples, so it follows
+    // the room without being dragged up by the speech it is meant to gate.
+    var noiseFloor = 12.0
+    var floorWindow = ArrayDeque<Int>()
+    var speechAboveFloor = 3.5  // speech must be 3.5x the floor
+    var minEnergy = 300
     val recordingStart = System.currentTimeMillis()
 
     android.util.Log.d("VAD", "Starting recording with energy threshold $minEnergy...")
@@ -388,9 +415,27 @@ fun recordAudioWithVAD(
 
             // Reset hasSpeechInChunk based on RMS energy, not individual samples
             if (rms > peakRms) peakRms = rms
-            var hasSpeechInChunk = rms > minEnergy
 
-            android.util.Log.d("VAD", "Chunk $chunkCount: bytesRead=$bytesRead, RMS=$rms, speechDetected=$speechDetected")
+            // Track the room: the lowest chunks seen recently set the floor.
+            // A 9-second window (75 x 120ms) is long enough to ride out a
+            // word and short enough to follow a door opening.
+            floorWindow.add(rms)
+            if (floorWindow.size > 75) {
+                val removed = floorWindow.removeFirst()
+                val min = floorWindow.min()
+                // The floor is the window's quietest chunk, smoothed; only
+                // apply it when the removed sample was itself quiet, so a
+                // burst of speech in the window cannot lower the floor it
+                // would have raised.
+                noiseFloor = noiseFloor * 0.7 + min * 0.3
+            }
+            // The effective gate: a constant floor for a quiet room, a high
+            // one for a loud room - speech always has to clear it by the
+            // same factor.
+            val effectiveGate = maxOf(minEnergy, (noiseFloor * speechAboveFloor).toInt())
+            var hasSpeechInChunk = rms > effectiveGate
+
+            android.util.Log.d("VAD", "Chunk $chunkCount: bytesRead=$bytesRead, RMS=$rms, gate=$effectiveGate, floor=${noiseFloor.toInt()}, speechDetected=$speechDetected")
 
             if (hasSpeechInChunk) {
                 lastSpeechTime = System.currentTimeMillis()
@@ -929,6 +974,39 @@ fun splitIntoSentences(text: String): List<String> {
 }
 
 /**
+ * Speaks a reply through TTS. The whole body runs on the IO dispatcher: the
+ * player's blocking AudioTrack writes may stall for as long as the buffer is
+ * full, and an ANR trace caught the main thread parked inside
+ * ReplyAudioPlayer.write after a reply - speech must never block the thread
+ * that answers the user's taps.
+ */
+suspend fun playTTSAudio(
+    text: String?,
+    ttsSettings: Pair<String?, String?>?,
+    model: String = "tts-1-hd",
+    voice: String? = null,
+    responseFormat: String = "mp3",
+    enableStreaming: Boolean = false,
+    timeoutSeconds: Long,
+    abortSignal: java.util.concurrent.atomic.AtomicBoolean? = null,
+    onTtsTooSlow: (() -> Unit)? = null,
+    forbidNonLatin: Boolean = true
+): Unit = withContext(Dispatchers.IO) {
+    playTTSAudioInternal(
+        text,
+        ttsSettings,
+        model,
+        voice,
+        responseFormat,
+        enableStreaming,
+        timeoutSeconds,
+        abortSignal,
+        onTtsTooSlow,
+        forbidNonLatin
+    )
+}
+
+/**
  * Play TTS audio for the given text using the configured endpoint.
  * Supports both full response and streaming modes.
  *
@@ -941,7 +1019,7 @@ fun splitIntoSentences(text: String): List<String> {
  * @param abortSignal Raised while the reply is being spoken - the wake word cut the
  *   exchange short, so the rest of the audio is dropped rather than played.
  */
- suspend fun playTTSAudio(
+ suspend fun playTTSAudioInternal(
      text: String?,
      ttsSettings: Pair<String?, String?>?,
      model: String = "tts-1-hd",
