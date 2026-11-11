@@ -295,10 +295,13 @@ class VoiceAssistantService : Service() {
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_START -> startListening()
-            ACTION_STOP -> stopListening()
-            ACTION_PAUSE -> pauseService()
-            ACTION_RESUME -> resumeService()
+            // Both paths block (audio route polling, cue playback, TTS wait,
+            // thread joins), so neither may run on the main thread - doing
+            // that froze input dispatch long enough to ANR the app.
+            ACTION_START -> serviceScope.launch { startListening() }
+            ACTION_STOP -> serviceScope.launch { stopListening() }
+            ACTION_PAUSE -> serviceScope.launch { pauseService() }
+            ACTION_RESUME -> serviceScope.launch { resumeService() }
             ACTION_END_CALL -> {
                 // Off the main thread: stopListening() waits for TTS and joins
                 // the recording thread, and doing that here froze the input
@@ -394,7 +397,7 @@ class VoiceAssistantService : Service() {
      * Start the voice assistant pipeline.
      */
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
-    private fun startListening() {
+    private suspend fun startListening() {
         if (_state.value == STATE_IDLE) {
             _state.value = STATE_LISTENING
             // A previous stopListening() cancelled the scope; resumeService()/the
@@ -469,7 +472,7 @@ class VoiceAssistantService : Service() {
      * Stop the voice assistant with graceful shutdown.
      * Waits for current TTS playback to finish, then properly cleans up resources.
      */
-    private fun stopListening() {
+    private suspend fun stopListening() {
         currentAudioLevel = 0
         
         // If TTS is currently playing, wait briefly for it to finish before cancelling
@@ -514,7 +517,7 @@ class VoiceAssistantService : Service() {
     }
 
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
-    private fun resumeService() {
+    private suspend fun resumeService() {
         startListening()
     }
 
@@ -561,7 +564,7 @@ class VoiceAssistantService : Service() {
         }
     }
 
-    private fun pauseService() {
+    private suspend fun pauseService() {
         stopListening()
     }
 
@@ -1191,9 +1194,14 @@ class VoiceAssistantService : Service() {
             .getOrDefault(false)
         if (stop) {
             android.util.Log.d("VoiceAssistantService", "Task removed: stopping the service as the settings ask")
-            stopListening()
-            stopForeground(android.app.Service.STOP_FOREGROUND_REMOVE)
-            stopSelf()
+            // The service may be dying with no scope to launch on: keep the
+            // stop work on a detached coroutine so the join and TTS wait
+            // never touch the main thread.
+            kotlinx.coroutines.CoroutineScope(Dispatchers.Default).launch {
+                stopListening()
+                stopForeground(android.app.Service.STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            }
         }
     }
 
@@ -1212,7 +1220,9 @@ class VoiceAssistantService : Service() {
             // Receiver may not have been registered
         }
         connectionWaitingScope.cancel()
-        stopListening()
+        // onDestroy may be called on the main thread: the stop waits on TTS
+        // and joins the recording thread, so it must not block here.
+        kotlinx.coroutines.CoroutineScope(Dispatchers.Default).launch { stopListening() }
     }
     
     // ==================== Wake Word Detection ====================

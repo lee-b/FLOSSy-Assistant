@@ -610,9 +610,18 @@ class ReplyAudioPlayer(
  *   wake word can take over mid-reply.
  * @return true if any audio was played.
  */
-fun playPcmAudio(pcmBytes: ByteArray, sampleRate: Int, abortSignal: AtomicBoolean? = null, player: ReplyAudioPlayer? = null): Boolean {
+suspend fun playPcmAudio(pcmBytes: ByteArray, sampleRate: Int, abortSignal: AtomicBoolean? = null, player: ReplyAudioPlayer? = null): Boolean {
     if (pcmBytes.isEmpty()) return false
     if (player != null) return player.write(pcmBytes, pcmBytes.size, sampleRate)
+    // A cue or standalone PCM opens its own track, and that means blocking
+    // writes plus a drain that sleeps on the playback head - the ANR showed
+    // the main thread stalling in exactly such a wait, so this runs on IO.
+    return withContext(Dispatchers.IO) {
+        playPcmAudioOnOwnTrack(pcmBytes, sampleRate, abortSignal)
+    }
+}
+
+private fun playPcmAudioOnOwnTrack(pcmBytes: ByteArray, sampleRate: Int, abortSignal: AtomicBoolean?): Boolean {
 
     val preferredRate = if (sampleRate in 8000..96000) sampleRate else 22050
     val rates = (listOf(preferredRate) + listOf(22050, 16000, 24000, 44100, 8000, 11025))
@@ -946,14 +955,14 @@ private const val WAITING_CUE_SAMPLE_RATE = 16000
  * the same up-chirp ChatGPT plays when its voice session opens. Synthesised so
  * it needs no asset and still plays while the app is minimized.
  */
-fun playListenStartCue(): Boolean = playPlopCue(240.0, 900.0)
+suspend fun playListenStartCue(): Boolean = playPlopCue(240.0, 900.0)
 
 /**
  * The falling downbeat that closes a listening window - a drop chirp paired
  * with [playListenStartCue], so opening and closing the mic read as a matched
  * pair like a ChatGPT-style voice session.
  */
-fun playListenEndCue(): Boolean = playPlopCue(900.0, 240.0)
+suspend fun playListenEndCue(): Boolean = playPlopCue(900.0, 240.0)
 
 /**
  * Renders one bubble-like chirp sweeping between two frequencies.
@@ -962,7 +971,7 @@ fun playListenEndCue(): Boolean = playPlopCue(900.0, 240.0)
  * sample, because an instantaneous-frequency sine would click wherever the
  * sweep passes through; a cumulative phase makes the plop continuous.
  */
-private fun playPlopCue(fromHz: Double, toHz: Double): Boolean {
+private suspend fun playPlopCue(fromHz: Double, toHz: Double): Boolean {
     val durationMs = 160
     val seconds = durationMs / 1000.0
     val samples = FloatArray(WAITING_CUE_SAMPLE_RATE * durationMs / 1000)
@@ -1075,7 +1084,7 @@ fun beginCommunicationCapture(context: Context): (() -> Unit)? {
  * along, never as an alarm. At lowish volume it never interrupts speech or the
  * TTS reply.
  */
-fun playWaitingCue(): Boolean {
+suspend fun playWaitingCue(): Boolean {
     val durationMs = 450
     val samples = FloatArray(WAITING_CUE_SAMPLE_RATE * durationMs / 1000)
     // Three quick ticks, rising in pitch and dropping in level: tip, tip,
@@ -1130,7 +1139,7 @@ private fun addSoftTick(
  * is what the wake pipeline needs: the request recording must not start before the
  * user has heard that they can speak.
  */
-fun playWakeCue(): Boolean {
+suspend fun playWakeCue(): Boolean {
     val durationMs = 320
     val samples = FloatArray(WAKE_CUE_SAMPLE_RATE * durationMs / 1000)
     addFadingNote(samples, 0, 180, 1046.5f, 0.30f)
