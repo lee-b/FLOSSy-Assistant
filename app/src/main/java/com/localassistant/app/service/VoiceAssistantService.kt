@@ -594,7 +594,12 @@ class VoiceAssistantService : Service() {
                             inSpeech = false
                             silenceStart = 0L
                             currentAudioLevel = 0
-                            processUtterance(utterance)
+                            // A quarter-second is the shortest span that can
+                            // carry a word; shorter blips are clicks and echoes
+                            // that STT only answers with a blank transcript.
+                            if (utterance.size >= sampleRate / 4) {
+                                processUtterance(utterance)
+                            }
                         }
                     }
                 } else if (readCount == 0) {

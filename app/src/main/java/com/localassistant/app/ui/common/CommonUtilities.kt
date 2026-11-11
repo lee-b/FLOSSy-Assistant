@@ -279,6 +279,13 @@ fun recordAudioWithVAD(
     val (voicedFrom, voicedTo) = voicedSpan(audioBuffers, buffer.size, VOICED_TRIM_FRACTION)
     val from = kotlin.math.max(0, voicedFrom - leadSamples)
     val to = kotlin.math.min(audioBuffers.size, voicedTo + trailSamples)
+    // A quarter-second is the shortest span that can carry a word: anything
+    // less is a door click, a breath or the speaker's own tail, and sending it
+    // to STT only earns a blank transcript and a needless "misheard" answer.
+    if (voicedTo - voicedFrom < sampleRate / 4) {
+        android.util.Log.d("VAD", "Voiced span ${(voicedTo - voicedFrom) / (sampleRate / 1000)}ms is under 250ms, treating as noise")
+        return null
+    }
     if (to <= from) return null
 
     // Convert to WAV format (little-endian PCM)
@@ -509,9 +516,19 @@ fun playPcmAudio(pcmBytes: ByteArray, sampleRate: Int, abortSignal: AtomicBoolea
                 continue
             }
 
-            // Block until the internal buffer is fully drained (playback complete)
-            audioTrack.flush()
+            // The write is blocking but only until the buffer accepts the data,
+            // so returning here would leave the speaker still sounding the tail
+            // - which the freshly re-armed microphone then hears as speech and
+            // turns into phantom utterances. stop() plays out what was written
+            // (flush() would discard it), and the head position is polled until
+            // every frame has actually left the speaker.
             audioTrack.stop()
+            val totalFrames = totalWritten / 2L
+            val deadline = System.currentTimeMillis() + 2000
+            while (System.currentTimeMillis() < deadline) {
+                if (audioTrack.playbackHeadPosition >= totalFrames) break
+                Thread.sleep(20)
+            }
             audioTrack.release()
             android.util.Log.d("TTS", "Played ${totalWritten} bytes at ${rate}Hz")
             return true
@@ -1151,8 +1168,16 @@ suspend fun playAudioBytes(data: ByteArray, abortSignal: AtomicBoolean? = null):
                 "Feed/decode finished: fed=$offset/${data.size} bytes, chunks=$feedCount, pcm=$totalWritten"
             )
 
-            track.flush()
+            // Same drain discipline as playPcmAudio: stop() plays out what is
+            // already written (flush() would cut the reply's tail), and the head
+            // position is polled until the speaker has actually finished.
             track.stop()
+            val totalFrames = totalWritten / 2L
+            val drainDeadline = System.currentTimeMillis() + 2000
+            while (System.currentTimeMillis() < drainDeadline) {
+                if (track.playbackHeadPosition >= totalFrames) break
+                Thread.sleep(20)
+            }
             track.release()
             codec.stop()
             codec.release()

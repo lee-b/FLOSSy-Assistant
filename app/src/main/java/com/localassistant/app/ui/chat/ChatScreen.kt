@@ -196,30 +196,15 @@ fun ChatScreen(
                 }
 
                 if (wavBytes == null || wavBytes.isEmpty()) {
-                    // The recorder answers nothing when the mic cannot run at
-                    // all; hands-free means spoken, so the failure is voiced
-                    // like a misheard request.
+                    // Nothing voiced enough to be a word came back - silence,
+                    // a door click or the speaker's own tail. Apologising to
+                    // somebody who said nothing is exactly the noise this used
+                    // to make, so the call quietly re-arms instead; only a
+                    // blank transcript after real speech gets the spoken
+                    // repeat prompt further down.
                     if (voiceCallMode) {
                         coroutineScope.launch {
-                            ttsAbortSignal.set(false)
-                            isTtsPlaying = true
-                            try {
-                                playTTSAudio(
-                                    "Sorry, I could not hear you. Please repeat.",
-                                    Pair(settings.ttsBaseUrl, if (settings.ttsApiKey.isBlank()) null else settings.ttsApiKey),
-                                    model = settings.ttsModelName,
-                                    voice = settings.ttsVoiceName,
-                                    responseFormat = settings.ttsResponseFormat,
-                                    enableStreaming = settings.enableTtsStreaming,
-                                    timeoutSeconds = settings.httpTimeoutSeconds.toLong(),
-                                    abortSignal = ttsAbortSignal
-                                )
-                            } finally {
-                                isTtsPlaying = false
-                            }
-                        }
-                        coroutineScope.launch {
-                            delay(3000)
+                            delay(800)
                             if (voiceCallMode) withContext(Dispatchers.Main) { startMicRecording() }
                         }
                     }
@@ -319,7 +304,14 @@ fun ChatScreen(
                                 // moment it has finished, like the wake chat.
                                 viewModel.setServiceState("idle")
                                 isRecording = false
-                                if (voiceCallMode) startMicRecording()
+                                if (voiceCallMode) coroutineScope.launch {
+                                    // The speaker is still ringing in the room
+                                    // right after playback returns; a beat of
+                                    // settle keeps the first capture from
+                                    // hearing the answer's own echo.
+                                    delay(500)
+                                    if (voiceCallMode) withContext(Dispatchers.Main) { startMicRecording() }
+                                }
                             }
                         } else {
                             // Nothing intelligible came back: hands-free means
