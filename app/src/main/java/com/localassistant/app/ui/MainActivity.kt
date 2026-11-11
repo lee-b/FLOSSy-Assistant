@@ -269,13 +269,11 @@ class MainActivity : ComponentActivity() {
         // Observe settings so theme changes (e.g. dark mode toggle) apply live
         val settingsRepository = SettingsRepository(applicationContext)
 
-        // Opening the app is a voice interaction: the pipeline starts listening
-        // straight away instead of waiting for the small mic button on the chat
-        // bar. The user can turn this off with the Voice on Launch switch.
-        if (hasPermissions && settingsRepository.loadSettings().autoStartVoiceOnLaunch) {
-            android.util.Log.d("MainActivity", "Starting voice assistant on launch")
-            startVoiceAssistant()
-        }
+        // Opening the app is a voice interaction, but the background service is
+        // deliberately NOT started here: its replies never reach the chat screen
+        // and it would fight the screen's own pipeline for the microphone. The
+        // "Voice on Launch" switch is honoured by ChatScreen instead, which
+        // opens a voice call with its own capture straight after composition.
         
         setContent {
             val showSplash = remember { mutableStateOf(true) }

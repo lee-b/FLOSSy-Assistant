@@ -82,9 +82,18 @@ fun ChatScreen(
     var menuExpanded by remember { mutableStateOf(false) }
     var lastAssistantMessage by remember { mutableStateOf<String?>(null) }
     var isTtsPlaying by remember { mutableStateOf(false) }
+    // Voice call mode: the conversation runs hands-free (the mic re-arms after
+    // every reply and a misheard request is answered by voice). A tap on the
+    // mic ends the call and the app falls back to plain text messaging.
+    var voiceCallMode by remember { mutableStateOf(false) }
     var recordedAudioBytes by remember { mutableStateOf<ByteArray?>(null) }
     var isRecordingActive by remember { mutableStateOf(false) }
     val recordingStopSignal = java.util.concurrent.atomic.AtomicBoolean(false)
+    // Raised to cut a reply short while it is still being spoken.
+    val ttsAbortSignal = java.util.concurrent.atomic.AtomicBoolean(false)
+    // Raised when the user ends a call mid-listen, so the half-heard utterance
+    // is discarded instead of sent on to STT.
+    val discardCurrentUtterance = java.util.concurrent.atomic.AtomicBoolean(false)
     val coroutineScope = rememberCoroutineScope()
     val context = LocalContext.current
     val lazyListState = rememberLazyListState()
@@ -120,15 +129,22 @@ fun ChatScreen(
                 lastAssistantMessage = lastMsg.content
                 coroutineScope.launch {
                     android.util.Log.d("ChatScreen", "Auto-playing TTS for completed message: ${lastMsg.content.take(50)}")
-                    playTTSAudio(
-                        lastMsg.content,
-                        Pair(settings.ttsBaseUrl, if (settings.ttsApiKey.isBlank()) null else settings.ttsApiKey),
-                        model = settings.ttsModelName,
-                        voice = settings.ttsVoiceName,
-                        responseFormat = settings.ttsResponseFormat,
-                        enableStreaming = settings.enableTtsStreaming,
-                        timeoutSeconds = settings.httpTimeoutSeconds.toLong()
-                    )
+                    ttsAbortSignal.set(false)
+                    isTtsPlaying = true
+                    try {
+                        playTTSAudio(
+                            lastMsg.content,
+                            Pair(settings.ttsBaseUrl, if (settings.ttsApiKey.isBlank()) null else settings.ttsApiKey),
+                            model = settings.ttsModelName,
+                            voice = settings.ttsVoiceName,
+                            responseFormat = settings.ttsResponseFormat,
+                            enableStreaming = settings.enableTtsStreaming,
+                            timeoutSeconds = settings.httpTimeoutSeconds.toLong(),
+                            abortSignal = ttsAbortSignal
+                        )
+                    } finally {
+                        isTtsPlaying = false
+                    }
                     ttsPlayedMessageIndex = lastIdx
                 }
             }
@@ -150,6 +166,24 @@ fun ChatScreen(
         // back to this guard, and the user's own taps must not stack recorders.
         if (isRecording) return
         isRecording = true
+        voiceCallMode = true
+        ttsAbortSignal.set(false)
+        discardCurrentUtterance.set(false)
+        // The background service would hear the same words and answer a second
+        // time (its replies never reach this chat), so while a voice call is
+        // open the screen owns the microphone. Only an already-running service
+        // is paused - starting one here would raise its foreground notification
+        // for nothing.
+        if (com.localassistant.app.service.VoiceAssistantService.isRunning) {
+            runCatching {
+                context.applicationContext.startService(
+                    com.localassistant.app.service.VoiceAssistantService.buildIntent(
+                        context.applicationContext,
+                        com.localassistant.app.service.VoiceAssistantService.ACTION_PAUSE
+                    )
+                )
+            }
+        }
         recordedAudioBytes = null
         recordingStopSignal.set(false)
 
@@ -165,20 +199,29 @@ fun ChatScreen(
                     // The recorder answers nothing when the mic cannot run at
                     // all; hands-free means spoken, so the failure is voiced
                     // like a misheard request.
-                    coroutineScope.launch {
-                        playTTSAudio(
-                            "Sorry, I could not hear you. Please repeat.",
-                            Pair(settings.ttsBaseUrl, if (settings.ttsApiKey.isBlank()) null else settings.ttsApiKey),
-                            model = settings.ttsModelName,
-                            voice = settings.ttsVoiceName,
-                            responseFormat = settings.ttsResponseFormat,
-                            enableStreaming = settings.enableTtsStreaming,
-                            timeoutSeconds = settings.httpTimeoutSeconds.toLong()
-                        )
-                    }
-                    coroutineScope.launch {
-                        delay(3000)
-                        withContext(Dispatchers.Main) { startMicRecording() }
+                    if (voiceCallMode) {
+                        coroutineScope.launch {
+                            ttsAbortSignal.set(false)
+                            isTtsPlaying = true
+                            try {
+                                playTTSAudio(
+                                    "Sorry, I could not hear you. Please repeat.",
+                                    Pair(settings.ttsBaseUrl, if (settings.ttsApiKey.isBlank()) null else settings.ttsApiKey),
+                                    model = settings.ttsModelName,
+                                    voice = settings.ttsVoiceName,
+                                    responseFormat = settings.ttsResponseFormat,
+                                    enableStreaming = settings.enableTtsStreaming,
+                                    timeoutSeconds = settings.httpTimeoutSeconds.toLong(),
+                                    abortSignal = ttsAbortSignal
+                                )
+                            } finally {
+                                isTtsPlaying = false
+                            }
+                        }
+                        coroutineScope.launch {
+                            delay(3000)
+                            if (voiceCallMode) withContext(Dispatchers.Main) { startMicRecording() }
+                        }
                     }
                     return@launch
                 }
@@ -189,6 +232,14 @@ fun ChatScreen(
                 coroutineScope.launch {
                     try {
                         viewModel.setServiceState("processing")
+
+                        // The user ended the call while this take was still being
+                        // heard - the half-captured words are theirs to drop, not
+                        // to send on to STT.
+                        if (discardCurrentUtterance.get()) {
+                            viewModel.setServiceState("idle")
+                            return@launch
+                        }
 
                         val transcribedText = withContext(Dispatchers.IO) {
                             com.localassistant.app.data.remote.ApiClient.transcribeAudio(
@@ -268,7 +319,7 @@ fun ChatScreen(
                                 // moment it has finished, like the wake chat.
                                 viewModel.setServiceState("idle")
                                 isRecording = false
-                                startMicRecording()
+                                if (voiceCallMode) startMicRecording()
                             }
                         } else {
                             // Nothing intelligible came back: hands-free means
@@ -278,22 +329,31 @@ fun ChatScreen(
                                 viewModel.setServiceState("idle")
                                 isRecording = false
                             }
-                            coroutineScope.launch {
-                                playTTSAudio(
-                                    "Sorry, I misheard you. Please repeat.",
-                                    Pair(settings.ttsBaseUrl, if (settings.ttsApiKey.isBlank()) null else settings.ttsApiKey),
-                                    model = settings.ttsModelName,
-                                    voice = settings.ttsVoiceName,
-                                    responseFormat = settings.ttsResponseFormat,
-                                    enableStreaming = settings.enableTtsStreaming,
-                                    timeoutSeconds = settings.httpTimeoutSeconds.toLong()
-                                )
-                            }
-                            coroutineScope.launch {
-                                // Re-arm the mic once the prompt has been spoken.
-                                delay(3000)
-                                withContext(Dispatchers.Main) {
-                                    startMicRecording()
+                            if (voiceCallMode) {
+                                coroutineScope.launch {
+                                    ttsAbortSignal.set(false)
+                                    isTtsPlaying = true
+                                    try {
+                                        playTTSAudio(
+                                            "Sorry, I misheard you. Please repeat.",
+                                            Pair(settings.ttsBaseUrl, if (settings.ttsApiKey.isBlank()) null else settings.ttsApiKey),
+                                            model = settings.ttsModelName,
+                                            voice = settings.ttsVoiceName,
+                                            responseFormat = settings.ttsResponseFormat,
+                                            enableStreaming = settings.enableTtsStreaming,
+                                            timeoutSeconds = settings.httpTimeoutSeconds.toLong(),
+                                            abortSignal = ttsAbortSignal
+                                        )
+                                    } finally {
+                                        isTtsPlaying = false
+                                    }
+                                }
+                                coroutineScope.launch {
+                                    // Re-arm the mic once the prompt has been spoken.
+                                    delay(3000)
+                                    if (voiceCallMode) withContext(Dispatchers.Main) {
+                                        startMicRecording()
+                                    }
                                 }
                             }
                         }
@@ -324,6 +384,43 @@ fun ChatScreen(
             return
         }
         recordingStopSignal.set(true)
+    }
+
+    /**
+     * Ends voice call mode: any voice output that is still playing is cut
+     * short, a half-heard utterance is dropped, and the app falls back to plain
+     * text messaging until a tap on the mic opens a new call.
+     */
+    fun stopVoiceCall() {
+        android.util.Log.d("ChatScreen", "Voice call ended by the mic button")
+        voiceCallMode = false
+        ttsAbortSignal.set(true)
+        isTtsPlaying = false
+        discardCurrentUtterance.set(true)
+        stopMicRecording()
+        viewModel.setServiceState("idle")
+    }
+
+    /**
+     * The one tap semantic for both mic buttons: cut voice output and end the
+     * call while it is speaking, end the call while it is listening, open a
+     * new call when the app is plain text messaging.
+     */
+    fun onMicTapped() {
+        when {
+            isTtsPlaying -> stopVoiceCall()
+            isRecording -> stopVoiceCall()
+            else -> startMicRecording()
+        }
+    }
+
+    // Launching the app is a voice interaction: the screen's own pipeline takes
+    // the microphone straight away, so the mic on the empty screen is already
+    // listening when the splash lifts. The background service is not started
+    // here - its answers never reach this chat and it would fight the screen
+    // for the microphone.
+    LaunchedEffect(Unit) {
+        if (hasPermissions && settings.autoStartVoiceOnLaunch) startMicRecording()
     }
 
     // Conversation summarization state - trigger when message count exceeds threshold
@@ -540,7 +637,7 @@ fun ChatScreen(
                     },
                     isRecording = isRecording,
                     onStartRecording = {
-                        if (!isRecording) startMicRecording() else stopMicRecording()
+                        onMicTapped()
                     },
                     onStopRecording = {
                         stopMicRecording()
@@ -578,7 +675,7 @@ fun ChatScreen(
                         modifier = Modifier
                             .fillMaxWidth()
                             .clickable {
-                                if (!isRecording) startMicRecording() else stopMicRecording()
+                                onMicTapped()
                             },
                         contentAlignment = Alignment.Center
                     ) {
