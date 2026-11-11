@@ -29,6 +29,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -141,7 +142,8 @@ fun ChatScreen(
 
     // One recording routine shared by the small mic button on the input bar and
     // the large microphone on the empty-state screen, so both start the same
-    // capture and the big icon is not decoration.
+    // capture and the big icon is not decoration. Tapping either one again ends
+    // the recording the same way.
     fun startMicRecording() {
         isRecording = true
         recordedAudioBytes = null
@@ -264,6 +266,18 @@ fun ChatScreen(
                 Toast.makeText(context.applicationContext, "Recording failed: ${e.message}", Toast.LENGTH_LONG).show()
             }
         }
+    }
+
+    /**
+     * Ends an in-flight recording and lets its VAD stop send the clip on.
+     */
+    fun stopMicRecording() {
+        android.util.Log.d("ChatScreen", "Manual stop recording requested")
+        if (!isRecording) {
+            android.util.Log.w("ChatScreen", "Stop called but not recording!")
+            return
+        }
+        recordingStopSignal.set(true)
     }
 
     // Conversation summarization state - trigger when message count exceeds threshold
@@ -462,6 +476,11 @@ fun ChatScreen(
                     connectionWaiting = connectionWaiting,
                     textInput = textInput,
                     onTextInputChange = { textInput = it },
+                    onInputFocused = {
+                        // Typing and voice capture are two ways of saying the same
+                        // thing; the keyboard taking focus means the recording ends.
+                        if (isRecording) stopMicRecording()
+                    },
                     onSendText = { text ->
                         if (text.isNotBlank()) {
                             viewModel.sendMessage(
@@ -475,15 +494,10 @@ fun ChatScreen(
                     },
                     isRecording = isRecording,
                     onStartRecording = {
-                        startMicRecording()
+                        if (!isRecording) startMicRecording() else stopMicRecording()
                     },
                     onStopRecording = {
-                        android.util.Log.d("ChatScreen", "Manual stop recording requested")
-                        if (!isRecording) {
-                            android.util.Log.w("ChatScreen", "Stop called but not recording!")
-                            return@VoiceControlsBar
-                        }
-                        recordingStopSignal.set(true)
+                        stopMicRecording()
                     },
                 )
             }
@@ -517,13 +531,15 @@ fun ChatScreen(
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clickable { startMicRecording() },
+                            .clickable {
+                                if (!isRecording) startMicRecording() else stopMicRecording()
+                            },
                         contentAlignment = Alignment.Center
                     ) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
                             Icon(
                                 imageVector = Icons.Default.Mic,
-                                contentDescription = "Start recording",
+                                contentDescription = if (isRecording) "Stop recording" else "Start recording",
                                 modifier = Modifier.size(64.dp),
                                 tint = MaterialTheme.colorScheme.primary
                             )
@@ -1085,6 +1101,7 @@ private fun VoiceControlsBar(
     connectionWaiting: Boolean = false,
     textInput: String = "",
     onTextInputChange: (String) -> Unit = {},
+    onInputFocused: () -> Unit = {},
     onSendText: (String) -> Unit,
     isRecording: Boolean = false,
     onStartRecording: () -> Unit = {},
@@ -1161,7 +1178,11 @@ private fun VoiceControlsBar(
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 OutlinedTextField(
-                    modifier = Modifier.weight(1f),
+                    modifier = Modifier
+                        .weight(1f)
+                        .onFocusChanged { state ->
+                            if (state.isFocused) onInputFocused()
+                        },
                     value = textInput,
                     onValueChange = onTextInputChange,
                     placeholder = { Text("Message", style = MaterialTheme.typography.bodyMedium) },
