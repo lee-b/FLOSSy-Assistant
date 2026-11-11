@@ -54,7 +54,10 @@ data class PresetEntry(
  */
 data class EndpointStatus(
     val working: Boolean,
-    val message: String
+    val message: String,
+    // True while the endpoint is rate limiting (429) and the client is still
+    // retrying: neither a pass nor a failure, just a wait.
+    val pending: Boolean = false
 )
 
 /**
@@ -285,6 +288,27 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     // must render as "cannot tell" rather than as a problem the user can fix.
     private val _defaultAssistantHeld = MutableStateFlow(isDefaultAssistantHeld(appContext))
     val defaultAssistantHeld: StateFlow<Boolean?> = _defaultAssistantHeld.asStateFlow()
+
+    init {
+        // A 429 while a test runs is not a failure: the API client retries on its
+        // own exponential backoff, so the status line only notes the wait once per
+        // episode and the final result overwrites it when the request lands.
+        viewModelScope.launch {
+            com.localassistant.app.data.remote.ApiClient.connectionWaiting.collect { waiting ->
+                if (!waiting) return@collect
+                val waitingStatus = EndpointStatus(
+                    false,
+                    "Awaiting connection... (rate limited, retrying)",
+                    pending = true
+                )
+                when {
+                    _llmTesting.value -> _llmStatus.value = waitingStatus
+                    _sttTesting.value -> _sttStatus.value = waitingStatus
+                    _ttsTesting.value -> _ttsStatus.value = waitingStatus
+                }
+            }
+        }
+    }
 
     /**
      * Re-reads the assistant role after the user has been taken to the Settings

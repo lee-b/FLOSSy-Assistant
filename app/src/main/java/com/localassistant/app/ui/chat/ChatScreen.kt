@@ -65,6 +65,7 @@ fun ChatScreen(
 ) {
     val messages by viewModel.messages.collectAsState()
     val serviceState by viewModel.serviceState.collectAsState()
+    val connectionWaiting by viewModel.connectionWaiting.collectAsState()
     val settings by viewModel.settings.collectAsState()
     
     android.util.Log.d("ChatScreen", "Composed with ${messages.size} messages")
@@ -331,6 +332,7 @@ fun ChatScreen(
                 VoiceControlsBar(
                     serviceState = serviceState,
                     isSendingText = isSendingText,
+                    connectionWaiting = connectionWaiting,
                     textInput = textInput,
                     onTextInputChange = { textInput = it },
                     onSendText = { text ->
@@ -1071,6 +1073,7 @@ internal fun StreamingResponseIndicator(
 private fun VoiceControlsBar(
     serviceState: String,
     isSendingText: Boolean = false,
+    connectionWaiting: Boolean = false,
     textInput: String = "",
     onTextInputChange: (String) -> Unit = {},
     onSendText: (String) -> Unit,
@@ -1091,10 +1094,11 @@ private fun VoiceControlsBar(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = when (serviceState) {
-                        "listening" -> "Listening..."
-                        "processing" -> "Thinking..."
-                        "speaking" -> "Speaking..."
+                    text = when {
+                        connectionWaiting -> "Awaiting connection..."
+                        serviceState == "listening" -> "Listening..."
+                        serviceState == "processing" -> "Thinking..."
+                        serviceState == "speaking" -> "Speaking..."
                         else -> ""
                     },
                     style = MaterialTheme.typography.bodySmall,

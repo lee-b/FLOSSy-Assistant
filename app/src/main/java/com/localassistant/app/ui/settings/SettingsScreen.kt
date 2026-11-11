@@ -128,10 +128,15 @@ fun EndpointStatusLine(
             )
         }
     } else {
-        val icon = if (status == null) "❔" else if (status.working) "✅" else "❌"
+        val icon = if (status == null) "❔" else when {
+            status.working -> "✅"
+            status.pending -> "⏳"
+            else -> "❌"
+        }
         val color = when {
             status == null -> MaterialTheme.colorScheme.onSurfaceVariant
             status.working -> MaterialTheme.colorScheme.primary
+            status.pending -> MaterialTheme.colorScheme.onSurfaceVariant
             else -> MaterialTheme.colorScheme.error
         }
         val message = status?.message ?: "Not checked yet - tap Test to probe this endpoint"

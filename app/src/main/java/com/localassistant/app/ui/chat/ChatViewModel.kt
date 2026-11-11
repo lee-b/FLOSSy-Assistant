@@ -38,6 +38,10 @@ class ChatViewModel(application: android.app.Application) : AndroidViewModel(app
     // Voice assistant service state
     private val _serviceState = MutableStateFlow("idle")
     val serviceState: StateFlow<String> = _serviceState.asStateFlow()
+
+    // True while an LLM request is being retried after a 429: the API client
+    // handles the backoff itself, the screen only has to say it once.
+    val connectionWaiting: StateFlow<Boolean> = ApiClient.connectionWaiting
     
     /**
      * Update the service state from outside (e.g., when voice recording starts/stops).

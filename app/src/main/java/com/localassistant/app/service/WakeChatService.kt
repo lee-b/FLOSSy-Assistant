@@ -241,6 +241,10 @@ class WakeChatService : VoiceInteractionService() {
 
     private fun newServiceScope() = CoroutineScope(Dispatchers.Default + Job())
 
+    // Watches the API client's rate-limit waiting state for the whole service
+    // lifetime; a cancelled serviceScope would kill the watch on every restart.
+    private val connectionWaitingScope = CoroutineScope(Dispatchers.Default + Job())
+
     private lateinit var notificationManager: NotificationManager
 
     override fun onCreate() {
@@ -249,6 +253,24 @@ class WakeChatService : VoiceInteractionService() {
 
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification(PHASE_IDLE))
+
+        // One "Awaiting connection..." per rate-limit episode, not per retry: the
+        // client retries 429s internally on an exponential backoff, so the overlay
+        // and the notification only have to note that the exchange is still working.
+        connectionWaitingScope.launch {
+            ApiClient.connectionWaiting.collect { waiting ->
+                when {
+                    waiting -> {
+                        _statusMessage.value = "Awaiting connection..."
+                        updateNotification("Awaiting connection...")
+                    }
+                    _statusMessage.value == "Awaiting connection..." -> {
+                        _statusMessage.value = ""
+                        updateNotification(getPhaseText(_phase.value))
+                    }
+                }
+            }
+        }
     }
 
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
@@ -1146,6 +1168,7 @@ class WakeChatService : VoiceInteractionService() {
     override fun onDestroy() {
         super.onDestroy()
         android.util.Log.d("WakeChatService", "Service destroying - stopping the listening loop")
+        connectionWaitingScope.cancel()
         stopListening()
     }
 }

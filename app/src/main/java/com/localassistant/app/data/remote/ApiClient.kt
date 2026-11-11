@@ -1,12 +1,17 @@
 package com.localassistant.app.data.remote
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.MultipartBody
 import okhttp3.RequestBody.Companion.asRequestBody
+import com.localassistant.app.ui.common.playWaitingCue
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -18,7 +23,66 @@ import java.util.concurrent.atomic.AtomicBoolean
 object ApiClient {
     
     private const val DEFAULT_TIMEOUT = 60L // seconds
+
+    // Rate-limit (429) retry schedule: an exponential backoff that caps at two
+    // seconds, then a steady two-second poll. This is an interactive assistant -
+    // the user is present and the request has priority - so the retries never
+    // give up on their own; the endpoint decides when the load has cleared. The
+    // wait must not spam anything: the waiting state rises once per episode and
+    // callers show one message for it, not one per attempt.
+    private val RATE_LIMIT_BACKOFF_MS = listOf(250L, 500L, 1000L, 2000L)
+    private const val RATE_LIMIT_STEADY_DELAY_MS = 2000L
+
+    /**
+     * True while any request is being retried because its endpoint answered 429.
+     * Callers observe this to show an "Awaiting connection..." message once for
+     * the whole episode instead of flashing one at every retry attempt.
+     */
+    private val _connectionWaiting = MutableStateFlow(false)
+    val connectionWaiting: StateFlow<Boolean> = _connectionWaiting.asStateFlow()
     
+    /**
+     * Executes one request, retrying while the endpoint answers 429 (rate limited).
+     *
+     * The delay starts at 250ms and doubles up to two seconds, then stays at two
+     * seconds for every attempt after that, because an interactive request waits
+     * for the endpoint rather than failing the exchange the user is standing in.
+     * Each retry plays the low waiting cue and raises [connectionWaiting] so a
+     * caller can show its "Awaiting connection..." message - once per episode,
+     * never per attempt. Any other status (success or failure) is handed back to
+     * the caller untouched, so hard errors like a 400 or a missing model keep
+     * failing fast exactly as they did before.
+     */
+    private suspend fun executeWithRateLimitRetry(
+        client: OkHttpClient,
+        request: Request
+    ): okhttp3.Response {
+        var attempt = 0
+        while (true) {
+            val response = client.newCall(request).execute()
+            if (response.code != 429) {
+                _connectionWaiting.value = false
+                return response
+            }
+            // The rejected response must be closed before the next attempt, or the
+            // connection pool holds the body open.
+            response.close()
+            _connectionWaiting.value = true
+            if (attempt == 0) {
+                android.util.Log.w("ApiClient", "Rate limited (429); retrying with backoff")
+            }
+            // A soft footstep-like cue, low in the mix: the user hears that the
+            // request is still working without a spoken interruption.
+            playWaitingCue()
+            val delayMs =
+                if (attempt < RATE_LIMIT_BACKOFF_MS.size) RATE_LIMIT_BACKOFF_MS[attempt]
+                else RATE_LIMIT_STEADY_DELAY_MS
+            android.util.Log.d("ApiClient", "429: retrying in ${delayMs}ms (attempt ${attempt + 1})")
+            delay(delayMs)
+            attempt++
+        }
+    }
+
     /**
      * The same exchange for callers that hold tools as plain maps - a `name`, a `description`
      * and a `parameters` JSON schema - which is the shape an MCP server reports. The shapes
@@ -264,7 +328,7 @@ object ApiClient {
         
         return withContext(Dispatchers.IO) {
             try {
-                client.newCall(request).execute().use { response ->
+                executeWithRateLimitRetry(client, request).use { response ->
                     if (!response.isSuccessful) {
                         val errorBody = response.body?.string() ?: "No error body"
                         android.util.Log.e("ApiClient", "Chat completion failed: ${response.code} - $errorBody")
@@ -415,7 +479,7 @@ object ApiClient {
         
         return withContext(Dispatchers.IO) {
             try {
-                client.newCall(request).execute().use { response ->
+                executeWithRateLimitRetry(client, request).use { response ->
                     if (!response.isSuccessful) {
                         throw IOException("STT failed: ${response.code} - ${response.body?.string()}")
                     }
@@ -469,7 +533,7 @@ object ApiClient {
         
         return withContext(Dispatchers.IO) {
             try {
-                client.newCall(request).execute().use { response ->
+                executeWithRateLimitRetry(client, request).use { response ->
                     if (!response.isSuccessful) {
                         val errBody = response.body?.string()?.take(200) ?: "no body"
                         android.util.Log.e("ApiClient", "TTS failed: ${response.code} - $errBody")
@@ -974,7 +1038,7 @@ object ApiClient {
                     .get()
                     .build()
                 
-                val response = client.newCall(request).execute()
+                val response = executeWithRateLimitRetry(client, request)
                 android.util.Log.d("ApiClient", "Response code: ${response.code}")
                 
                 if (!response.isSuccessful) {
@@ -1052,7 +1116,7 @@ object ApiClient {
                     .get()
                     .build()
                 
-                val response = client.newCall(request).execute()
+                val response = executeWithRateLimitRetry(client, request)
                 android.util.Log.d("ApiClient", "Voices response code: ${response.code}")
                 
                 if (!response.isSuccessful) {

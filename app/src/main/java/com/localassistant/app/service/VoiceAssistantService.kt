@@ -133,13 +133,29 @@ class VoiceAssistantService : Service() {
     // Notification manager
     private lateinit var notificationManager: NotificationManager
 
+    // Watches the API client's rate-limit waiting state for the whole service
+    // lifetime; a cancelled serviceScope would kill the watch on every restart.
+    private val connectionWaitingScope = CoroutineScope(Dispatchers.Default + Job())
+
     override fun onCreate() {
         super.onCreate()
         notificationManager = getSystemService(NotificationManager::class.java)
         
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification(STATE_IDLE))
-        
+
+        // One "Awaiting connection..." per rate-limit episode, not per retry: the
+        // client retries 429s internally on an exponential backoff, so the
+        // notification only has to note that the request is still working.
+        connectionWaitingScope.launch {
+            ApiClient.connectionWaiting.collect { waiting ->
+                when {
+                    waiting -> updateNotification("Awaiting connection...")
+                    _state.value == STATE_PROCESSING -> updateNotification("Processing...")
+                }
+            }
+        }
+
         // Register battery receiver for energy-saving mode
         try {
             val filter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
@@ -989,6 +1005,7 @@ class VoiceAssistantService : Service() {
         } catch (e: Exception) {
             // Receiver may not have been registered
         }
+        connectionWaitingScope.cancel()
         stopListening()
     }
     
