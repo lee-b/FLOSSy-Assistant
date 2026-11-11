@@ -19,6 +19,7 @@ import android.os.IBinder
 import android.os.PowerManager
 import androidx.annotation.RequiresPermission
 import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationCompat.Builder
 import com.localassistant.app.LocalAssistantApplication
 import com.localassistant.app.data.remote.ApiClient
 import com.localassistant.app.data.remote.McpClient
@@ -51,6 +52,9 @@ class VoiceAssistantService : Service() {
         const val ACTION_STOP = "com.localassistant.STOP"
         const val ACTION_PAUSE = "com.localassistant.PAUSE"
         const val ACTION_RESUME = "com.localassistant.RESUME"
+        // Ends the call from the notification: the same stop path a mic tap
+        // takes, with the end-listen plop and the route closed.
+        const val ACTION_END_CALL = "com.localassistant.END_CALL"
         
         // Service states - the same typed phases the chat screen uses, so the
         // background pipeline and the UI can never drift into different words
@@ -170,11 +174,52 @@ class VoiceAssistantService : Service() {
                 serviceScope.launch { rerouteCapture() }
             }
         }
+
+        // The capture device the route is currently on, tracked so a loss can
+        // be told apart from any other device change. Null means the built-in
+        // mic - there is nothing to lose there, and losing it re-routes.
+        @Volatile
+        private var routedDeviceType: Int = AudioDeviceInfo.TYPE_BUILTIN_MIC
+
         override fun onAudioDevicesAdded(addedDevices: Array<AudioDeviceInfo>) {
             rerouteIfListening()
         }
         override fun onAudioDevicesRemoved(removedDevices: Array<AudioDeviceInfo>) {
+            val wasRouted = removedDevices.any { it.type == routedDeviceType }
+            if (!wasRouted) {
+                rerouteIfListening()
+                return
+            }
+            // The device capture rides went away mid-listen.
+            if (routedDeviceType == AudioDeviceInfo.TYPE_BUILTIN_MIC) {
+                // The phone's own mic cannot vanish; a callback naming it is a
+                // framework hiccup, not a lost device - re-establish the route.
+                rerouteIfListening()
+                return
+            }
+            if (routedDeviceType == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
+                // A private headset conversation must never continue on the
+                // loudspeaker: the headset going away while it carried the call
+                // is the user hanging up, so the call ends - it does not fall
+                // back to the phone mic and speaker. A switch TO a headset is
+                // a connection, not a loss, and the re-route above serves it.
+                android.util.Log.d("VoiceAssistantService", "Bluetooth capture device lost: hanging up the call")
+                serviceScope.launch {
+                    stopListening()
+                    stopForeground(android.app.Service.STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }
+                return
+            }
+            // A wired or USB headset that vanished: the phone mic is private
+            // enough, so re-establish and carry on.
             rerouteIfListening()
+        }
+
+        // Called from rerouteCapture() once the recorder swap has settled, so
+        // the next device-change event is judged against the new device.
+        fun noteRoutedDevice(info: AudioDeviceInfo?) {
+            routedDeviceType = info?.type ?: AudioDeviceInfo.TYPE_BUILTIN_MIC
         }
     }
 
@@ -248,6 +293,11 @@ class VoiceAssistantService : Service() {
             ACTION_STOP -> stopListening()
             ACTION_PAUSE -> pauseService()
             ACTION_RESUME -> resumeService()
+            ACTION_END_CALL -> {
+                stopListening()
+                stopForeground(android.app.Service.STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            }
         }
         
         return START_STICKY
@@ -370,6 +420,10 @@ class VoiceAssistantService : Service() {
                 // does. The start cue blocks, so it plays before the mic opens.
                 audioRouteRestore = beginCommunicationCapture(applicationContext)
                 playListenStartCue()
+                // The device the call starts on decides what "the device went
+                // away" means later: a Bluetooth loss hangs up, anything else
+                // re-establishes.
+                captureDeviceCallback.noteRoutedDevice(audioManager.getCommunicationDevice())
                 audioManager.registerAudioDeviceCallback(captureDeviceCallback, android.os.Handler(android.os.Looper.getMainLooper()))
 
                 if (audioRecord != null) {
@@ -461,6 +515,11 @@ class VoiceAssistantService : Service() {
      * that reads [audioRecord] keeps going without a gap to notice.
      */
     private suspend fun rerouteCapture() {
+        // The new recorder may land on a different device than the old one;
+        // remember which, so the next removal is judged against the device
+        // capture actually rides now.
+        val routedNow = audioManager.getCommunicationDevice()
+        captureDeviceCallback.noteRoutedDevice(routedNow)
         val bufferSize = AudioRecord.getMinBufferSize(
             sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
         )
@@ -998,8 +1057,8 @@ class VoiceAssistantService : Service() {
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
             )
         }
-        
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Local Assistant")
             .setContentText(getStateText(state))
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
@@ -1007,19 +1066,41 @@ class VoiceAssistantService : Service() {
             .setOnlyAlertOnce(true)
             .setContentIntent(intent)
             .setVisibility(NotificationCompat.VISIBILITY_SECRET)
-            .build()
+        // An idle service is not a call; hanging up is meaningless then.
+        if (state != STATE_IDLE) {
+            builder.addAction(android.R.drawable.ic_menu_close_clear_cancel, "End Call", endCallPendingIntent)
+        }
+        return builder.build()
     }
 
     private fun updateNotification(text: String) {
-        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+        val notification = Builder(this, CHANNEL_ID)
             .setContentTitle("Local Assistant")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
-            .build()
-        
-        notificationManager.notify(NOTIFICATION_ID, notification)
+            .setContentIntent(packageManager.getLaunchIntentForPackage(packageName)?.let { launchIntent ->
+                PendingIntent.getActivity(
+                    this, 0, launchIntent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+            })
+            .setVisibility(NotificationCompat.VISIBILITY_SECRET)
+        if (_state.value != STATE_IDLE) {
+            notification.addAction(android.R.drawable.ic_menu_close_clear_cancel, "End Call", endCallPendingIntent)
+        }
+        notificationManager.notify(NOTIFICATION_ID, notification.build())
+    }
+
+    // Built once: the end-call action is the same PendingIntent from the
+    // notification built at startup to every update that follows.
+    private val endCallPendingIntent: PendingIntent by lazy {
+        PendingIntent.getService(
+            this, 1,
+            buildIntent(this, ACTION_END_CALL),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
     }
 
     private fun getStateText(state: com.localassistant.app.domain.model.VoiceCallPhase): String = when (state) {
