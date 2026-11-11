@@ -19,6 +19,7 @@ import androidx.core.app.NotificationCompat
 import com.localassistant.app.LocalAssistantApplication
 import com.localassistant.app.data.remote.ApiClient
 import com.localassistant.app.data.remote.McpClient
+import com.localassistant.app.ui.common.beginBluetoothCapture
 import com.localassistant.app.ui.common.isNonSpeechTranscript
 import com.localassistant.app.ui.common.playListenEndCue
 import com.localassistant.app.ui.common.playListenStartCue
@@ -134,6 +135,10 @@ class VoiceAssistantService : Service() {
     
     // Notification manager
     private lateinit var notificationManager: NotificationManager
+
+    // The restore runnable for a Bluetooth capture route opened in
+    // startListening(); closed again in stopListening().
+    private var audioRouteRestore: (() -> Unit)? = null
 
     // Watches the API client's rate-limit waiting state for the whole service
     // lifetime; a cancelled serviceScope would kill the watch on every restart.
@@ -320,7 +325,10 @@ class VoiceAssistantService : Service() {
                     sampleRate, channelConfig, audioFormat, bufferSize * 4
                 )
 
-                // The start cue blocks, so it plays before the mic opens.
+                // With Bluetooth headphones the recorder would otherwise stay on
+                // the phone mic, so the route is opened before the microphone
+                // does. The start cue blocks, so it plays before the mic opens.
+                audioRouteRestore = beginBluetoothCapture(applicationContext)
                 playListenStartCue()
 
                 if (audioRecord != null) {
@@ -386,8 +394,11 @@ class VoiceAssistantService : Service() {
         audioRecord = null
         audioTrack = null
 
-        // The matched downbeat closes the listening window.
+        // The matched downbeat closes the listening window, and the Bluetooth
+        // route goes with the microphone it served.
         playListenEndCue()
+        audioRouteRestore?.invoke()
+        audioRouteRestore = null
 
         recordingThread?.join(5000)
         recordingThread = null
