@@ -1052,16 +1052,27 @@ object ApiClient {
                 
                 val models = mutableListOf<String>()
                 val root = org.json.JSONObject(json)
-                
+
+                // Only an endpoint's own listing prefix (".../models/<name>") is
+                // stripped, and the id is kept whole otherwise: a model named
+                // "local/medium" or "bartowski/gemma.q8" is its own namespace
+                // and the request must carry exactly what the server returned,
+                // so trimming the first path part sent back wrong ids and the
+                // endpoint answered 404 for a model that was right there.
+                val listingPrefix = Regex("/models/")
+                fun normalizeId(raw: String?): String? {
+                    if (raw.isNullOrBlank()) return null
+                    return if (raw.contains("/models/"))
+                        raw.substring(raw.lastIndexOf("/models/") + "/models/".length)
+                    else raw
+                }
+
                 val dataArray = root.optJSONArray("data")
                 if (dataArray != null) {
                     for (i in 0 until dataArray.length()) {
                         val item = dataArray.optJSONObject(i)
-                        var id = item?.optString("id")
-                        if (!id.isNullOrEmpty()) {
-                            if (id.contains("/models/")) {
-                                id = id.substring(id.lastIndexOf("/") + 1)
-                            }
+                        val id = normalizeId(item?.optString("id"))
+                        if (id != null) {
                             models.add(id)
                             android.util.Log.d("ApiClient", "Found model (OpenAI format): $id")
                         }
@@ -1071,11 +1082,8 @@ object ApiClient {
                     if (modelsArray != null) {
                         for (i in 0 until modelsArray.length()) {
                             val item = modelsArray.optJSONObject(i)
-                            var id = item?.optString("name") ?: item?.optString("id")
-                            if (!id.isNullOrEmpty()) {
-                                if (id.contains("/models/")) {
-                                    id = id.substring(id.lastIndexOf("/") + 1)
-                                }
+                            val id = normalizeId(item?.optString("name") ?: item?.optString("id"))
+                            if (id != null) {
                                 models.add(id)
                                 android.util.Log.d("ApiClient", "Found model (alternative format): $id")
                             }

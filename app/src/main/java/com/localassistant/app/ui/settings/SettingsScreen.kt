@@ -162,24 +162,25 @@ fun EndpointChoices(title: String, options: List<String>, current: String, onSel
     if (options.isEmpty()) return
     Text(text = title, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     Spacer(modifier = Modifier.height(6.dp))
-    options.take(20).chunked(3).forEach { group ->
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            group.forEach { option ->
-                val active = option.equals(current, ignoreCase = true)
-                Button(
-                    onClick = { onSelect(option) },
-                    shape = RoundedCornerShape(8.dp),
-                    modifier = Modifier.weight(1f),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant,
-                        contentColor = if (active) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                ) {
-                    Text(text = option, maxLines = 1)
-                }
-            }
+    // One full-width choice per line: model ids are long ("llama/local/medium"
+    // and friends), and a three-column chip grid both truncates them badly and
+    // makes tapping the right one fiddly. The text wraps over two lines rather
+    // than clipping, so the whole id stays readable.
+    options.take(20).forEach { option ->
+        val active = option.equals(current, ignoreCase = true)
+        Button(
+            onClick = { onSelect(option) },
+            shape = RoundedCornerShape(8.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 2.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant,
+                contentColor = if (active) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        ) {
+            Text(text = option, maxLines = 2)
         }
-        Spacer(modifier = Modifier.height(8.dp))
     }
 }
 
