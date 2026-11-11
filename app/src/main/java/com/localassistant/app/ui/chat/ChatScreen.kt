@@ -165,7 +165,15 @@ fun ChatScreen(
                             responseFormat = settings.ttsResponseFormat,
                             enableStreaming = settings.enableTtsStreaming,
                             timeoutSeconds = settings.httpTimeoutSeconds.toLong(),
-                            abortSignal = ttsAbortSignal
+                            abortSignal = ttsAbortSignal,
+                            onTtsTooSlow = {
+                                // A tick fills the silence and a note explains it.
+                                // SYSTEM-role messages render in the chat but are
+                                // never sent to the LLM, so this stays display-only.
+                                viewModel.addMessage(com.localassistant.app.domain.model.MessageRole.SYSTEM,
+                                    "The TTS server or connection is too slow for real-time speech.")
+                                com.localassistant.app.ui.common.playWaitingCue()
+                            }
                         )
                     } finally {
                         if (viewModel.dialogState.value.isVoiceCall) viewModel.setDialogPhase(VoiceCallPhase.IDLE)

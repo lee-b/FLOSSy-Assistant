@@ -458,11 +458,15 @@ fun parseWavBytes(data: ByteArray): Pair<Int, ByteArray>? {
  *
  * @param abortSignal raised to cut the reply short mid-stream.
  */
-class ReplyAudioPlayer(private val abortSignal: java.util.concurrent.atomic.AtomicBoolean?) {
+class ReplyAudioPlayer(
+    private val abortSignal: java.util.concurrent.atomic.AtomicBoolean?,
+    private val onStarving: (() -> Unit)? = null
+) {
     private var track: android.media.AudioTrack? = null
     private var rate: Int = 0
     private var totalFrames: Long = 0
     private var aborted: Boolean = false
+    private var lastStarveWarnAt: Long = 0
 
     /** Writes [byteCount] bytes of mono 16-bit PCM; false means stop (abort). */
     fun write(pcmBytes: ByteArray, byteCount: Int, sampleRate: Int): Boolean {
@@ -487,6 +491,19 @@ class ReplyAudioPlayer(private val abortSignal: java.util.concurrent.atomic.Atom
             written += n
         }
         totalFrames += written / 2
+        // The lead is how many frames are buffered ahead of the playback
+        // head. When it drops under a quarter second, the server cannot keep
+        // up and the user is about to hear silence: ask the caller to fill
+        // the gap (a waiting tick, a note in the chat), but only every few
+        // seconds - one tick per written chunk would be a siren.
+        val lead = totalFrames - (track?.playbackHeadPosition ?: 0)
+        if (onStarving != null && rate > 0 && lead < rate / 4L) {
+            val now = System.currentTimeMillis()
+            if (now - lastStarveWarnAt > 3000) {
+                lastStarveWarnAt = now
+                try { onStarving() } catch (_: Exception) {}
+            }
+        }
         return true
     }
 
@@ -738,7 +755,8 @@ fun splitIntoSentences(text: String): List<String> {
      responseFormat: String = "mp3",
      enableStreaming: Boolean = false,
      timeoutSeconds: Long,
-     abortSignal: AtomicBoolean? = null
+     abortSignal: AtomicBoolean? = null,
+     onTtsTooSlow: (() -> Unit)? = null
  ) {
      if (text == null || ttsSettings?.first == null) {
          return
@@ -752,7 +770,7 @@ fun splitIntoSentences(text: String): List<String> {
      // One track carries the whole reply - every sentence, however many -
      // so sentence boundaries are inaudible and only one drain happens at
      // the end.
-     val player = ReplyAudioPlayer(abortSignal)
+     val player = ReplyAudioPlayer(abortSignal, onTtsTooSlow)
 
      val ttsBaseUrl = ttsSettings.first!!
      val ttsApiKey = ttsSettings.second?.takeIf { it.isNotBlank() }
