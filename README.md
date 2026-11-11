@@ -5,6 +5,35 @@
 A privacy-first, fully local AI voice assistant for Android that connects to your own running
 services. No cloud dependencies, no telemetry, no data leaves your device.
 
+## Differences from upstream (smoluu/LocalAssistant)
+
+This fork carries a set of changes over [smoluu/LocalAssistant](https://github.com/smoluu/LocalAssistant),
+mostly around making voice mode genuinely hands-free and resilient:
+
+- **Rate limits wait instead of failing** - a 429 from an endpoint is retried on an exponential
+  backoff (250ms doubling to 2s, then a steady 2s poll), with a soft footstep-like sound and an
+  "Awaiting connection..." status in the chat, the notification and the settings test buttons,
+  instead of an error ending the exchange
+- **Voice calls keep going** - the mic re-arms automatically after every spoken reply, and a
+  misheard request is answered by voice ("Sorry, I misheard you. Please repeat.") rather than a
+  toast a user with the screen off would never see
+- **Listening is audible** - a matched pair of synthesized plop cues plays as the microphone opens
+  and closes, in voice mode and hands-free alike
+- **Bluetooth and wired headsets work** - microphone capture routes through Android's
+  communication routing, so the STT hears the device the user is actually holding (previously a
+  Bluetooth headset was ignored and the phone mic recorded instead), and a headset connected or
+  pulled mid-utterance re-routes capture on the fly
+- **Voice on launch** - opening the app starts the voice pipeline listening straight away,
+  behind a new "Voice on Launch" switch
+- **The big microphone is real** - the large mic on the empty-state screen starts recording like
+  the small button next to the input, and both toggle an in-flight capture; focusing the message
+  input ends it
+- **Honest model lists** - settings list one full-width choice per line so long model ids fit,
+  and ids with slashes ("local/medium") are kept whole instead of truncated
+- **Navigation-bar aware chat bar** - the message input no longer renders under the system
+  back/home/overview bar
+- **The bot artwork is the app icon** and the README logo
+
 ## Features
 
 ### Core Capabilities
