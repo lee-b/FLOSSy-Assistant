@@ -509,7 +509,13 @@ class ReplyAudioPlayer(private val abortSignal: java.util.concurrent.atomic.Atom
                 .setChannelMask(channelMask)
                 .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                 .build(),
-            minBuffer * 4,
+            // A small ring starves between sentence fetches: each sentence is
+            // a full HTTP round trip, and when the next one lands slower than
+            // this one plays, the ring runs empty and the user hears a gap.
+            // Sixteen minimum buffers (~1-2s of speech) ride out that jitter;
+            // the blocking write still throttles the producer, so the extra
+            // memory costs nothing but wait time.
+            minBuffer * 16,
             android.media.AudioTrack.MODE_STREAM,
             0
         )
@@ -764,21 +770,25 @@ fun splitIntoSentences(text: String): List<String> {
          if (sentences.size > 1) {
              var played = false
              val fetchScope = CoroutineScope(Dispatchers.Default + Job())
-             var pending = fetchScope.async {
-                 fetchTtsAudio(ttsBaseUrl, ttsApiKey, sentences[0], model, voice, responseFormat, timeoutSeconds)
-                     ?: fetchTtsAudio(ttsBaseUrl, ttsApiKey, sentences[0], model, null, responseFormat, timeoutSeconds)
+             fun fetch(text: String) = fetchScope.async {
+                 fetchTtsAudio(ttsBaseUrl, ttsApiKey, text, model, voice, responseFormat, timeoutSeconds)
+                     ?: fetchTtsAudio(ttsBaseUrl, ttsApiKey, text, model, null, responseFormat, timeoutSeconds)
              }
+             // Two fetches in flight: one playing, one landing. A single
+             // prefetch made the pipeline exactly as fast as the network -
+             // any fetch slower than playback of its sentence starved the
+             // track and was heard as a drop-out, so the second slot keeps a
+             // sentence of slack between the server and the speaker.
+             val inFlight = ArrayDeque< kotlinx.coroutines.Deferred<ByteArray?> >()
+             inFlight.add(fetch(sentences[0]))
+             if (sentences.size > 1) inFlight.add(fetch(sentences[1]))
              for (index in sentences.indices) {
-                 val chunk = pending.await()
-                 if (index + 1 < sentences.size) {
-                     val next = sentences[index + 1]
-                     pending = fetchScope.async {
-                         fetchTtsAudio(ttsBaseUrl, ttsApiKey, next, model, voice, responseFormat, timeoutSeconds)
-                             ?: fetchTtsAudio(ttsBaseUrl, ttsApiKey, next, model, null, responseFormat, timeoutSeconds)
-                     }
-                 }
+                 val chunk = inFlight.removeFirst().await()
+                 val nextIndex = index + 2
+                 if (nextIndex < sentences.size) inFlight.add(fetch(sentences[nextIndex]))
                  if (abortSignal?.get() == true) {
                      android.util.Log.d("TTS", "Playback cut short by the wake word")
+                     fetchScope.cancel()
                      return
                  }
                  if (chunk != null && chunk.isNotEmpty() && playAudioBytes(chunk, abortSignal, player)) {
@@ -786,6 +796,7 @@ fun splitIntoSentences(text: String): List<String> {
                  }
              }
              player.finish()
+             fetchScope.cancel()
              if (played) return
              android.util.Log.w("TTS", "Streaming playback failed, falling back to a single request")
          }
