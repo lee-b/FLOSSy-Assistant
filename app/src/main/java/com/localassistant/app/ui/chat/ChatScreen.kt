@@ -174,7 +174,10 @@ fun ChatScreen(
 
         // Track last assistant message for auto-TTS - only trigger when streaming is COMPLETE
         val lastMsg = messages.lastOrNull { it.role == com.localassistant.app.domain.model.MessageRole.ASSISTANT }
-        if (lastMsg != null && lastMsg.content.isNotBlank() && streamingContent.value.isEmpty() && settings.autoTtsEnabled) {
+        // A voice call speaks inside the exchange, with the gate closed;
+        // this effect would double-speak and, worse, let the capture hear
+        // the reply it is meant to stay deaf to.
+        if (lastMsg != null && lastMsg.content.isNotBlank() && streamingContent.value.isEmpty() && settings.autoTtsEnabled && !viewModel.dialogState.value.isVoiceCall) {
             val lastIdx = messages.indexOf(lastMsg)
             if (lastIdx != ttsPlayedMessageIndex && lastMsg.content != lastAssistantMessage) {
                 lastAssistantMessage = lastMsg.content
@@ -397,10 +400,39 @@ fun ChatScreen(
                                 if (reasoningText.isNotEmpty()) {
                                     viewModel.updateStreamingReasoning("")
                                 }
-                                // A voice call carries on: the capture never
-                                // stopped, so once playback ends the gate
-                                // re-opens and the next utterance can start
-                                // the instant the user begins speaking.
+                                // A voice call speaks its own reply here,
+                                // inside the exchange: the gate must not
+                                // reopen until the speaker has actually
+                                // finished, so the capture can never hear its
+                                // own output. (The auto-TTS effect used to
+                                // carry this playback in a separate job, which
+                                // let the exchange return - and the gate
+                                // re-open - while the reply was still on the
+                                // speaker.)
+                                if (viewModel.dialogState.value.isVoiceCall && finalText.isNotEmpty()) {
+                                    viewModel.setDialogPhase(VoiceCallPhase.SPEAKING)
+                                    try {
+                                        ttsAbortSignal.set(false)
+                                        playTTSAudio(
+                                            finalText,
+                                            Pair(settings.ttsBaseUrl, if (settings.ttsApiKey.isBlank()) null else settings.ttsApiKey),
+                                            model = settings.ttsModelName,
+                                            voice = settings.ttsVoiceName,
+                                            responseFormat = settings.ttsResponseFormat,
+                                            enableStreaming = settings.enableTtsStreaming,
+                                            timeoutSeconds = settings.httpTimeoutSeconds.toLong(),
+                                            forbidNonLatin = settings.forbidNonLatinTts,
+                                            abortSignal = ttsAbortSignal,
+                                            onTtsTooSlow = {
+                                                viewModel.addMessage(com.localassistant.app.domain.model.MessageRole.SYSTEM,
+                                                    "The TTS server or connection is too slow for real-time speech.")
+                                                launchVoiceJob { com.localassistant.app.ui.common.playWaitingCue() }
+                                            }
+                                        )
+                                    } finally {
+                                        viewModel.setDialogPhase(VoiceCallPhase.IDLE)
+                                    }
+                                }
                                 viewModel.setDialogPhase(VoiceCallPhase.IDLE)
                             }
                         } else {
@@ -411,26 +443,26 @@ fun ChatScreen(
                                 viewModel.setDialogPhase(VoiceCallPhase.IDLE)
                             }
                             if (viewModel.dialogState.value.isVoiceCall) {
-                                launchVoiceJob {
-                                    ttsAbortSignal.set(false)
-                                    if (viewModel.dialogState.value.isVoiceCall) viewModel.setDialogPhase(VoiceCallPhase.SPEAKING)
-                                    try {
-                                        playTTSAudio(
-                                            "Sorry, I misheard you. Please repeat.",
-                                            Pair(settings.ttsBaseUrl, if (settings.ttsApiKey.isBlank()) null else settings.ttsApiKey),
-                                            model = settings.ttsModelName,
-                                            voice = settings.ttsVoiceName,
-                                            responseFormat = settings.ttsResponseFormat,
-                                            enableStreaming = settings.enableTtsStreaming,
-                                            timeoutSeconds = settings.httpTimeoutSeconds.toLong(),
-                                            abortSignal = ttsAbortSignal
-                                        )
-                                    } finally {
-                                        if (viewModel.dialogState.value.isVoiceCall) viewModel.setDialogPhase(VoiceCallPhase.IDLE)
-                                    }
+                                // Spoken inside the exchange, like the reply:
+                                // the gate stays shut until the prompt has
+                                // finished, so the capture cannot hear it.
+                                ttsAbortSignal.set(false)
+                                if (viewModel.dialogState.value.isVoiceCall) viewModel.setDialogPhase(VoiceCallPhase.SPEAKING)
+                                try {
+                                    playTTSAudio(
+                                        "Sorry, I misheard you. Please repeat.",
+                                        Pair(settings.ttsBaseUrl, if (settings.ttsApiKey.isBlank()) null else settings.ttsApiKey),
+                                        model = settings.ttsModelName,
+                                        voice = settings.ttsVoiceName,
+                                        responseFormat = settings.ttsResponseFormat,
+                                        enableStreaming = settings.enableTtsStreaming,
+                                        timeoutSeconds = settings.httpTimeoutSeconds.toLong(),
+                                        forbidNonLatin = settings.forbidNonLatinTts,
+                                        abortSignal = ttsAbortSignal
+                                    )
+                                } finally {
+                                    if (viewModel.dialogState.value.isVoiceCall) viewModel.setDialogPhase(VoiceCallPhase.IDLE)
                                 }
-                                // The capture is continuous: the gate re-opens
-                                // when the prompt finishes speaking.
                             }
                         }
                     } catch (e: java.util.concurrent.CancellationException) {
@@ -447,9 +479,12 @@ fun ChatScreen(
                     }
         finally {
             exchangeRunning.set(false)
-            // Reopen only if the call is still on; a hung-up call has a
-            // closed capture, and a closed gate cannot hear anything.
-            captureGate.set(viewModel.dialogState.value.isVoiceCall)
+            // Reopen only if the call is still on and nothing is speaking; a
+            // hung-up call has a closed capture, and a closed gate cannot
+            // hear anything. Checking the phase too keeps the gate shut for
+            // as long as the speaker is audible, whatever path spoke.
+            val d = viewModel.dialogState.value
+            captureGate.set(d.isVoiceCall && !d.isSpeaking)
         }
     }
     // The capture thread has no Compose scope: it calls through this
