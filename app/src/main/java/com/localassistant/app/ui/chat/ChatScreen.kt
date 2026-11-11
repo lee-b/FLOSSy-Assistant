@@ -1351,18 +1351,31 @@ private fun VoiceControlsBar(
                     }
                 }
 
-                IconButton(
-                    onClick = {
-                        if (!isRecording) onStartRecording() else onStopRecording()
-                    },
-                    modifier = Modifier.size(40.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Mic,
-                        contentDescription = if (isRecording) "Stop recording" else "Start recording",
-                        tint = if (isRecording) MaterialTheme.colorScheme.onError else MaterialTheme.colorScheme.onPrimaryContainer,
-                        modifier = Modifier.size(20.dp)
-                    )
+                // A voice call is not a recording session - the bar shows one
+                // unmistakable way out of it instead of a second mic.
+                if (dialogState.isVoiceCall) {
+                    Button(
+                        onClick = onStopRecording,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.error,
+                            contentColor = MaterialTheme.colorScheme.onError
+                        ),
+                        modifier = Modifier.weight(1f).height(40.dp)
+                    ) {
+                        Text("End Call")
+                    }
+                } else {
+                    IconButton(
+                        onClick = onStartRecording,
+                        modifier = Modifier.size(40.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Mic,
+                            contentDescription = "Start recording",
+                            tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
                 }
             }
 
