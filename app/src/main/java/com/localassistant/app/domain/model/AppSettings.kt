@@ -82,6 +82,9 @@ data class AppSettings(
     // Service Settings
     val enableForegroundService: Boolean = true,
     val autoStartOnBoot: Boolean = true,
+    // Open the app as a live voice session: launching the app starts the voice
+    // pipeline listening straight away instead of waiting for the mic button.
+    val autoStartVoiceOnLaunch: Boolean = true,
     val batteryOptimizationExempted: Boolean = false,
     // Chat Display Settings
     val autoTtsEnabled: Boolean = true,

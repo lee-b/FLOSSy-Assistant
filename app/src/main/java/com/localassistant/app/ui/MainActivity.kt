@@ -261,13 +261,21 @@ class MainActivity : ComponentActivity() {
         
         // Check permissions on creation
         hasPermissions = hasRequiredPermissions()
-        
+
         // Handle intent from launch (first start)
         handleVoiceCommandIntent(intent)
         handleWakeTriggerIntent(intent)
-        
+
         // Observe settings so theme changes (e.g. dark mode toggle) apply live
         val settingsRepository = SettingsRepository(applicationContext)
+
+        // Opening the app is a voice interaction: the pipeline starts listening
+        // straight away instead of waiting for the small mic button on the chat
+        // bar. The user can turn this off with the Voice on Launch switch.
+        if (hasPermissions && settingsRepository.loadSettings().autoStartVoiceOnLaunch) {
+            android.util.Log.d("MainActivity", "Starting voice assistant on launch")
+            startVoiceAssistant()
+        }
         
         setContent {
             val showSplash = remember { mutableStateOf(true) }

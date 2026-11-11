@@ -368,6 +368,9 @@ fun SettingsScreen(onNavigateBack: () -> Unit, viewModel: SettingsViewModel = vi
 
             SettingsSection("Appearance", "🎨", "How the interface looks") {
                 SettingSwitch("Dark Mode (gray Gruvbox)", settings.darkModeEnabled, { viewModel.updateSetting("darkModeEnabled", it) })
+                // Launching the app is a voice interaction: the pipeline starts
+                // listening immediately rather than waiting for the mic button.
+                SettingSwitch("Voice on Launch", settings.autoStartVoiceOnLaunch, { viewModel.updateSetting("autoStartVoiceOnLaunch", it) })
             }
 
             SettingsSection("Wake Word", "🔑", "Say the phrase to start a conversation without tapping") {
