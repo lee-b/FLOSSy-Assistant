@@ -1083,7 +1083,15 @@ private fun VoiceControlsBar(
 ) {
 
     Surface(
-        modifier = Modifier.fillMaxWidth().imePadding(),
+        // The navigation bar insets have to be applied here: this is a custom
+        // bottom bar, and unlike the built-in NavigationBar the Scaffold does not
+        // pad it for the virtual back/home/overview bar - without it the Message
+        // input renders underneath the system bar. imePadding() comes after so
+        // the keyboard pushes the whole bar clear of both.
+        modifier = Modifier
+            .fillMaxWidth()
+            .navigationBarsPadding()
+            .imePadding(),
         tonalElevation = 4.dp
     ) {
         Column(modifier = Modifier.padding(12.dp)) {
