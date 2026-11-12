@@ -25,6 +25,16 @@ import ai.flossyapp.ui.theme.WAKE_PHASE_LISTENING
 import ai.flossyapp.ui.theme.WAKE_PHASE_THINKING
 import ai.flossyapp.ui.theme.WAKE_PHASE_ANSWERING
 import ai.flossyapp.ui.theme.WAKE_DIVIDER
+import ai.flossyapp.ui.wake.WakeCardContent
+import ai.flossyapp.ui.wake.WakeCardSnapshot
+import ai.flossyapp.ui.wake.WakeCardState
+import androidx.compose.ui.platform.ComposeView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.LifecycleRegistry
+import androidx.savedstate.SavedStateRegistry
+import androidx.savedstate.SavedStateRegistryController
+import androidx.savedstate.SavedStateRegistryOwner
 
 /**
  * The key the wake service uses to hand the user's request to a session.
@@ -512,15 +522,6 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
     private var riseProgress = 0f
 
     /**
-     * Which blink of the caret the next show is, so a still-arriving answer can
-     * toggle its underline - see [CARET_HEIGHT] for why a blink is a counter.
-     *
-     * The session is created per exchange, so this counts from the first show of
-     * an exchange and never needs resetting.
-     */
-    private var caretFrame = 0
-
-    /**
      * The short edge of the display, in px, as measured from the window the
      * platform lays out for the first show; zero until measured.
      *
@@ -565,78 +566,30 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
      * The empty strip under the card that keeps it off the bottom edge.
      *
      * It measures to its own top padding and paints nothing, which is the same
-     * honoured trick the ruler uses for width - see [BOTTOM_MARGIN].
+     * trick the card's elevation inset uses.
      */
     private val foot = LinearLayout(context)
-    private val panel = LinearLayout(context)
-    private val statusLine = TextView(context)
 
     /**
-     * The drawn indicator that leads the status line - see [CHIP_SIZE] for why a
-     * glyph could not be used.
+     * The exchange the card draws, painted by [WakeCardContent] - the same
+     * bubbles and the same bottom-pinning scroll the main chat view draws with.
+     *
+     * A Compose surface inside a voice-interaction window needs owners the
+     * window does not build on its own: a lifecycle and a saved-state registry
+     * the recomposer attaches to. The session builds them itself and wires them
+     * onto the view before it joins the tree - see [SessionComposeOwner].
      */
-    private val phaseChip = LinearLayout(context)
-    private val userBubble = LinearLayout(context)
-    private val userLines = (0 until USER_MAX_LINES).map { _ -> TextView(context) }
-    private val replyBubble = LinearLayout(context)
-    private val replyLines = (0 until REPLY_MAX_LINES).map { _ -> TextView(context) }
+    private val cardState = WakeCardState()
+    private lateinit var composeCard: ComposeView
+    private val composeOwner = SessionComposeOwner()
 
     /**
-     * The underline that blinks under a reply that is still arriving.
-     *
-     * It is a childless `LinearLayout`, the same measuring trick the ruler and
-     * the foot use - see [CARET_HEIGHT] for why the ink is a bar and how the
-     * blink is driven.
+     * The shapes the legacy half still paints: the card's surface and its
+     * elevation halo, built once and re-tinted per show.
      */
-    private val caret = LinearLayout(context)
-
-    /**
-     * The row under the reply that carries the two ways out of the popup:
-     * opening the full app, and ending the exchange. The end button wears the
-     * same red the app chat view's End Call wears, so both surfaces read as
-     * one assistant.
-     */
-    private val buttonRow = LinearLayout(context)
-    private val openAppButton = Button(context)
-    private val endChatButton = Button(context)
-
-    /**
-     * The children that pin the card to a fixed size, the rows the bubbles sit
-     * in, and the shapes that round them.
-     *
-     * The ruler is an empty child carrying the card's width as left-plus-right
-     * padding: it measures to that width and to no height, so the card stays the
-     * same shape for the whole exchange instead of jumping wider whenever a
-     * longer sentence arrives.
-     *
-     * Each bubble sits inside its own row rather than directly in the panel. The
-     * panel is a vertical container, so it stretches its children across the full
-     * inner width - measured on the tab, the user bubble came out at 1560 px
-     * regardless of how much text it held, which read as a band across the card
-     * rather than a bubble. A row is the default horizontal container, and there
-     * the bubble keeps its **own** measured width along the main axis, so it hugs
-     * its longest line; the row itself is still stretched by the panel, which is
-     * what leaves room for gravity to push the reply to the right edge.
-     *
-     * The shapes are built once because the views are built once; [paint] only
-     * ever swaps which shape a widget carries.
-     */
-    private val ruler = LinearLayout(context)
-    private val statusRow = LinearLayout(context)
-    private val userRow = LinearLayout(context)
-    private val divider = LinearLayout(context)
-    private val replyRow = LinearLayout(context)
     private var cardShape = rounded(WAKE_CARD_SURFACE, CARD_RADIUS)
     private var elevationShape = rounded(WAKE_CARD_ELEVATION, CARD_RADIUS + CARD_ELEVATION)
     private val clearShape = rounded(TRANSPARENT, CARD_RADIUS)
-    private var userShape = rounded(WAKE_USER_BUBBLE, USER_RADIUS)
-    private var replyShape = rounded(WAKE_REPLY_BUBBLE, REPLY_RADIUS)
-    private var dividerShape = rounded(WAKE_DIVIDER, 0f)
-    private var caretShape = rounded(GRUVBOX_PRIMARY, CARET_HEIGHT / 2f)
-    private var chipListening = rounded(WAKE_PHASE_LISTENING, CHIP_SIZE / 2f)
-    private var chipThinking = rounded(WAKE_PHASE_THINKING, CHIP_SIZE / 2f)
-    private var chipAnswering = rounded(WAKE_PHASE_ANSWERING, CHIP_SIZE / 2f)
-    private var chipFault = rounded(GRUVBOX_ERROR, CHIP_SIZE / 2f)
 
     /**
      * Records what the platform is about to show.
@@ -653,12 +606,13 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
         request = args.getString(SESSION_REQUEST_KEY) ?: ""
         reply = args.getString(SESSION_REPLY_KEY) ?: ""
         riseProgress = settledProgress(args.getString(SESSION_ANIM_KEY))
-        caretFrame++
         rescale()
+        // The bubbles are Compose now, so they wrap themselves; the line counts
+        // here are only the window-height estimate [neededHeight] runs on, kept
+        // because the window is cut before the card is ever laid out.
         userShown = wrap(request, USER_MAX_LINES)
         replyShown = wrap(reply, REPLY_MAX_LINES)
         sizeWindow()
-        metrics()
         paint()
     }
 
@@ -790,50 +744,10 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
         scale = target
         cardShape = rounded(WAKE_CARD_SURFACE, pt(CARD_RADIUS))
         elevationShape = rounded(WAKE_CARD_ELEVATION, pt(CARD_RADIUS + CARD_ELEVATION))
-        userShape = rounded(WAKE_USER_BUBBLE, pt(USER_RADIUS))
-        replyShape = rounded(WAKE_REPLY_BUBBLE, pt(REPLY_RADIUS))
-        dividerShape = rounded(WAKE_DIVIDER, 0f)
-        caretShape = rounded(GRUVBOX_PRIMARY, pt(CARET_HEIGHT / 2f))
-        chipListening = rounded(WAKE_PHASE_LISTENING, pt(CHIP_SIZE / 2f))
-        chipThinking = rounded(WAKE_PHASE_THINKING, pt(CHIP_SIZE / 2f))
-        chipAnswering = rounded(WAKE_PHASE_ANSWERING, pt(CHIP_SIZE / 2f))
-        chipFault = rounded(GRUVBOX_ERROR, pt(CHIP_SIZE / 2f))
         Log.i(
             "WakeChatSessionService",
             "Scaled the card to $scale for a $measuredShortEdge-px short edge of the display"
         )
-    }
-
-    /**
-     * Applies the current scale to every metric the card draws with.
-     *
-     * Applied on every show rather than wired once, because the scale is not
-     * known until the display has been measured and the first show is the
-     * measurement. [onCreateContentView] wires the structure once; these setters
-     * are the numeric half of that wiring, and re-applying them is what lets the
-     * show after the measurement draw at the real size.
-     */
-    private fun metrics() {
-        panel.setPadding(px(CARD_SIDE_PADDING), px(CARD_TOP_PADDING), px(CARD_SIDE_PADDING), px(CARD_BOTTOM_PADDING))
-        ruler.setPadding(px(CARD_WIDTH) / 2, 0, px(CARD_WIDTH) / 2, 0)
-        foot.setPadding(0, px(BOTTOM_MARGIN), 0, 0)
-        card.setPadding(px(CARD_ELEVATION), px(CARD_ELEVATION), px(CARD_ELEVATION), px(CARD_ELEVATION))
-        statusRow.setPadding(0, 0, 0, px(BUBBLE_GAP))
-        phaseChip.setPadding(px(CHIP_SIZE / 2), px(CHIP_SIZE / 2), px(CHIP_SIZE / 2), px(CHIP_SIZE / 2))
-        statusLine.setPadding(px(STATUS_DOT_GAP), 0, 0, 0)
-        statusLine.textSize = pt(STATUS_SIZE)
-        divider.setPadding(0, px(DIVIDER_HEIGHT / 2), 0, px(DIVIDER_HEIGHT / 2))
-        userLines.forEach { line -> line.textSize = pt(USER_TEXT_SIZE) }
-        replyLines.forEach { line -> line.textSize = pt(REPLY_TEXT_SIZE) }
-        // The buttons are wired once but sized per show, like every other
-        // metric here, so a rescale between shows re-fits them too.
-        buttonRow.setPadding(0, px(BUBBLE_GAP), 0, 0)
-        openAppButton.textSize = pt(STATUS_SIZE + 3f)
-        endChatButton.textSize = pt(STATUS_SIZE + 3f)
-        (openAppButton.layoutParams as? LinearLayout.LayoutParams)?.let { lp ->
-            lp.height = px(BUTTON_HEIGHT); openAppButton.layoutParams = lp }
-        (endChatButton.layoutParams as? LinearLayout.LayoutParams)?.let { lp ->
-            lp.height = px(BUTTON_HEIGHT); endChatButton.layoutParams = lp }
     }
 
     /**
@@ -860,74 +774,36 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
         stage.addView(foot)
         card.setGravity(Gravity.TOP or Gravity.CENTER_HORIZONTAL)
         card.setOrientation(VERTICAL)
-        card.addView(panel)
-        panel.setGravity(Gravity.TOP or Gravity.CENTER_HORIZONTAL)
-        panel.setOrientation(VERTICAL)
-        panel.addView(ruler)
-        panel.addView(statusRow)
-        statusRow.setGravity(Gravity.LEFT)
-        statusRow.addView(phaseChip)
-        statusRow.addView(statusLine)
-        panel.addView(userRow)
-        userRow.setGravity(Gravity.TOP or Gravity.LEFT)
-        userRow.addView(userBubble)
-        userBubble.setOrientation(VERTICAL)
-        userLines.forEach { line ->
-            userBubble.addView(line)
-            line.setGravity(Gravity.LEFT)
-            line.setTextColor(GRUVBOX_ON_SURFACE)
+        card.setPadding(px(CARD_ELEVATION), px(CARD_ELEVATION), px(CARD_ELEVATION), px(CARD_ELEVATION))
+        // The content view is a Compose surface: the card is a mini version of
+        // the main chat view, drawn from the same bubble and scroll parts the
+        // chat screen draws with (see ui/common/BubbleKit.kt). The legacy views
+        // this session used before could not share a single line of rendering
+        // with the chat view - they could only imitate its look - and the
+        // bubbles' line cutting was a hand-rolled algorithm the chat view did
+        // not run. Drawing both surfaces from one kit is what makes the popup
+        // a smaller copy of the chat view rather than a look-alike.
+        //
+        // A voice-interaction window builds no lifecycle of its own, so the
+        // owners the recomposer needs are built here and wired onto the view
+        // BEFORE it joins the tree: the recomposer looks them up at attach,
+        // and a view attached without them never starts composing.
+        composeCard = ComposeView(context)
+        wireComposeOwners(composeCard, composeOwner)
+        // The recomposer resolves from the window's decor view, which the
+        // framework builds outside this chain, so the owner rides there too.
+        // The window already exists by the first show - sizeWindow laid it
+        // out in onPrepareShow - so the decor is reachable here.
+        window?.window?.decorView?.let { wireComposeOwners(it, composeOwner) }
+        composeCard.setContent {
+            WakeCardContent(cardState)
         }
-        panel.addView(divider)
-        panel.addView(replyRow)
-        replyRow.setGravity(Gravity.TOP or Gravity.RIGHT)
-        replyRow.addView(replyBubble)
-        // The row is a horizontal container like the bubble rows, and the two
-        // buttons split the inner width between them with weights, so they
-        // always fill the card rather than hugging their labels.
-        buttonRow.setOrientation(HORIZONTAL)
-        openAppButton.setGravity(Gravity.CENTER)
-        endChatButton.setGravity(Gravity.CENTER)
-        openAppButton.setAllCaps(false)
-        endChatButton.setAllCaps(false)
-        openAppButton.background = rounded(GRUVBOX_SURFACE_LOW, BUTTON_RADIUS)
-        endChatButton.background = rounded(GRUVBOX_ERROR, BUTTON_RADIUS)
-        openAppButton.setTextColor(GRUVBOX_ON_SURFACE)
-        endChatButton.setTextColor(GRUVBOX_ON_SURFACE)
-        // Opening the full app is the one thing a session is allowed to do
-        // with an activity: startAssistantActivity is the sanctioned path and
-        // the platform grants it inside a voice interaction, where a service's
-        // own startActivity would be refused as a background launch.
-        openAppButton.setOnClickListener {
-            try {
-                val launch = context.packageManager.getLaunchIntentForPackage(context.packageName)
-                if (launch != null) startAssistantActivity(launch)
-            } catch (e: Exception) {
-                Log.w("WakeChatSessionService", "Could not open the app: ${e.message}")
-            }
-        }
-        // Ending the chat is the service's call, not the session's: the state
-        // both halves share lives over there, and its close animation is the
-        // one way the card sinks everywhere at once.
-        endChatButton.setOnClickListener {
-            try {
-                context.startService(
-                    WakeChatService.buildIntent(context, WakeChatService.ACTION_CLOSE_CHAT)
-                )
-            } catch (e: Exception) {
-                Log.w("WakeChatSessionService", "Could not end the chat: ${e.message}")
-            }
-        }
-        replyBubble.setOrientation(VERTICAL)
-        replyLines.forEach { line ->
-            replyBubble.addView(line)
-            line.setGravity(Gravity.RIGHT)
-            line.setTextColor(GRUVBOX_PRIMARY)
-        }
-        replyBubble.addView(caret)
-        panel.addView(buttonRow)
-        buttonRow.addView(openAppButton, LinearLayout.LayoutParams(0, 0, 1f))
-        buttonRow.addView(endChatButton, LinearLayout.LayoutParams(0, 0, 1f))
-        metrics()
+        composeCard.layoutParams = LinearLayout.LayoutParams(
+            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+            android.view.ViewGroup.LayoutParams.MATCH_PARENT
+        )
+        card.addView(composeCard)
+        foot.setPadding(0, px(BOTTOM_MARGIN), 0, 0)
         paint()
         return stage
     }
@@ -935,77 +811,62 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
     /**
      * Draws what [state] asks for, leaving everything else empty.
      *
-     * An empty `TextView` measures nothing and a transparent background paints
-     * nothing, so a state that shows no turn contributes no height and no ink -
-     * which is how a closed exchange looks like nothing at all.
-     *
-     * The status line is the one thing painted in every open state, so the card
-     * always says what it is doing even before a word has been heard.
+     * The session's half of the card is only the choreography: the card
+     * surface, its elevation halo and the fade the climb carries. Everything
+     * inside - the status line, the two bubbles, the caret, the buttons - is
+     * the snapshot [WakeCardContent] renders, and an empty snapshot paints
+     * nothing, which is how a closed exchange looks like nothing at all.
      */
     private fun paint() {
-        statusLine.text = ""
-        userLines.forEach { line -> line.text = "" }
-        replyLines.forEach { line -> line.text = "" }
-        // The ink carries the animation's share of its strength, so a card that is
-        // climbing arrives fading rather than appearing at full strength in mid-air
-        // - see [tint] for why colour is applied on every show.
         tint()
         val closed = state == SESSION_STATE_CLOSE && riseProgress <= 0f
-        val bothTurns = request.isNotBlank() && reply.isNotBlank()
+        // The card wears the elevation halo; the Compose surface inside wears
+        // the card surface, so the ring the panel used to show is still the
+        // space between the two backgrounds. On the first show
+        // [onPrepareShow] runs before the framework asks for the content
+        // view, so the surface may not exist yet: the paint that matters then
+        // is [onCreateContentView]'s own, and this pass draws only the shell.
         card.background = if (closed) clearShape else elevationShape
-        panel.background = if (closed) clearShape else cardShape
-        divider.background = if (closed || !bothTurns) clearShape else dividerShape
-        phaseChip.background = if (closed) clearShape else phaseShape()
-        statusLine.text = if (closed) "" else statusLabel()
-        statusLine.setTextColor(if (closed) TRANSPARENT else ink(GRUVBOX_ON_SURFACE_MUTED))
-        userBubble.background = if (request.isBlank()) clearShape else userShape
-        replyBubble.background = if (reply.isBlank()) clearShape else replyShape
-        val userPad = if (request.isBlank()) 0 else px(BUBBLE_PADDING)
-        userBubble.setPadding(userPad, userPad, userPad, userPad + if (request.isBlank()) 0 else px(BUBBLE_GAP))
-        val replyPad = if (reply.isBlank()) 0 else px(BUBBLE_PADDING)
-        replyBubble.setPadding(replyPad, replyPad, replyPad, replyPad)
-        val caretPad = if (reply.isBlank()) 0 else px(CARET_HEIGHT / 2)
-        caret.setPadding(0, caretPad, 0, caretPad)
-        caret.background =
-            if (state == SESSION_STATE_STREAMING && caretFrame % 2 == 0) caretShape else clearShape
-        // The buttons belong to an open exchange only: a closed card sinks
-        // with nothing left to act on, and an empty row would still measure
-        // its padding and hold the card open over nothing.
-        buttonRow.visibility = if (closed) View.GONE else View.VISIBLE
-        openAppButton.visibility = buttonRow.visibility
-        endChatButton.visibility = buttonRow.visibility
-        userShown.forEachIndexed { index, line ->
-            if (index < userLines.size) userLines[index].text = line
-        }
-        replyShown.forEachIndexed { index, line ->
-            if (index < replyLines.size) replyLines[index].text = line
-        }
+        if (this::composeCard.isInitialized) composeCard.background = if (closed) clearShape else cardShape
+        if (this::composeCard.isInitialized) cardState.snapshot = if (closed) null else WakeCardSnapshot(
+            statusLabel = statusLabel(),
+            statusColor = ink(GRUVBOX_ON_SURFACE_MUTED),
+            chipColor = ink(phaseColor()),
+            request = request,
+            reply = reply,
+            streaming = state == SESSION_STATE_STREAMING,
+            alpha = riseProgress,
+            fontScale = scale,
+            onOpenApp = {
+                try {
+                    val launch = context.packageManager.getLaunchIntentForPackage(context.packageName)
+                    if (launch != null) startAssistantActivity(launch)
+                } catch (e: Exception) {
+                    Log.w("WakeChatSessionService", "Could not open the app: ${e.message}")
+                }
+            },
+            onEndChat = {
+                try {
+                    context.startService(
+                        WakeChatService.buildIntent(context, WakeChatService.ACTION_CLOSE_CHAT)
+                    )
+                } catch (e: Exception) {
+                    Log.w("WakeChatSessionService", "Could not end the chat: ${e.message}")
+                }
+            }
+        )
     }
 
     /**
-     * Re-tints every shape and text run the card owns to the current progress.
+     * Re-tints the legacy half's shapes to the current progress.
      *
-     * Colour is applied on every show rather than at the shapes' construction so
-     * [rescale] stays the owner of geometry alone: the shapes are rebuilt only when
-     * the card rescales, while their ink changes on every frame of a climb, and
-     * mutating an existing [GradientDrawable]'s colour costs far less than building
-     * a new one per frame. Setting every shape on every show, settled or not, is what
-     * returns a shape that a climb faded back to full strength - a colour left behind
-     * by the frame before would otherwise stay translucent for the whole exchange.
+     * The card surface and its elevation halo are the only paint left here;
+     * everything inside the card is Compose, which carries the fade itself via
+     * the snapshot's alpha.
      */
     private fun tint() {
         cardShape.setColor(ink(WAKE_CARD_SURFACE))
         elevationShape.setColor(ink(WAKE_CARD_ELEVATION))
-        userShape.setColor(ink(WAKE_USER_BUBBLE))
-        replyShape.setColor(ink(WAKE_REPLY_BUBBLE))
-        dividerShape.setColor(ink(WAKE_DIVIDER))
-        caretShape.setColor(ink(GRUVBOX_PRIMARY))
-        chipListening.setColor(ink(WAKE_PHASE_LISTENING))
-        chipThinking.setColor(ink(WAKE_PHASE_THINKING))
-        chipAnswering.setColor(ink(WAKE_PHASE_ANSWERING))
-        chipFault.setColor(ink(GRUVBOX_ERROR))
-        userLines.forEach { line -> line.setTextColor(ink(GRUVBOX_ON_SURFACE)) }
-        replyLines.forEach { line -> line.setTextColor(ink(GRUVBOX_PRIMARY)) }
     }
 
     /**
@@ -1083,11 +944,19 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
      * the state. A state the wake service does not name is taken as a fault and
      * wears [GRUVBOX_ERROR].
      */
-    private fun phaseShape(): GradientDrawable = when (state) {
-        SESSION_STATE_LISTENING -> chipListening
-        SESSION_STATE_REQUEST -> chipThinking
-        SESSION_STATE_STREAMING, SESSION_STATE_SPEAKING, SESSION_STATE_REPLY -> chipAnswering
-        else -> chipFault
+    /**
+     * The colour the status chip wears, which is the exchange's phase wearing
+     * the colour it is doing in. Only the chip wears it: the label beside it
+     * stays [GRUVBOX_ON_SURFACE_MUTED], so the phase is legible from across a
+     * room by colour alone while the words stay quiet instead of shouting the
+     * state. A state the wake service does not name is taken as a fault and
+     * wears [GRUVBOX_ERROR].
+     */
+    private fun phaseColor(): Int = when (state) {
+        SESSION_STATE_LISTENING -> WAKE_PHASE_LISTENING
+        SESSION_STATE_REQUEST -> WAKE_PHASE_THINKING
+        SESSION_STATE_STREAMING, SESSION_STATE_SPEAKING, SESSION_STATE_REPLY -> WAKE_PHASE_ANSWERING
+        else -> GRUVBOX_ERROR
     }
 
     /**
@@ -1167,7 +1036,8 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
     override fun onShow(args: android.os.Bundle?, showFlags: Int) {
         Log.i(
             "WakeChatSessionService",
-            "Shown state=$state scale=$scale stageW=${stage.width} stageH=${stage.height} cardW=${card.width} cardH=${card.height} panelW=${panel.width} panelH=${panel.height} rowW=${statusRow.width} chipW=${phaseChip.width} chipH=${phaseChip.height} statusW=${statusLine.width} statusH=${statusLine.height} divH=${divider.height} u0W=${userLines[0].width} u0H=${userLines[0].height} u0T=${userLines[0].text.length} r0T=${replyLines[0].text.length} userBW=${userBubble.width} userBH=${userBubble.height} replyBW=${replyBubble.width} replyBH=${replyBubble.height} userRowW=${userRow.width} replyRowW=${replyRow.width}"
+            "Shown state=$state scale=$scale stageW=${stage.width} stageH=${stage.height} " +
+                "cardW=${card.width} cardH=${card.height} composeW=${composeCard.width} composeH=${composeCard.height}"
         )
         if (state == SESSION_STATE_CLOSE) finish()
     }
@@ -1238,5 +1108,84 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
      */
     override fun onCreate() {
         setKeepAwake(true)
+    }
+}
+
+/**
+ * The lifecycle and saved-state owners a Compose surface needs that a
+ * voice-interaction window does not build.
+ *
+ * A [VoiceInteractionSession]'s content view joins a window the framework
+ * drives directly, so the view tree carries no
+ * [androidx.lifecycle.LifecycleOwner] and the recomposer a [ComposeView]
+ * builds at attach has nothing to observe: without one the surface never
+ * starts composing and the card stays blank. This owner is constructed with
+ * its lifecycle already resumed - the session is only ever shown while it is
+ * alive, so there is no pause state to model - and is wired onto the view
+ * before the view joins the tree, which is when the lookup happens.
+ *
+ * The saved-state registry rides along because Compose asks for one at
+ * attach too; the card keeps no state worth saving, so the registry is
+ * restored from nothing.
+ */
+private class SessionComposeOwner : LifecycleOwner, SavedStateRegistryOwner {
+    // The Restarter check demands the controller attach during the owner's own
+    // initialization, and a field initialiser IS that stage: creating the
+    // controller here instead of in an init block is what keeps performRestore
+    // from throwing "Restarter must be created only during owner's
+    // initialization stage". The lifecycle is still INITIALIZED at that point,
+    // which is exactly what the check reads. The session is only ever shown
+    // while it is alive, so there is no pause state to model: the lifecycle
+    // starts resumed and stays there.
+    private val state = LifecycleRegistry(this)
+    private val controller = SavedStateRegistryController.create(this).also {
+        it.performRestore(null)
+    }
+
+    init {
+        state.currentState = Lifecycle.State.RESUMED
+    }
+
+    // Lifecycle 2.8 and savedstate 1.2 are Kotlin interfaces exposing these as
+    // properties, not getter overrides.
+    override val lifecycle: Lifecycle get() = state
+    override val savedStateRegistry: SavedStateRegistry get() = controller.savedStateRegistry
+}
+
+/**
+ * Wires the view-tree owners a Compose surface needs onto [view].
+ *
+ * The setter classes are android-only sources of their artifacts, so this
+ * module's compiler does not see them even though the runtime classpath
+ * carries them - Compose itself looks the owners up at attach by the same
+ * names. Reflection is therefore the only way to reach them, and a failure
+ * only means the recomposer will have nothing to observe and the card stays
+ * blank, which the log says plainly.
+ */
+private fun wireComposeOwners(view: android.view.View, owner: SessionComposeOwner) {
+    // The recomposer resolves from the ROOT of the view tree, not from the
+    // ComposeView: getWindowRecomposer walks to the root and looks the owner
+    // up there, so an owner set only on the leaf is invisible to it - which
+    // is exactly what the "ViewTreeLifecycleOwner not found from
+    // LinearLayout{stage}" crash was. The owner therefore rides on every view
+    // from the leaf to the root, so whichever root the window ends up with
+    // carries it.
+    var link: android.view.View? = view
+    while (link != null) {
+        runCatching {
+            Class.forName("androidx.lifecycle.ViewTreeLifecycleOwner")
+                .getMethod("set", android.view.View::class.java, LifecycleOwner::class.java)
+                .invoke(null, link, owner)
+        }.onFailure {
+            Log.w("WakeChatSessionService", "Could not wire the lifecycle owner: ${it.message}")
+        }
+        runCatching {
+            Class.forName("androidx.savedstate.ViewTreeSavedStateRegistryOwner")
+                .getMethod("set", android.view.View::class.java, SavedStateRegistryOwner::class.java)
+                .invoke(null, link, owner)
+        }.onFailure {
+            Log.w("WakeChatSessionService", "Could not wire the saved-state owner: ${it.message}")
+        }
+        link = link.parent as? android.view.View
     }
 }
