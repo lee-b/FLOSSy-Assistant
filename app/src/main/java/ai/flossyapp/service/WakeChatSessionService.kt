@@ -11,6 +11,7 @@ import android.view.View
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
+import ai.flossyapp.ui.common.CallPose
 import ai.flossyapp.ui.theme.TRANSPARENT
 import ai.flossyapp.ui.theme.GRUVBOX_ON_SURFACE
 import ai.flossyapp.ui.theme.GRUVBOX_ON_SURFACE_MUTED
@@ -354,6 +355,10 @@ private const val CARET_HEIGHT = 8
  * as part of the card rather than as system chrome.
  */
 private const val BUTTON_HEIGHT = 72
+
+// The room the bot face takes between the status and the bubbles, in design
+// units - scaled like every other length by the display factor.
+private const val AVATAR_HEIGHT = 100
 private const val BUTTON_RADIUS = 26f
 
 /**
@@ -835,6 +840,7 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
             request = request,
             reply = reply,
             streaming = state == SESSION_STATE_STREAMING,
+            pose = pose(),
             alpha = riseProgress,
             fontScale = scale,
             onOpenApp = {
@@ -909,7 +915,13 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
         val buttons =
             if (userLineCount == 0 && replyLineCount == 0) 0
             else px(BUBBLE_GAP) + px(BUTTON_HEIGHT)
-        return px(CARD_TOP_PADDING) + px(CARD_BOTTOM_PADDING) + status + px(DIVIDER_HEIGHT) + user + answer + buttons
+        // The bot rides between the status and the bubbles, so it costs the
+        // window its own room on every open card - without it the reply's
+        // first lines would be clipped under the avatar.
+        val avatar =
+            if (userLineCount == 0 && replyLineCount == 0) 0
+            else px(BUBBLE_GAP) + px(AVATAR_HEIGHT)
+        return px(CARD_TOP_PADDING) + px(CARD_BOTTOM_PADDING) + status + px(DIVIDER_HEIGHT) + user + answer + buttons + avatar
     }
 
     /**
@@ -921,6 +933,19 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
      * reply still carries a label, because the card is open and the user should
      * be able to tell it is open.
      */
+    /**
+     * What the bot in the card is doing, one pose per thing a voice exchange
+     * does. Thinking is the pose that matters most: nothing arrives from the
+     * network during it, so the scanning head tilt is the only sign of life
+     * the card has - a still card reads as broken, a moving one reads busy.
+     */
+    private fun pose(): CallPose = when (state) {
+        SESSION_STATE_LISTENING -> CallPose.LISTENING
+        SESSION_STATE_REQUEST -> CallPose.THINKING
+        SESSION_STATE_STREAMING, SESSION_STATE_SPEAKING, SESSION_STATE_REPLY -> CallPose.SPEAKING
+        else -> CallPose.CONNECTING
+    }
+
     private fun statusLabel(): String = when (state) {
         SESSION_STATE_RISE -> "Ready"
         SESSION_STATE_LISTENING -> "Listening…"

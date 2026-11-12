@@ -1,6 +1,8 @@
 package ai.flossyapp.ui.wake
 
 import ai.flossyapp.ui.common.BubblePinEffect
+import ai.flossyapp.ui.common.CallAvatar
+import ai.flossyapp.ui.common.CallPose
 import ai.flossyapp.ui.common.ChatBubble
 import ai.flossyapp.ui.theme.FLOSSyAssistantTheme
 import ai.flossyapp.ui.theme.GRUVBOX_ERROR
@@ -57,6 +59,10 @@ data class WakeCardSnapshot(
     val request: String,
     val reply: String,
     val streaming: Boolean,
+    // What the bot is doing right now: the pose carries the "I am alive and
+    // working" signal, most importantly while thinking - a still card reads
+    // as broken, a moving one reads as busy.
+    val pose: CallPose,
     val alpha: Float,
     val fontScale: Float,
     val onOpenApp: () -> Unit,
@@ -88,7 +94,12 @@ fun WakeCardContent(state: WakeCardState) {
                 .alpha(snap.alpha)
         ) {
             StatusRow(snap)
-            Spacer(Modifier.height(sdp(10f, snap)))
+            Spacer(Modifier.height(sdp(8f, snap)))
+            // The same bot the chat screen rides: while the reply is being
+            // prepared the scanning pose is the card's only sign of life, so
+            // the card never looks dead while thinking.
+            CallAvatar(pose = snap.pose, size = sdp(56f, snap), modifier = Modifier.align(Alignment.CenterHorizontally))
+            Spacer(Modifier.height(sdp(8f, snap)))
             BubbleThread(snap, Modifier.weight(1f).fillMaxWidth())
             Spacer(Modifier.height(sdp(10f, snap)))
             ButtonRow(snap)

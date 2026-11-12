@@ -8,7 +8,10 @@ import android.media.AudioManager
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.background
 import androidx.compose.foundation.lazy.LazyColumn
+import ai.flossyapp.ui.common.CallAvatar
+import ai.flossyapp.ui.common.CallPose
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -595,6 +598,27 @@ fun ChatScreen(
                     }
                     Spacer(modifier = Modifier.weight(1f))
                 } else {
+                    // While a call is live the bot rides at the top of the
+                    // screen: the pose IS the status (listening, thinking,
+                    // speaking), and the log below is the conversation it is
+                    // having, fading out toward the bot instead of ending
+                    // flat at a header. Once the call ends the same log
+                    // renders cleanly, full strength - the call was the
+                    // overlay, the history was never touched.
+                    if (dialogState.isVoiceCall) {
+                        CallAvatar(
+                            pose = when {
+                                dialogState.isSpeaking -> CallPose.SPEAKING
+                                dialogState.isThinking -> CallPose.THINKING
+                                dialogState.isListening -> CallPose.LISTENING
+                                else -> CallPose.CONNECTING
+                            },
+                            size = 72.dp,
+                            modifier = Modifier.padding(top = 12.dp)
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                    }
+                    Box(modifier = Modifier.fillMaxWidth()) {
                     LazyColumn(
                         modifier = Modifier.fillMaxWidth(),
                         state = lazyListState,
@@ -713,6 +737,29 @@ fun ChatScreen(
                                 }
                             }
                         }
+                    }
+                    // The fade: the newest lines sink into the bot's space,
+                    // so the call reads as one view - the bot above, the log
+                    // it is writing below - rather than two stacked blocks.
+                    if (dialogState.isVoiceCall) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(72.dp)
+                                .align(Alignment.TopCenter)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .background(
+                                        androidx.compose.ui.graphics.Brush.verticalGradient(
+                                            0f to MaterialTheme.colorScheme.background,
+                                            1f to androidx.compose.ui.graphics.Color.Transparent
+                                        )
+                                    )
+                            )
+                        }
+                    }
                     }
                 }
             }
