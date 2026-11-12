@@ -41,8 +41,10 @@ mode genuinely hands-free and resilient:
 - **No broken speech, no silent stalls** - a reply's sentences play through one AudioTrack that
   stays fed ahead of the playback head (two TTS fetches in flight, a ~1-2s ring buffer), so
   sentence boundaries are inaudible; hanging up cuts sound out immediately instead of draining,
-  and when the TTS server falls behind real-time speech, the waiting tippy-taps fill the gap and
-  a display-only note in the chat says the server or connection is too slow
+  and the waiting tippy-taps sound while the assistant is thinking (a slow reply gets a tick
+  every couple of seconds, fast replies stay silent) and when the TTS server falls behind
+  real-time speech, with a display-only note in the chat saying the server or connection is
+  too slow
 - **Listening is audible** - a matched pair of synthesized plop cues plays as the microphone opens
   and closes, in voice mode and hands-free alike
 - **Bluetooth and wired headsets work** - each recorder is steered at the headset input with

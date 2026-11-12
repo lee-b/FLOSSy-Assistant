@@ -4,6 +4,7 @@ import ai.flossyapp.data.remote.ApiClient
 import ai.flossyapp.data.remote.McpClient
 import ai.flossyapp.domain.model.AppSettings
 import ai.flossyapp.domain.model.VoiceCallPhase
+import ai.flossyapp.ui.common.playWaitingCue
 import android.content.Context
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -11,6 +12,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -53,6 +55,13 @@ class VoiceCallEngine private constructor(context: Context) {
         // adopt the released call within this window, the handoff dies and
         // the next wake phrase starts a fresh conversation as usual.
         private const val HANDOFF_TTL_MS = 5000L
+
+        // The tippy taps are not a metronome: a fast reply gets its grace
+        // period of silence (most local exchanges answer well inside it),
+        // and once the wait is real the ticks repeat slowly enough that
+        // they read as status, not as an alarm.
+        private const val WAITING_CUE_GRACE_MS = 1200L
+        private const val WAITING_CUE_PERIOD_MS = 2500L
 
         /** Initializes or returns the singleton, pinned to the application context. */
         fun instance(context: Context): VoiceCallEngine {
@@ -331,6 +340,20 @@ class VoiceCallEngine private constructor(context: Context) {
                     host.onUserMessage(transcribedText)
                     host.onPhase(VoiceCallPhase.THINKING)
 
+                    // The tippy taps: the audio feedback that tells the user the
+                    // assistant took the request and is working on it, before
+                    // the reply can reach their ears. The loop is a child of
+                    // this exchange, so it dies with the exchange - cancelled
+                    // the moment speech starts (or the exchange fails), and
+                    // silent for fast replies inside the grace window.
+                    val waitingCue = launch {
+                        delay(WAITING_CUE_GRACE_MS)
+                        while (true) {
+                            playWaitingCue()
+                            delay(WAITING_CUE_PERIOD_MS)
+                        }
+                    }
+
                     val fullResponse = StringBuilder()
                     val reasoningContent = StringBuilder()
 
@@ -399,6 +422,10 @@ class VoiceCallEngine private constructor(context: Context) {
                     // the gate must not reopen until the speaker has actually
                     // finished, so the capture can never hear its own output.
                     if (host.isActive()) {
+                        // Speech has arrived, so the thinking ticks have done
+                        // their job - they stop before the first syllable,
+                        // never over the reply.
+                        waitingCue.cancel()
                         host.onPhase(VoiceCallPhase.SPEAKING)
                         try {
                             ttsAbortSignal.set(false)
@@ -416,6 +443,14 @@ class VoiceCallEngine private constructor(context: Context) {
                                 abortSignal = ttsAbort,
                                 onTtsTooSlow = {
                                     host.onSystemNote("The TTS server or connection is too slow for real-time speech.")
+                                    // The screen's own voice path fills a starving
+                                    // track with the waiting tick, so a stall is
+                                    // heard and not just noted. The same tick here
+                                    // keeps both owners sounding alike; a call that
+                                    // ended between the stall and now stays silent.
+                                    // The callback runs on the audio thread, so
+                                    // the tick is carried on the engine's scope.
+                                    if (host.isActive()) jobScope.launch { playWaitingCue() }
                                 }
                             )
                         } finally {
