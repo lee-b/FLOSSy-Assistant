@@ -13,6 +13,7 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
@@ -245,19 +246,24 @@ fun EndpointChoices(title: String, options: List<String>, current: String, onSel
         Spacer(modifier = Modifier.height(6.dp))
 
         var expanded by remember { mutableStateOf(false) }
+        var typed by remember(current) { mutableStateOf(current) }
         Box(modifier = Modifier.fillMaxWidth()) {
             OutlinedTextField(
-                modifier = Modifier.fillMaxWidth(),
-                value = current,
-                onValueChange = onSelect,
+                value = typed,
+                onValueChange = { typed = it },
                 singleLine = true,
                 shape = RoundedCornerShape(8.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .onFocusChanged { state ->
+                        // Commit whatever is typed the moment the field loses
+                        // focus, so a hand-entered id survives without a
+                        // separate confirm button.
+                        if (!state.isFocused && typed != current) onSelect(typed)
+                    },
                 placeholder = { Text("Type or pick from the list") },
-                // Typing is always available: the list is a suggestion, not a
-                // gate. A server whose id is missing from its own listing can
-                // still be entered by hand.
                 trailingIcon = {
-                    IconButton(onClick = { expanded = !expanded }) {
+                    IconButton(onClick = { expanded = !expanded }, enabled = options.isNotEmpty()) {
                         Icon(
                             imageVector = if (expanded) Icons.Default.ArrowDropUp else Icons.Default.ArrowDropDown,
                             contentDescription = if (expanded) "Collapse list" else "Expand list"
@@ -268,13 +274,22 @@ fun EndpointChoices(title: String, options: List<String>, current: String, onSel
             DropdownMenu(
                 expanded = expanded,
                 onDismissRequest = { expanded = false },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    // A long listing scrolls inside the dropdown instead of
-                    // unrolling into a wall of buttons across the screen.
-                    .heightIn(max = 240.dp)
+                modifier = Modifier.fillMaxWidth()
             ) {
-                Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                // The height cap belongs on the scrollable itself: a popup
+                // measures its content with unbounded height, and a vertical
+                // scrollable under infinite constraints throws
+                // IllegalStateException the moment the menu opens (this is
+                // what crashed the ASR/TTS dropdowns). Capping the scrolling
+                // Column gives it the finite maximum it requires, and the
+                // long listing scrolls inside the dropdown instead of
+                // unrolling into a wall of buttons across the screen.
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 240.dp)
+                        .verticalScroll(rememberScrollState())
+                ) {
                     options.forEach { option ->
                         val active = option.equals(current, ignoreCase = true)
                         DropdownMenuItem(
@@ -287,6 +302,7 @@ fun EndpointChoices(title: String, options: List<String>, current: String, onSel
                                 )
                             },
                             onClick = {
+                                typed = option
                                 onSelect(option)
                                 expanded = false
                             }
