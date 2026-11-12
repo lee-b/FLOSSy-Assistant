@@ -1,22 +1,37 @@
-# Local Assistant - On-Device AI Voice Assistant
+# FLOSSy Assistant - On-Device AI Voice Assistant
 
 <img src="docs/images/app-icon.webp" alt="Local Assistant logo" width="128" align="left" />
 
 A privacy-first, fully local AI voice assistant for Android that connects to your own running
 services. No cloud dependencies, no telemetry, no data leaves your device.
 
-## Differences from upstream (smoluu/LocalAssistant)
+## Differences from upstream (smoluu/LocalAssistant - hard-forked as FLOSSy Assistant)
 
-This fork carries a set of changes over [smoluu/LocalAssistant](https://github.com/smoluu/LocalAssistant),
-mostly around making voice mode genuinely hands-free and resilient:
+FLOSSy Assistant is a hard fork of [smoluu/LocalAssistant](https://github.com/smoluu/LocalAssistant):
+same project, different package and application id (`ai.flossyapp`), renamed because the voice
+pipeline has diverged too far for a soft fork to claim. The changes, mostly around making voice
+mode genuinely hands-free and resilient:
 
 - **Rate limits wait instead of failing** - a 429 from an endpoint is retried on an exponential
   backoff (250ms doubling to 2s, then a steady 2s poll), with a soft footstep-like sound and an
   "Awaiting connection..." status in the chat, the notification and the settings test buttons,
   instead of an error ending the exchange
-- **Voice calls keep going** - the mic re-arms automatically after every spoken reply, and a
-  misheard request is answered by voice ("Sorry, I misheard you. Please repeat.") rather than a
-  toast a user with the screen off would never see
+- **A streaming capture per call, gated by a neural VAD** - the microphone is one persistent
+  stream for the whole call (not a fresh recorder per turn), so the next turn begins the instant
+  the user starts speaking. Speech is detected by the bundled Silero VAD network (silero_vad.onnx,
+  2.3MB, run through ONNX Runtime with the NNAPI provider so a Pixel's NPU/GPU does the inference;
+  CPU fallback elsewhere), which tells "human speaking" from "loud" - taps, fans and door slams
+  are not utterances, whatever the device, the mic or the room. The utterance clip is cut on the
+  network's own speech span, with 300ms of lead rising out of the noise and 500ms of decay kept
+- **One exchange at a time, and never hearing its own voice** - replies are spoken inside the
+  exchange that produced them, so the capture's phase gate stays shut until the speaker is
+  actually silent; concurrent exchanges and self-echo cannot happen. Hanging up cancels every
+  exchange mid-flight and closes the capture
+- **Speech playback off the main thread** - TTS audio writes on Dispatchers.IO, so a stalled
+  AudioTrack can never freeze input dispatch (an ANR trace once caught the main thread parked
+  inside a playback write)
+- **Voice calls keep going** - a misheard request is answered by voice ("Sorry, I misheard you.
+  Please repeat.") rather than a toast a user with the screen off would never see
 - **No broken speech, no silent stalls** - a reply's sentences play through one AudioTrack that
   stays fed ahead of the playback head (two TTS fetches in flight, a ~1-2s ring buffer), so
   sentence boundaries are inaudible; hanging up cuts sound out immediately instead of draining,
@@ -111,7 +126,7 @@ mostly around making voice mode genuinely hands-free and resilient:
 - Microphone access
 - Network access to your local AI services
 - **To use the hands-free overlay**, the platform must host hands-free conversations: open the
-  system's "Default digital assistant" page and select LocalAssistant. Without that selection the
+  system's "Default digital assistant" page and select FLOSSy Assistant. Without that selection the
   app still runs its own pipeline, but the system refuses to draw the card outside the app.
 
 ### Local AI Services
@@ -299,7 +314,7 @@ app/
 
 ### The Card Only Renders Inside the App
 The session window is drawn by the platform, so the app has to hold the assistant role. Open the
-system's "Default digital assistant" page and select LocalAssistant, then start the service again -
+system's "Default digital assistant" page and select FLOSSy Assistant, then start the service again -
 `adb install` force-stops the running process. The service logs
 `onReady: the system has bound this app as its voice interaction service` once the platform has
 really bound it; if that line never appears, the selection is the problem, not the code.

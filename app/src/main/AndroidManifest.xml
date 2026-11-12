@@ -44,7 +44,7 @@
     <!-- <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" /> -->
 
     <application
-        android:name=".LocalAssistantApplication"
+        android:name="com.localassistant.app.LocalAssistantApplication"
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
@@ -59,7 +59,7 @@
             This is the primary UI for chat history and settings.
         -->
         <activity
-            android:name=".ui.MainActivity"
+            android:name="com.localassistant.app.ui.MainActivity"
             android:exported="true"
             android:windowSoftInputMode="adjustPan">
             <intent-filter>
@@ -80,7 +80,7 @@
             Runs continuously in the background with a persistent notification.
         -->
         <service
-            android:name=".service.VoiceAssistantService"
+            android:name="com.localassistant.app.service.VoiceAssistantService"
             android:foregroundServiceType="microphone"
             android:exported="false" />
 
@@ -114,7 +114,7 @@
             path - the picker's list, onReady(), showSession() - is dead until it does.
         -->
         <service
-            android:name=".service.WakeChatService"
+            android:name="com.localassistant.app.service.WakeChatService"
             android:foregroundServiceType="microphone"
             android:permission="android.permission.BIND_VOICE_INTERACTION"
             android:exported="true">
@@ -150,7 +150,7 @@
             resolves it from, so the two halves have to share it.
         -->
         <service
-            android:name=".service.WakeChatSessionService"
+            android:name="com.localassistant.app.service.WakeChatSessionService"
             android:exported="true" />
 
         <!--
@@ -159,7 +159,7 @@
             Restarts the voice assistant service after device reboot.
         -->
         <receiver
-            android:name=".receiver.AppBootReceiver"
+            android:name="com.localassistant.app.receiver.AppBootReceiver"
             android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
@@ -173,7 +173,7 @@
             Restarts listening when network becomes available.
         -->
         <receiver
-            android:name=".receiver.NetworkStateReceiver"
+            android:name="com.localassistant.app.receiver.NetworkStateReceiver"
             android:exported="false">
             <intent-filter>
                 <action android:name="android.net.conn.CONNECTIVITY_CHANGE" />
@@ -187,7 +187,7 @@
             to start/stop the voice assistant service.
         -->
         <receiver
-            android:name=".widget.VoiceAssistantWidget"
+            android:name="com.localassistant.app.widget.VoiceAssistantWidget"
             android:exported="false">
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />

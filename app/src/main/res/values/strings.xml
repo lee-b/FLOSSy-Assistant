@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <!-- App Name -->
-    <string name="app_name">Local Assistant</string>
+    <string name="app_name">FLOSSy Assistant</string>
 
     <!-- Service Notification -->
     <string name="notification_channel_name">Voice Assistant</string>

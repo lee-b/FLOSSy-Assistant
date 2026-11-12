@@ -11,7 +11,7 @@ android {
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.localassistant.app"
+        applicationId = "ai.flossyapp"
         minSdk = 35
         targetSdk = 35
         versionCode = 1
