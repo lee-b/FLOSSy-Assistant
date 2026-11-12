@@ -49,6 +49,11 @@ class VoiceCallEngine private constructor(context: Context) {
         @Volatile
         private var INSTANCE: VoiceCallEngine? = null
 
+        // A handoff is a moment, not a state: if the wake service does not
+        // adopt the released call within this window, the handoff dies and
+        // the next wake phrase starts a fresh conversation as usual.
+        private const val HANDOFF_TTL_MS = 5000L
+
         /** Initializes or returns the singleton, pinned to the application context. */
         fun instance(context: Context): VoiceCallEngine {
             return INSTANCE ?: synchronized(this) {
@@ -192,19 +197,27 @@ class VoiceCallEngine private constructor(context: Context) {
     @Volatile
     private var pendingHandoff = false
 
+    // When the handoff was latched. A handoff the wake service never picks
+    // up (it was stopped, say) must not lie in wait forever and open a
+    // conversation nobody asked for when the service comes back - so it
+    // expires.
+    @Volatile
+    private var handoffAt = 0L
+
     /**
      * Whether APP mode just released a live call. The wake service reads and
      * clears this when it regains the capture, so the same conversation can
      * continue in the popup without a fresh wake phrase.
      */
     fun consumeHandoff(): Boolean {
-        val handoff = pendingHandoff
+        val handoff = pendingHandoff && System.currentTimeMillis() - handoffAt < HANDOFF_TTL_MS
         pendingHandoff = false
         return handoff
     }
 
     /** Whether a handoff is pending, without consuming it. */
-    fun hasHandoff(): Boolean = pendingHandoff
+    fun hasHandoff(): Boolean =
+        pendingHandoff && System.currentTimeMillis() - handoffAt < HANDOFF_TTL_MS
 
     /**
      * Leave APP mode: [handoffToWake] says whether the call was released
@@ -215,6 +228,7 @@ class VoiceCallEngine private constructor(context: Context) {
      */
     fun stopAppMode(handoffToWake: Boolean) {
         pendingHandoff = handoffToWake && mode == Mode.APP
+        handoffAt = System.currentTimeMillis()
         stop()
     }
 
