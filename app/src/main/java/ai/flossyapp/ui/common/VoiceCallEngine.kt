@@ -399,24 +399,36 @@ class VoiceCallEngine private constructor(context: Context?) {
     val hangUpEvents = kotlinx.coroutines.flow.MutableSharedFlow<Unit>(extraBufferCapacity = 1)
 
     /**
-     * Mark the start of a call. When no call was live, this is a NEW
-     * conversation: the old turns are cleared, because a fresh wake phrase
-     * or a fresh mic-button call must not inherit them (no history carryover
-     * until the sidebar drawer exists). When a call is already live - the
-     * wake service adopting a released screen call, or the screen joining
-     * the popup's conversation - the same conversation continues.
+     * Mark the start of a call. Whether this is a NEW conversation is the
+     * conversation's own lifetime, not the call's: the old turns are kept
+     * and the same conversation resumed whenever a surface still shows it
+     * (a mic-button call while the transcript is on screen, or a wake
+     * phrase before every surface has closed). Only a conversation that has
+     * truly ended - the model's own end_call, or every surface closed with
+     * no call live - makes the next call a fresh one, with the old turns
+     * cleared. See [ConversationStore] for the lifetime rules.
      *
      * @return true when this call began a fresh conversation.
      */
     fun beginCall(): Boolean {
-        val fresh = !callActive
+        val fresh = if (testMode) {
+            !callActive
+        } else {
+            !callActive && ConversationStore.conversationEnded
+        }
         callActive = true
         if (fresh) {
             if (!testMode) {
                 ConversationStore.clear()
+                ConversationStore.markConversationOpen()
                 ConversationStore.setCallActive(true)
             }
             log("New call: fresh conversation (previous turns cleared)")
+        } else if (!testMode) {
+            // The same conversation continues; make sure the ended mark a
+            // previous lifecycle left behind is not carried into it.
+            ConversationStore.markConversationOpen()
+            ConversationStore.setCallActive(true)
         }
         return fresh
     }
@@ -450,6 +462,13 @@ class VoiceCallEngine private constructor(context: Context?) {
             return
         }
         log("hangUp: $reason", level="w")
+        // The model ending the call itself is a true end of the conversation
+        // (see ConversationStore), not just the end of this exchange: the
+        // next wake phrase or mic button starts a new one, even with a
+        // surface still on screen showing the transcript.
+        if (reason.contains("model asked to end")) {
+            ConversationStore.markConversationEndedByModel()
+        }
         callActive = false
         lastCallEndAt = System.currentTimeMillis()
         hangUpEvents.tryEmit(Unit)

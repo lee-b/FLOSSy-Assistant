@@ -867,8 +867,11 @@ class WakeChatService : VoiceInteractionService() {
             // draw from the same store while this conversation is live, and
             // outside a call neither draws any of it.
             // One call, one conversation: beginCall() marks the call live in
-            // the engine and, when no call was live, clears the old turns -
-            // a fresh wake phrase starts a fresh conversation.
+            // the engine and, when the conversation has truly ended, clears
+            // the old turns - a fresh wake phrase after that starts a fresh
+            // conversation, while a phrase with the conversation still open
+            // (any surface showing it) resumes the same one.
+            ConversationStore.setPopupSurfaceOpen(true)
             engine.beginCall()
             setPhase(PHASE_LISTENING)
             // The window is raised the moment the phrase is heard, before the
@@ -1249,6 +1252,9 @@ class WakeChatService : VoiceInteractionService() {
      * can act on survives the animation.
      */
     private suspend fun endExchange() {
+        // The mini popup surface is going down with the card: the mini mode
+        // is closed for the conversation-lifetime bookkeeping.
+        ConversationStore.setPopupSurfaceOpen(false)
         // The call is over everywhere: the fullscreen view drops its call UI
         // (and with it the avatar) the moment this lands.
         ConversationStore.setCallActive(false)

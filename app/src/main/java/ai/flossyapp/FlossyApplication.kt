@@ -1,5 +1,6 @@
 package ai.flossyapp
 
+import ai.flossyapp.ui.common.ConversationStore
 import android.app.Application
 
 /**
@@ -31,5 +32,8 @@ class FlossyApplication : Application() {
                 INSTANCE = this
             }
         }
+        // The one conversation store persists across process deaths, so a
+        // relaunch picks the last conversation back up instead of erasing it.
+        ConversationStore.attach(this)
     }
 }

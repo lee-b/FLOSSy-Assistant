@@ -29,6 +29,7 @@ import androidx.navigation.compose.composable
 import ai.flossyapp.R
 import ai.flossyapp.data.settings.SettingsRepository
 import ai.flossyapp.ui.chat.ChatScreen
+import ai.flossyapp.ui.common.ConversationStore
 import ai.flossyapp.ui.common.VoiceCallEngine
 import ai.flossyapp.ui.settings.SettingsScreen
 import ai.flossyapp.ui.theme.FLOSSyAssistantTheme
@@ -268,14 +269,20 @@ class MainActivity : ComponentActivity() {
     // The app is on screen as an app proper: the wake service reads this to
     // stay silent while the app is visible, so the wake word cannot start an
     // exchange and the popup cannot be drawn over the app the user is using.
+    // The same lifecycle brackets the fullscreen conversation surface: while
+    // the app is in the foreground the conversation stays open (settings
+    // round trips included - the activity never stops), and only the app
+    // leaving the screen counts its surface as closed.
     override fun onStart() {
         super.onStart()
         VoiceCallEngine.isAppOnScreen = true
+        ConversationStore.setAppSurfaceOpen(true)
     }
 
     override fun onStop() {
         super.onStop()
         VoiceCallEngine.isAppOnScreen = false
+        ConversationStore.setAppSurfaceOpen(false)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
