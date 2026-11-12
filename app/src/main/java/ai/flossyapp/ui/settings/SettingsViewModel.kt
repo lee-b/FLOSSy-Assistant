@@ -264,6 +264,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
             // TTS Settings
             "enableTtsStreaming" -> _settings.update { it.copy(enableTtsStreaming = value as Boolean) }
             "forbidNonLatinTts" -> _settings.update { it.copy(forbidNonLatinTts = value as Boolean) }
+            "continueCallsOnPhoneWhenHeadsetDisconnects" -> _settings.update { it.copy(continueCallsOnPhoneWhenHeadsetDisconnects = value as Boolean) }
 
             // The flat MCP fields are no longer edited: the Tools tab owns the
             // configuration through the tool instance actions above.

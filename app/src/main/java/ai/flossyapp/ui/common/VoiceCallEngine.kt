@@ -229,6 +229,43 @@ class VoiceCallEngine private constructor(context: Context?) {
     // whether the request came from the screen or the wake word.
     private val vad by lazy { SileroVad(appContext!!) }
 
+    // Settings, read fresh when a headset leaves so the disconnect policy is
+    // whatever the user last chose. Null in unit tests (no context).
+    private val settingsRepository by lazy {
+        appContext?.let { ai.flossyapp.data.settings.SettingsRepository(it) }
+    }
+
+    // Headset watch: while the capture is live, a headset joining the call
+    // transparently takes the microphone over (per-recorder re-steering,
+    // never a global route), and a headset leaving ends the call for privacy
+    // unless the user opted into continuing on the phone.
+    private val headsetWatch: android.media.AudioDeviceCallback? = if (appContext != null) {
+        object : android.media.AudioDeviceCallback() {
+            override fun onAudioDevicesAdded(addedDevices: Array<android.media.AudioDeviceInfo>) {
+                rerouteCapture()
+            }
+
+            override fun onAudioDevicesRemoved(removedDevices: Array<android.media.AudioDeviceInfo>) {
+                val headsetGone = removedDevices.any {
+                    it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                        it.type == android.media.AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+                        it.type == android.media.AudioDeviceInfo.TYPE_USB_HEADSET
+                }
+                if (!headsetGone || !callActive) return
+                val keep = runCatching {
+                    settingsRepository?.settingsFlow?.value?.continueCallsOnPhoneWhenHeadsetDisconnects
+                }.getOrNull() ?: false
+                if (keep) {
+                    log("Headset disconnected; keeping the call on the phone (user preference)", level="d")
+                    rerouteCapture()
+                } else {
+                    log("Headset disconnected; hanging up for privacy", level="w")
+                    hangUp("headset disconnected")
+                }
+            }
+        }
+    } else null
+
     // The persistent capture. One AudioRecord for the whole voice session,
     // whoever owns it.
     private var capture: StreamingCallCapture? = null
@@ -488,6 +525,12 @@ class VoiceCallEngine private constructor(context: Context?) {
         capture?.stop()
         capture = null
         chunkListener = null
+        if (!testMode && headsetWatch != null) {
+            runCatching {
+                (appContext!!.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager)
+                    .unregisterAudioDeviceCallback(headsetWatch)
+            }
+        }
         // Drain so a stale utterance can never reach the next session.
         utteranceChannel.tryReceive() // single-shot drain of one pending clip
         while (true) {
@@ -730,5 +773,20 @@ class VoiceCallEngine private constructor(context: Context?) {
             val started = cap.start()
             log("Capture started=$started mode=$mode", level="d")
         }.start()
+        // Watch the audio devices while the call is live: a headset joining
+        // takes the capture over, one leaving ends the call (unless the user
+        // opted into continuing on the phone).
+        if (!testMode && headsetWatch != null) {
+            runCatching {
+                (appContext!!.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager)
+                    .registerAudioDeviceCallback(headsetWatch, null)
+            }
+        }
+    }
+
+    /** Hands the live capture over to whatever the current preferred input is. */
+    private fun rerouteCapture() {
+        if (testMode) return
+        capture?.reroute()
     }
 }

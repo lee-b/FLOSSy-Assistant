@@ -61,6 +61,7 @@ class SettingsRepository(private val context: Context) {
             ttsResponseFormat = sharedPreferences.getString("tts_response_format", defaults.ttsResponseFormat) ?: defaults.ttsResponseFormat,
             enableTtsStreaming = sharedPreferences.getBoolean("enable_tts_streaming", defaults.enableTtsStreaming),
             forbidNonLatinTts = sharedPreferences.getBoolean("forbid_non_latin_tts", defaults.forbidNonLatinTts),
+            continueCallsOnPhoneWhenHeadsetDisconnects = sharedPreferences.getBoolean("continue_calls_on_phone_headset_disconnect", defaults.continueCallsOnPhoneWhenHeadsetDisconnects),
             // The flat MCP fields are read only to upgrade an old install into
             // tool instances; once "tools_config" exists they are never
             // consulted again and the Tools tab owns the configuration.
@@ -123,6 +124,7 @@ class SettingsRepository(private val context: Context) {
             putString("tts_response_format", settings.ttsResponseFormat)
             putBoolean("enable_tts_streaming", settings.enableTtsStreaming)
             putBoolean("forbid_non_latin_tts", settings.forbidNonLatinTts)
+            putBoolean("continue_calls_on_phone_headset_disconnect", settings.continueCallsOnPhoneWhenHeadsetDisconnects)
             putString("tools_config", settings.toolsConfig)
 
             putBoolean("auto_tts_enabled", settings.autoTtsEnabled)

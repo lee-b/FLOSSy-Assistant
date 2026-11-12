@@ -697,6 +697,9 @@ private fun EndpointsTab(
         // The TTS spells out leaked foreign characters one by one; this
         // drops them before synthesis so speech stays in the user's language.
         SettingSwitch("Forbid non-Latin characters in speech", settings.forbidNonLatinTts, { viewModel.updateSetting("forbidNonLatinTts", it) })
+        // Privacy by default: a headset coming off ends the call, unless the
+        // user opts into continuing on the phone's own mic and speaker.
+        SettingSwitch("Continue calls on phone when headset disconnects", settings.continueCallsOnPhoneWhenHeadsetDisconnects, { viewModel.updateSetting("continueCallsOnPhoneWhenHeadsetDisconnects", it) })
         TestButton("Test TTS", true, ttsTesting) { viewModel.runEndpointTest("tts") }
     }
 }

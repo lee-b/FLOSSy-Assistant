@@ -64,6 +64,10 @@ data class AppSettings(
     // synthesis keeps speech in the user's language; the visible text keeps
     // whatever the model wrote.
     val forbidNonLatinTts: Boolean = true,
+    // Privacy default: a headset coming off ends the voice call, so the
+    // microphone never keeps hearing for the user on an open speaker.
+    // Opting in keeps the call on the phone's own mic and earpiece instead.
+    val continueCallsOnPhoneWhenHeadsetDisconnects: Boolean = false,
 
     // MCP tool servers (Model Context Protocol over streamable HTTP, no stdio).
     // Kept only to upgrade an old install into tool instances: the Tools tab

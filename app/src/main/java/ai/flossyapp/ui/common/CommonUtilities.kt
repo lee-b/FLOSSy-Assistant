@@ -217,6 +217,21 @@ class StreamingCallCapture(
         return true
     }
 
+    /**
+     * Re-steers the live recorder at the current preferred input, so a
+     * headset connected mid-call transparently takes the capture over (and
+     * a headset that left hands it back to the built-in mic). Per-recorder
+     * routing only - no global communication route is ever set.
+     */
+    fun reroute() {
+        val rec = record ?: return
+        preferredCaptureDevice(context)?.let { device ->
+            runCatching { rec.setPreferredDevice(device) }
+                .onSuccess { android.util.Log.d("VAD", "Capture re-steered mid-call") }
+                .onFailure { android.util.Log.w("VAD", "Could not re-steer capture: ${it.message}") }
+        }
+    }
+
     /** Ends the stream and releases the recorder and the route. */
     fun stop() {
         stopSignal.set(true)
