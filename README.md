@@ -19,6 +19,9 @@ mode genuinely hands-free and resilient:
 - **A streaming capture per call, gated by a neural VAD** - the microphone is one persistent
   stream for the whole call (not a fresh recorder per turn), so the next turn begins the instant
   the user starts speaking. Speech is detected by the bundled Silero VAD network (silero_vad.onnx,
+  both voice entry points - the chat screen's mic button and the wake phrase - run through the same
+  `VoiceCallEngine` singleton: one persistent capture, one exchange at a time, and the mic owned by
+  whichever mode is active, so no recorder ever fights another for the device.
   2.3MB, run through ONNX Runtime with the NNAPI provider so a Pixel's NPU/GPU does the inference;
   CPU fallback elsewhere), which tells "human speaking" from "loud" - taps, fans and door slams
   are not utterances, whatever the device, the mic or the room. The utterance clip is cut on the

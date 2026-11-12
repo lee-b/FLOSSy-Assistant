@@ -34,6 +34,7 @@ never commit it and never copy its specifics into this file.
 - `ui/wake/` - `WakeChatViewModel` only: a thin forwarder of the service's `StateFlow`s and start/stop intents. The in-app card renderer was deleted - the session window is the single rendering of an exchange.
 - `ui/settings/` - `SettingsViewModel` + `SettingsScreen` (presets, model fetching, wake enrollment, wake-chat section, adb debug trigger)
 - `ui/common/` - `CommonUtilities.kt` (VAD recording, WAV, TTS playback) · `WakeWordDetector.kt` (MFCC + DTW matcher against enrolled references) · `DefaultAssistant.kt` (assistant-role oracle + picker intents)
+- `ui/common/VoiceCallEngine.kt` - the **one shared voice-call engine**: a single persistent `StreamingCallCapture` (Silero-scored) owned by whichever voice mode is active - the chat screen's mic button (`APP`) or the wake service (`WAKE`) - and one serialized STT → LLM (MCP tools included) → synchronous TTS pipeline per utterance, reported to each owner through an `ExchangeHost` interface. The old per-window energy recorder in the wake service read a silent device whenever both paths were live; there is now never a second recorder.
 - `ui/theme/` - `Theme.kt` Gruvbox schemes · `receiver/` boot + network restarters · `widget/` home-screen mic control
 - `ui/MainActivity.kt` - entry point and navigation graph; **do not edit**
 
