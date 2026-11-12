@@ -122,8 +122,11 @@ class VoiceCallEngine private constructor(context: Context) {
     private val captureGate = java.util.concurrent.atomic.AtomicBoolean(true)
 
     // One exchange at a time - a second utterance while one runs is either
-    // self-echo or talk-over, and both are dropped.
-    private val exchangeRunning = java.util.concurrent.atomic.AtomicBoolean(false)
+    // self-echo or talk-over, and both are dropped. A mutex whose lock is
+    // taken inside the exchange coroutine can never leak: a scope cancelled
+    // before the body runs holds nothing, and the body's own finally always
+    // releases what it took.
+    private val exchangeMutex = kotlinx.coroutines.sync.Mutex()
 
     // Cutting the reply short when the call ends mid-speech.
     private val ttsAbortSignal = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -168,6 +171,14 @@ class VoiceCallEngine private constructor(context: Context) {
     fun startWakeMode(): Boolean {
         if (mode == Mode.APP) return false
         mode = Mode.WAKE
+        // Per-exchange state must be cleared on this path too, not only in
+        // startAppMode: stop() latches discardCurrentUtterance (and the tts
+        // abort) on, and a wake session entered afterwards would otherwise
+        // return every exchange's body before STT - the wake word is heard,
+        // the chime plays, and no reply is ever spoken, with no error
+        // anywhere. This flag belongs to a session, not to the screen.
+        ttsAbortSignal.set(false)
+        discardCurrentUtterance.set(false)
         ensureCapture()
         return true
     }
@@ -225,13 +236,20 @@ class VoiceCallEngine private constructor(context: Context) {
         host: ExchangeHost,
         ttsAbort: java.util.concurrent.atomic.AtomicBoolean
     ): kotlinx.coroutines.Job? {
-        if (!exchangeRunning.compareAndSet(false, true)) {
-            android.util.Log.d("VoiceCallEngine", "Exchange already running, dropping the new utterance")
-            return null
-        }
-        captureGate.set(false)
+        // One exchange at a time is enforced by a mutex taken *inside* the
+        // coroutine rather than a CAS before the launch: with the CAS, a
+        // scope cancelled between compareAndSet and the body's first line
+        // left the flag (and the closed capture gate) latched forever, and
+        // every later utterance was silently dropped.
         val job = jobScope.launch {
+            if (!exchangeMutex.tryLock()) {
+                android.util.Log.d("VoiceCallEngine", "Exchange already running, dropping the new utterance")
+                return@launch
+            }
             try {
+                // The gate is closed here, inside the accepted exchange, so
+                // a dropped utterance never closes the microphone behind it.
+                captureGate.set(false)
                 host.onPhase(VoiceCallPhase.TRANSCRIBING)
 
                 // The call ended while this take was still being heard - the
@@ -389,10 +407,10 @@ class VoiceCallEngine private constructor(context: Context) {
                 host.onPhase(VoiceCallPhase.IDLE)
                 host.onError(e.message ?: "unknown error")
             } finally {
-                exchangeRunning.set(false)
                 // Reopen only if the call is still on; a hung-up call has a
                 // closed capture, and a closed gate cannot hear anything.
                 captureGate.set(host.isActive())
+                exchangeMutex.unlock()
             }
         }
         return job
