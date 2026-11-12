@@ -149,14 +149,29 @@ fun ChatScreen(
         // streamed chunk otherwise yanks the list and made it unscrollable
         // while a response was playing.
         if (!lazyListState.isNearBottom()) return@LaunchedEffect
-        // Bottom-align the last bubble: scrollToItem pins the item's top,
-        // so a tall bubble would sit with its bottom below the fold (the
-        // previous complaint). Passing Int.MAX_VALUE as scrollOffset pushes
-        // the item's start past the viewport top; the list clamps at its
-        // maximum scroll, leaving the bubble's BOTTOM at the viewport bottom
-        // - for tall and short bubbles alike. Re-running on every streaming
-        // key keeps the bottom pinned while the reply grows.
-        lazyListState.scrollToItem(messages.size - 1, Int.MAX_VALUE)
+        val streaming = streamingContent.value.isNotEmpty() || streamingReasoning.value.isNotEmpty()
+        if (streaming) {
+            // While a reply streams, scroll by only the amount the text has
+            // grown past the viewport bottom: each new line eases the list up
+            // one line, so the user reads the output as it arrives. An
+            // absolute bottom-align here would jump by whole paragraphs.
+            val layout = lazyListState.layoutInfo
+            val lastVisible = layout.visibleItemsInfo.lastOrNull()
+            if (lastVisible != null) {
+                val overflow = lastVisible.offset + lastVisible.size - layout.viewportSize.height
+                if (overflow > 0) {
+                    lazyListState.scroll { scrollBy(overflow.toFloat()) }
+                }
+            }
+        } else {
+            // A message just arrived: bottom-align the last bubble. scrollToItem
+            // pins the item's top, so a tall bubble would sit with its bottom
+            // below the fold; passing Int.MAX_VALUE as scrollOffset pushes the
+            // item's start past the viewport top and the list clamps at
+            // maximum scroll, leaving the bubble's BOTTOM at the viewport
+            // bottom - tall and short bubbles alike.
+            lazyListState.scrollToItem(messages.size - 1, Int.MAX_VALUE)
+        }
 
         // Track last assistant message for auto-TTS - only trigger when streaming is COMPLETE
         val lastMsg = messages.lastOrNull { it.role == ai.flossyapp.domain.model.MessageRole.ASSISTANT }
@@ -768,6 +783,7 @@ fun ChatScreen(
                 } else {
                     LazyColumn(
                         modifier = Modifier.fillMaxWidth(),
+                        state = lazyListState,
                         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
