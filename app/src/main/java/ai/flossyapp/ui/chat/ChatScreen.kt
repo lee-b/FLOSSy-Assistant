@@ -147,7 +147,16 @@ fun ChatScreen(
         // exactly while a response was playing.
         if (layout.totalItemsCount > 0 && lazyListState.isNearBottom()) {
             val lastVisible = layout.visibleItemsInfo.lastOrNull() ?: return@LaunchedEffect
-            if (lastVisible.index < layout.totalItemsCount - 1) {
+            // The layoutInfo snapshot can be stale here: this effect runs on
+            // the recomposition that appends a message, often BEFORE LazyList
+            // has laid the new item out, so totalItemsCount and visibleItemsInfo
+            // still describe the old list. Comparing against messages.size (a
+            // fresh value, this effect's key) is the only trustworthy test for
+            // "a bubble exists that we have not brought into view yet" - the
+            // stale comparison fell through to the overflow branch, which
+            // measured the OLD bubble, found it fully visible, and scrolled
+            // nothing. That is the exact "not scrolling at all" failure.
+            if (lastVisible.index < messages.size - 1) {
                 // The bottom item is entirely off-screen - LazyList only lays
                 // out what is visible, so no overflow is computable here and
                 // the old overflow-only check could never take the first step
@@ -156,7 +165,7 @@ fun ChatScreen(
                 // position clamps to the bottom when it is short, and pins
                 // its top when it is tall - which the branch below then
                 // chases on the next recomposition.
-                lazyListState.scrollToItem(layout.totalItemsCount - 1)
+                lazyListState.scrollToItem(messages.size - 1)
             } else {
                 // Scroll by the distance the last item's bottom sits below the
                 // viewport bottom, not by item index: an absolute jump pins an
