@@ -12,8 +12,11 @@ const val DEFAULT_TTS_BASE_URL = "http://127.0.0.1:8089/v1"
 // default locale, baked into the shipped system prompt so it is in force at
 // the start of every session on every call path, and overridden only by an
 // explicit user request.
+// Null-safe: a plain JVM unit environment (the engine's state-machine
+// tests) returns a mocked-default null here, and the fallback locale must
+// stand in rather than crash the class initializer.
 private val userLocale: java.util.Locale =
-    (android.os.LocaleList.getDefault().takeIf { it.size() > 0 }?.get(0))
+    (android.os.LocaleList.getDefault()?.takeIf { it.size() > 0 }?.get(0))
         ?: java.util.Locale.getDefault()
 private val userLanguage: String =
     userLocale.getDisplayLanguage(userLocale).ifBlank { userLocale.language }

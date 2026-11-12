@@ -207,7 +207,13 @@ fun ChatScreen(
         // A voice call speaks inside the exchange, with the gate closed;
         // this effect would double-speak and, worse, let the capture hear
         // the reply it is meant to stay deaf to.
-        if (lastMsg != null && lastMsg.content.isNotBlank() && streamingContent.value.isEmpty() && settings.autoTtsEnabled && !viewModel.dialogState.value.isVoiceCall) {
+        // One TTS at a time, across every surface: a live call (wake-owned
+        // or screen-owned) speaks inside its exchange, so the auto-play path
+        // stands down whenever the engine holds a call - not only when this
+        // screen's dialog says so. Without the engine's flag, a reply
+        // rendered while a wake exchange spoke would double-speak.
+        val callActive = ConversationStore.callActive.value
+        if (lastMsg != null && lastMsg.content.isNotBlank() && streamingContent.value.isEmpty() && settings.autoTtsEnabled && !viewModel.dialogState.value.isVoiceCall && !callActive) {
             val lastIdx = messages.indexOf(lastMsg)
             if (lastIdx != ttsPlayedMessageIndex && lastMsg.content != lastAssistantMessage) {
                 lastAssistantMessage = lastMsg.content
@@ -295,7 +301,9 @@ fun ChatScreen(
         // running underneath and re-enters wake mode on its own the moment
         // the engine releases the capture - even if this window died without
         // ever running any hang-up code.
-        ConversationStore.setCallActive(true)
+        // The engine marks the call live (and clears stale turns when no
+        // call was live) inside startAppMode, so the store and the engine
+        // agree on the one call from a single writer.
         launchVoiceJob {
             if (announce) withContext(Dispatchers.IO) { playListenStartCue() }
         }
@@ -356,9 +364,15 @@ fun ChatScreen(
     // call the screen owns the microphone, so the service alone cannot end
     // the call - it raises the event, and the screen does the hanging up
     // (ending the capture, cutting TTS, dropping the half-heard utterance).
+    // The engine announces every deliberate hang-up - from the wake
+    // notification's End call, the popup card, or the assistant service -
+    // and the screen drops its call view whatever surface sent it. This is
+    // the unified one-call model: the engine owns the call, the surfaces
+    // only render it.
     LaunchedEffect(Unit) {
-        ai.flossyapp.service.VoiceAssistantService.hangUpEvents.collect {
-            android.util.Log.d("ChatScreen", "Voice call ended from the notification")
+        val engine = ai.flossyapp.ui.common.VoiceCallEngine.instance(context.applicationContext)
+        engine.hangUpEvents.collect {
+            android.util.Log.d("ChatScreen", "Voice call ended from a hang-up")
             stopVoiceCall()
         }
     }

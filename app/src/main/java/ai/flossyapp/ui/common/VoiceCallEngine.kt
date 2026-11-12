@@ -45,16 +45,11 @@ import kotlinx.coroutines.withTimeoutOrNull
  * plumbing: the screen draws bubbles, the service draws its card, and both
  * hear about the same exchange the same way.
  */
-class VoiceCallEngine private constructor(context: Context) {
+class VoiceCallEngine private constructor(context: Context?) {
 
     companion object {
         @Volatile
         private var INSTANCE: VoiceCallEngine? = null
-
-        // A handoff is a moment, not a state: if the wake service does not
-        // adopt the released call within this window, the handoff dies and
-        // the next wake phrase starts a fresh conversation as usual.
-        private const val HANDOFF_TTL_MS = 5000L
 
         // The tippy taps are not a metronome: a fast reply gets its grace
         // period of silence (most local exchanges answer well inside it),
@@ -63,15 +58,93 @@ class VoiceCallEngine private constructor(context: Context) {
         private const val WAITING_CUE_GRACE_MS = 1200L
         private const val WAITING_CUE_PERIOD_MS = 2500L
 
+        // A handoff is a moment, not a state: if the wake service does not
+        // adopt the released call within this window, the handoff dies and
+        // the next wake phrase starts a fresh conversation as usual.
+        private const val HANDOFF_TTL_MS = 5000L
+
         /** Initializes or returns the singleton, pinned to the application context. */
         fun instance(context: Context): VoiceCallEngine {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: VoiceCallEngine(context.applicationContext).also { INSTANCE = it }
             }
         }
+
+        /**
+         * Test-only construction: the engine's state machine is android-free,
+         * so the unit suite builds instances without a context and never
+         * opens a real capture (the engine's testMode seam keeps the
+         * recorder and the VAD untouched). Production code always goes
+         * through [instance].
+         */
+        internal fun createUnattached(): VoiceCallEngine = VoiceCallEngine(null)
+
+        // Test seams: production never touches these; the unit suite swaps
+        // them so the exchange state machine runs without a network.
+        internal var testMode = false
+        internal var sttRunner: suspend (ByteArray, AppSettings) -> String = { wav, s ->
+            ApiClient.transcribeAudio(
+                baseUrl = s.sttBaseUrl,
+                apiKey = if (s.sttApiKey.isBlank()) null else s.sttApiKey,
+                audioData = wav,
+                model = s.sttModelName,
+                timeoutSeconds = s.httpTimeoutSeconds.toLong()
+            )
+        }
+        internal var llmRunner: suspend (
+            AppSettings,
+            List<Map<String, String>>,
+            ((String) -> Unit)?,
+            java.util.concurrent.atomic.AtomicBoolean?
+        ) -> String = { s, messages, onChunk, abort ->
+            ApiClient.chatCompletionWithTools(
+                baseUrl = s.llmBaseUrl,
+                apiKey = if (s.llmApiKey.isBlank()) null else s.llmApiKey,
+                messages = messages,
+                model = s.llmModelName,
+                stream = true,
+                maxTokens = s.llmMaxTokens,
+                reasoningBudgetTokens = s.llmReasoningBudgetTokens,
+                chatTemplateKwargs = s.llmChatTemplateKwargs,
+                systemPrompt = s.systemPrompt,
+                toolDescriptors = if (s.mcpReady) McpClient.advertisedTools(s.mcpServerUrls, s.mcpLazyTools) else emptyList(),
+                runTool = { name: String, argumentsJson: String ->
+                    McpClient.runNamedTool(s.mcpServerUrls, name, argumentsJson)
+                },
+                abortSignal = abort,
+                timeoutSeconds = s.httpTimeoutSeconds.toLong(),
+                onChunk = onChunk
+            ).content ?: ""
+        }
+        internal var ttsRunner: suspend (
+            String,
+            AppSettings,
+            java.util.concurrent.atomic.AtomicBoolean?,
+            (() -> Unit)?
+        ) -> Unit =
+            { text, s, abort, onTtsTooSlow ->
+                playTTSAudio(
+                    text,
+                    Pair(s.ttsBaseUrl, if (s.ttsApiKey.isBlank()) null else s.ttsApiKey),
+                    model = s.ttsModelName,
+                    voice = s.ttsVoiceName,
+                    responseFormat = s.ttsResponseFormat,
+                    enableStreaming = s.enableTtsStreaming,
+                    timeoutSeconds = s.httpTimeoutSeconds.toLong(),
+                    forbidNonLatin = s.forbidNonLatinTts,
+                    abortSignal = abort,
+                    onTtsTooSlow = onTtsTooSlow
+                )
+            }
+        internal var waitingCueRunner: suspend () -> Boolean = { playWaitingCue() }
     }
 
-    /** Who the microphone currently belongs to. */
+    /**
+     * Where a completed utterance goes right now: the wake service's
+     * matcher, the chat screen's exchange pipeline, or nowhere. This is
+     * mic *routing*, not call ownership - there is one call, and the
+     * surfaces that draw it are views, not owners.
+     */
     enum class Mode { IDLE, APP, WAKE }
 
     /**
@@ -111,7 +184,7 @@ class VoiceCallEngine private constructor(context: Context) {
         fun onError(message: String)
     }
 
-    private val appContext: Context = context
+    private val appContext: Context? = context?.applicationContext
 
     // One scope for every exchange coroutine the engine carries. Exchanges
     // are cancelled wholesale when the mode drops, so nothing can answer or
@@ -122,9 +195,24 @@ class VoiceCallEngine private constructor(context: Context) {
     var mode: Mode = Mode.IDLE
         private set
 
+    // The one call. True from the moment a conversation opens (wake phrase,
+    // mic button, or the screen adopting a live exchange) until [hangUp]
+    // ends it; the surfaces read this through ConversationStore to decide
+    // what to draw, and the engine reads it to decide what still speaks.
+    // Volatile: the notification thread hangs up while an exchange runs.
+    @Volatile
+    var callActive: Boolean = false
+        private set
+
+    // Marks the moment a call was deliberately ended, so a capture the
+    // engine stopped is never mistaken for a call that is still live when
+    // the wake loop re-arms its windows.
+    internal var lastCallEndAt: Long = 0
+        private set
+
     // The bundled Silero network, loaded once per process - the same model
     // whether the request came from the screen or the wake word.
-    private val vad by lazy { SileroVad(appContext) }
+    private val vad by lazy { SileroVad(appContext!!) }
 
     // The persistent capture. One AudioRecord for the whole voice session,
     // whoever owns it.
@@ -159,6 +247,19 @@ class VoiceCallEngine private constructor(context: Context) {
 
     private var appHost: ExchangeHost? = null
 
+    // android.util.Log is not mockable in a plain JVM unit suite, so the
+    // engine's own logging goes through this seam: in testMode the calls
+    // vanish, everywhere else they are the ordinary logcat lines.
+    private fun log(message: String, level: String = "d", error: Throwable? = null) {
+        if (testMode) return
+        when (level) {
+            "w" -> android.util.Log.w("VoiceCallEngine", message)
+            "e" -> android.util.Log.e("VoiceCallEngine", message, error)
+            else -> android.util.Log.d("VoiceCallEngine", message)
+        }
+    }
+
+
     /**
      * Start (or re-enter) app mode: the chat screen owns the microphone and
      * every utterance becomes an exchange through [host].
@@ -166,6 +267,7 @@ class VoiceCallEngine private constructor(context: Context) {
     fun startAppMode(host: ExchangeHost) {
         appHost = host
         mode = Mode.APP
+        beginCall()
         ttsAbortSignal.set(false)
         discardCurrentUtterance.set(false)
         ensureCapture()
@@ -185,6 +287,12 @@ class VoiceCallEngine private constructor(context: Context) {
     fun startWakeMode(): Boolean {
         if (mode == Mode.APP) return false
         mode = Mode.WAKE
+        if (callActive) {
+            // A live call (the screen released it, or the wake loop adopted
+            // it) continues: this re-entry is the wake service re-arming as
+            // the utterance router, not a new conversation.
+            return true
+        }
         // Per-exchange state must be cleared on this path too, not only in
         // startAppMode: stop() latches discardCurrentUtterance (and the tts
         // abort) on, and a wake session entered afterwards would otherwise
@@ -238,6 +346,98 @@ class VoiceCallEngine private constructor(context: Context) {
     fun stopAppMode(handoffToWake: Boolean) {
         pendingHandoff = handoffToWake && mode == Mode.APP
         handoffAt = System.currentTimeMillis()
+        if (handoffToWake) {
+            // The call itself survives: the engine keeps the capture and the
+            // conversation; only the surface changes. The wake loop adopts
+            // it on its next pass. The running exchange (whose host was the
+            // vanished window) is cancelled like in stop(), but the capture
+            // stays and the gate reopens so the wake loop can hear the user.
+            appHost = null
+            mode = Mode.WAKE
+            discardCurrentUtterance.set(true)
+            ttsAbortSignal.set(true)
+            cancelExchangeScope()
+            ttsAbortSignal.set(false)
+            discardCurrentUtterance.set(false)
+            captureGate.set(true)
+        } else {
+            hangUp("ChatScreen endVoiceCall")
+        }
+    }
+
+    /** Cancel every exchange the scope still carries and start fresh, so
+     * the next session cannot inherit a cancelled-scope error. */
+    private fun cancelExchangeScope() {
+        val old = jobScope
+        synchronized(this) {
+            val fresh = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+            jobScope = fresh
+            old.cancel()
+        }
+    }
+
+    /**
+     * Deliberate hang-ups are announced, so every surface that draws the
+     * call can drop its own view of it (the exchange itself is torn down
+     * inside [hangUp]).
+     */
+    val hangUpEvents = kotlinx.coroutines.flow.MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+
+    /**
+     * Mark the start of a call. When no call was live, this is a NEW
+     * conversation: the old turns are cleared, because a fresh wake phrase
+     * or a fresh mic-button call must not inherit them (no history carryover
+     * until the sidebar drawer exists). When a call is already live - the
+     * wake service adopting a released screen call, or the screen joining
+     * the popup's conversation - the same conversation continues.
+     *
+     * @return true when this call began a fresh conversation.
+     */
+    fun beginCall(): Boolean {
+        val fresh = !callActive
+        callActive = true
+        if (fresh) {
+            if (!testMode) {
+                ConversationStore.clear()
+                ConversationStore.setCallActive(true)
+            }
+            log("New call: fresh conversation (previous turns cleared)")
+        }
+        return fresh
+    }
+
+    /**
+     * The exchange finished on its own (the close clock declared silence):
+     * the call is over, but the wake capture stays live for slumbering - only
+     * the call flag drops, so the next wake phrase begins a fresh
+     * conversation. Deliberate hang-ups go through [hangUp] instead.
+     */
+    fun endCallKeepCapture() {
+        callActive = false
+        lastCallEndAt = System.currentTimeMillis()
+        if (!testMode) ConversationStore.setCallActive(false)
+        log("Call finished; capture stays for slumbering")
+    }
+
+    /**
+     * The one deliberate hang-up, from any surface: the notification's End
+     * call, the card, the chat screen, the service. The running exchange is
+     * cancelled and cut short (TTS stops immediately), the capture closes,
+     * and the call is marked ended - the wake service goes back to
+     * slumbering. The conversation itself is NOT cleared here: while the
+     * fullscreen chat view is still open the transcript stays, and text
+     * interaction (with the option to resume as a voice call) continues.
+     * Clearing happens when a NEW conversation starts.
+     */
+    fun hangUp(reason: String) {
+        if (!callActive && mode == Mode.IDLE) {
+            log("hangUp ignored (no call): $reason")
+            return
+        }
+        log("hangUp: $reason", level="w")
+        callActive = false
+        lastCallEndAt = System.currentTimeMillis()
+        hangUpEvents.tryEmit(Unit)
         stop()
     }
 
@@ -262,12 +462,8 @@ class VoiceCallEngine private constructor(context: Context) {
         }
         // Cancel every exchange the old scope still carries and start fresh,
         // so the next session cannot inherit a cancelled-scope error.
-        val old = jobScope
-        synchronized(this) {
-            val fresh = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-            jobScope = fresh
-            old.cancel()
-        }
+        cancelExchangeScope()
+        if (!testMode) ConversationStore.setCallActive(false)
     }
 
     /**
@@ -301,7 +497,7 @@ class VoiceCallEngine private constructor(context: Context) {
         // every later utterance was silently dropped.
         val job = jobScope.launch {
             if (!exchangeMutex.tryLock()) {
-                android.util.Log.d("VoiceCallEngine", "Exchange already running, dropping the new utterance")
+                log("Exchange already running, dropping the new utterance", level="d")
                 return@launch
             }
             try {
@@ -319,24 +515,18 @@ class VoiceCallEngine private constructor(context: Context) {
 
                 val settings = host.settings()
                 val transcribedText = withContext(Dispatchers.IO) {
-                    ApiClient.transcribeAudio(
-                        baseUrl = settings.sttBaseUrl,
-                        apiKey = if (settings.sttApiKey.isBlank()) null else settings.sttApiKey,
-                        audioData = wavBytes,
-                        model = settings.sttModelName,
-                        timeoutSeconds = settings.httpTimeoutSeconds.toLong()
-                    )
+                    sttRunner(wavBytes, settings)
                 }
 
                 // whisper.cpp answers silence with markers like [BLANK_AUDIO];
                 // they must not become a user message or reach the LLM.
                 val nonSpeech = isNonSpeechTranscript(transcribedText)
                 if (nonSpeech) {
-                    android.util.Log.d("VoiceCallEngine", "Ignoring non-speech transcript: $transcribedText")
+                    log("Ignoring non-speech transcript: $transcribedText", level="d")
                 }
 
                 if (!nonSpeech && transcribedText.isNotBlank()) {
-                    android.util.Log.d("VoiceCallEngine", "STT result: $transcribedText")
+                    log("STT result: $transcribedText", level="d")
                     host.onUserMessage(transcribedText)
                     host.onPhase(VoiceCallPhase.THINKING)
 
@@ -349,7 +539,7 @@ class VoiceCallEngine private constructor(context: Context) {
                     val waitingCue = launch {
                         delay(WAITING_CUE_GRACE_MS)
                         while (true) {
-                            playWaitingCue()
+                            waitingCueRunner()
                             delay(WAITING_CUE_PERIOD_MS)
                         }
                     }
@@ -362,32 +552,8 @@ class VoiceCallEngine private constructor(context: Context) {
                     // install that never enabled MCP pays nothing. The same
                     // call serves both owners, so the wake service keeps its
                     // tool access and the screen keeps its plain path.
-                    val toolDescriptors =
-                        if (settings.mcpReady) McpClient.advertisedTools(settings.mcpServerUrls, settings.mcpLazyTools)
-                        else emptyList()
                     withContext(Dispatchers.IO) {
-                        ApiClient.chatCompletionWithTools(
-                            baseUrl = settings.llmBaseUrl,
-                            apiKey = if (settings.llmApiKey.isBlank()) null else settings.llmApiKey,
-                            messages = host.history(),
-                            model = settings.llmModelName,
-                            stream = true,
-                            maxTokens = settings.llmMaxTokens,
-                            reasoningBudgetTokens = settings.llmReasoningBudgetTokens,
-                            chatTemplateKwargs = settings.llmChatTemplateKwargs,
-                            systemPrompt = settings.systemPrompt,
-                            toolDescriptors = toolDescriptors,
-                            // The answer to a tool call is fetched here so the loop
-                            // in the API client can hand the result back to the
-                            // model and ask again in the same exchange.
-                            runTool = { name: String, argumentsJson: String ->
-                                McpClient.runNamedTool(settings.mcpServerUrls, name, argumentsJson)
-                            },
-                            // A fresh phrase said while the answer is arriving cuts
-                            // it short, the same way it cuts the spoken reply.
-                            abortSignal = ttsAbort,
-                            timeoutSeconds = settings.httpTimeoutSeconds.toLong()
-                        ) { chunk: String ->
+                        llmRunner(settings, host.history(), { chunk: String ->
                             if (chunk.startsWith("\u0001")) {
                                 reasoningContent.append(chunk.substring(1))
                                 host.onStreamingReasoning(reasoningContent.toString())
@@ -395,7 +561,7 @@ class VoiceCallEngine private constructor(context: Context) {
                                 fullResponse.append(chunk)
                                 host.onStreamingContent(fullResponse.toString())
                             }
-                        }.content
+                        }, ttsAbort)
                     }
 
                     var finalText = fullResponse.toString().trim()
@@ -409,10 +575,10 @@ class VoiceCallEngine private constructor(context: Context) {
                         c.isWhitespace() || c.code < 0x250
                     }.trim() else finalText
                     if (finalText.isEmpty() || speakableText.isEmpty()) {
-                        android.util.Log.d("VoiceCallEngine", "LLM gave nothing speakable (${finalText.length} chars raw), filling with a spoken fallback")
+                        log("LLM gave nothing speakable (${finalText.length} chars raw), filling with a spoken fallback")
                         finalText = "Hmm, I'm not sure what to say to that."
                     }
-                    android.util.Log.d("VoiceCallEngine", "LLM response: ${finalText.length} chars, reasoning: ${reasoningText.length} chars")
+                    log("LLM response: ${finalText.length} chars, reasoning: ${reasoningText.length} chars", level="d")
 
                     host.onAssistantMessage(finalText, if (reasoningText.isNotEmpty()) reasoningText else null)
                     host.onStreamingContent("")
@@ -429,30 +595,11 @@ class VoiceCallEngine private constructor(context: Context) {
                         host.onPhase(VoiceCallPhase.SPEAKING)
                         try {
                             ttsAbortSignal.set(false)
-                            playTTSAudio(
-                                finalText,
-                                Pair(settings.ttsBaseUrl, if (settings.ttsApiKey.isBlank()) null else settings.ttsApiKey),
-                                model = settings.ttsModelName,
-                                voice = settings.ttsVoiceName,
-                                responseFormat = settings.ttsResponseFormat,
-                                enableStreaming = settings.enableTtsStreaming,
-                                timeoutSeconds = settings.httpTimeoutSeconds.toLong(),
-                                forbidNonLatin = settings.forbidNonLatinTts,
-                                // The owner's abort (the wake interrupt, the
-                                // screen's hang-up) cuts the reply short.
-                                abortSignal = ttsAbort,
-                                onTtsTooSlow = {
-                                    host.onSystemNote("The TTS server or connection is too slow for real-time speech.")
-                                    // The screen's own voice path fills a starving
-                                    // track with the waiting tick, so a stall is
-                                    // heard and not just noted. The same tick here
-                                    // keeps both owners sounding alike; a call that
-                                    // ended between the stall and now stays silent.
-                                    // The callback runs on the audio thread, so
-                                    // the tick is carried on the engine's scope.
-                                    if (host.isActive()) jobScope.launch { playWaitingCue() }
-                                }
-                            )
+                            ttsRunner(finalText, settings, ttsAbort) {
+                                // The callback runs on the audio thread, so
+                                // the tick is carried on the engine's scope.
+                                if (host.isActive()) jobScope.launch { waitingCueRunner() }
+                            }
                         } finally {
                             host.onPhase(VoiceCallPhase.IDLE)
                         }
@@ -467,17 +614,7 @@ class VoiceCallEngine private constructor(context: Context) {
                         host.onPhase(VoiceCallPhase.SPEAKING)
                         try {
                             ttsAbortSignal.set(false)
-                            playTTSAudio(
-                                "Sorry, I misheard you. Please repeat.",
-                                Pair(settings.ttsBaseUrl, if (settings.ttsApiKey.isBlank()) null else settings.ttsApiKey),
-                                model = settings.ttsModelName,
-                                voice = settings.ttsVoiceName,
-                                responseFormat = settings.ttsResponseFormat,
-                                enableStreaming = settings.enableTtsStreaming,
-                                timeoutSeconds = settings.httpTimeoutSeconds.toLong(),
-                                forbidNonLatin = settings.forbidNonLatinTts,
-                                abortSignal = ttsAbort
-                            )
+                            ttsRunner("Sorry, I misheard you. Please repeat.", settings, ttsAbort, null)
                         } finally {
                             host.onPhase(VoiceCallPhase.IDLE)
                         }
@@ -487,13 +624,16 @@ class VoiceCallEngine private constructor(context: Context) {
                 // The call ended and this job was cancelled on purpose.
                 throw e
             } catch (e: Exception) {
-                android.util.Log.e("VoiceCallEngine", "Voice interaction failed", e)
+                log("Voice interaction failed", level="e", error=e)
                 host.onPhase(VoiceCallPhase.IDLE)
                 host.onError(e.message ?: "unknown error")
             } finally {
                 // Reopen only if the call is still on; a hung-up call has a
                 // closed capture, and a closed gate cannot hear anything.
-                captureGate.set(host.isActive())
+                // The engine's own call flag is the arbiter here, not the
+                // surface's dialog state, so a call handed between surfaces
+                // keeps its gate consistent.
+                captureGate.set(callActive)
                 exchangeMutex.unlock()
             }
         }
@@ -512,9 +652,10 @@ class VoiceCallEngine private constructor(context: Context) {
      */
     @Synchronized
     private fun ensureCapture() {
+        if (testMode) return // unit tests drive the state machine only
         if (capture != null) return
         val cap = StreamingCallCapture(
-            appContext,
+            appContext!!,
             java.util.concurrent.atomic.AtomicBoolean(false),
             captureGate,
             vad
@@ -536,7 +677,7 @@ class VoiceCallEngine private constructor(context: Context) {
         // belongs off whatever thread called this.
         Thread {
             val started = cap.start()
-            android.util.Log.d("VoiceCallEngine", "Capture started=$started mode=$mode")
+            log("Capture started=$started mode=$mode", level="d")
         }.start()
     }
 }

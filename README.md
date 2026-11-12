@@ -22,9 +22,15 @@ mode genuinely hands-free and resilient:
   both voice entry points - the chat screen's mic button and the wake phrase - run through the same
   `VoiceCallEngine` singleton: one persistent capture, one exchange at a time, and the mic owned by
   whichever mode is active, so no recorder ever fights another for the device. A call is **one
-  session across surfaces**: opening the fullscreen app mid-wake-call shows the same conversation
-  (shared `ConversationStore`), swiping the app away mid-call hands the call to the wake popup
-  (engine handoff), and the notification carries an End-call action while a call is live.
+  conversation across surfaces**: text messaging, the wake popup and the fullscreen chat/call view
+  are all views of the one conversation in `ConversationStore` - the engine holds the one active
+  call, and `VoiceCallEngine.hangUp()` is the single deliberate end point no matter which surface
+  fires it. The persistent notification matches the state: a live call shows **End call**,
+  slumbering (listening for the wake word) shows **Disable**, and a disabled wake loop shows
+  **Enable**. Swiping the ongoing notification away cannot remove a foreground-service
+  notification for good - the platform re-posts it - so the app re-posts it itself as slumbering,
+  never as a live call (the delete intent routes through `ACTION_NOTIFICATION_SWIPE`, which ends
+  the call first).
   2.3MB, run through ONNX Runtime with the NNAPI provider so a Pixel's NPU/GPU does the inference;
   CPU fallback elsewhere), which tells "human speaking" from "loud" - taps, fans and door slams
   are not utterances, whatever the device, the mic or the room. The utterance clip is cut on the

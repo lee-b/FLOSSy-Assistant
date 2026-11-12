@@ -78,6 +78,26 @@ class WakeChatService : VoiceInteractionService() {
         // Runs one exchange without waiting for the wake phrase, so the pipeline
         // can be exercised from Settings.
         const val ACTION_TRIGGER_EXCHANGE = "ai.flossyapp.TRIGGER_WAKE_CHAT"
+        // The notification's End call: one deliberate hang-up that ends the
+        // call wherever it lives (popup, fullscreen chat, or mid-TTS) - the
+        // engine is the arbiter, so the same entry point works from any
+        // surface.
+        const val ACTION_END_CALL = "ai.flossyapp.END_WAKE_CALL"
+        // The notification was swiped away: the call must end (never still
+        // talking afterwards) and the notification re-posts as slumbering.
+        const val ACTION_NOTIFICATION_SWIPE = "ai.flossyapp.WAKE_NOTIFICATION_SWIPE"
+
+        /**
+         * The notification's action for the call's state, as a pure mapping
+         * (label to action constant) so the unit suite can verify it without
+         * building a notification: a live call hangs up, slumbering disables
+         * the wake loop, and a disabled loop is enabled again.
+         */
+        internal fun notificationActionFor(callActive: Boolean, sleeping: Boolean): Pair<String, String> = when {
+            callActive -> Pair("End call", ACTION_END_CALL)
+            sleeping -> Pair("Enable", ACTION_START)
+            else -> Pair("Disable", ACTION_STOP)
+        }
 
         // Phases an exchange is in
         // The wake chat's exchange phases are the same typed phases the chat
@@ -332,6 +352,19 @@ class WakeChatService : VoiceInteractionService() {
             // thread exactly as the listening loop does.
             ACTION_CLOSE_CHAT -> serviceScope.launch { endExchange() }
             ACTION_TRIGGER_EXCHANGE -> triggerExchange()
+            ACTION_END_CALL -> serviceScope.launch {
+                VoiceCallEngine.instance(applicationContext).hangUp("notification End call")
+                endExchange()
+            }
+            ACTION_NOTIFICATION_SWIPE -> serviceScope.launch {
+                VoiceCallEngine.instance(applicationContext).hangUp("notification swiped away")
+                endExchange()
+                // The swipe cannot remove an ongoing foreground-service
+                // notification for good: the platform re-posts it. Re-post
+                // it as slumbering, never as a live call, so what the user
+                // sees after swiping is an assistant at rest.
+                setPhase(PHASE_DETECTING)
+            }
         }
 
         return START_STICKY
@@ -800,7 +833,10 @@ class WakeChatService : VoiceInteractionService() {
             // One call, many surfaces: the fullscreen chat and the popup both
             // draw from the same store while this conversation is live, and
             // outside a call neither draws any of it.
-            ConversationStore.setCallActive(true)
+            // One call, one conversation: beginCall() marks the call live in
+            // the engine and, when no call was live, clears the old turns -
+            // a fresh wake phrase starts a fresh conversation.
+            engine.beginCall()
             setPhase(PHASE_LISTENING)
             // The window is raised the moment the phrase is heard, before the
             // request is recorded. A session that only appears once the reply is
@@ -1164,6 +1200,13 @@ class WakeChatService : VoiceInteractionService() {
         // The call is over everywhere: the fullscreen view drops its call UI
         // (and with it the avatar) the moment this lands.
         ConversationStore.setCallActive(false)
+        // The engine's call flag drops with it, so the next wake phrase
+        // begins a fresh conversation - but only when the wake service owns
+        // the call: a chat-screen call keeps its capture (the chat-hangup
+        // protection) and is ended by the screen's own hang-up path.
+        if (VoiceCallEngine.instance(applicationContext).mode == VoiceCallEngine.Mode.WAKE) {
+            VoiceCallEngine.instance(applicationContext).endCallKeepCapture()
+        }
         closeChat()
         for (frame in SINK_FRAMES - 1 downTo 0) {
             requestSession(
@@ -1227,22 +1270,46 @@ class WakeChatService : VoiceInteractionService() {
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setContentIntent(intent)
-        // While a call is live the notification is a call surface of its own:
-        // the user must be able to hang up without opening the app, exactly
-        // like the End chat button on the popup card.
-        if (ConversationStore.callActive.value) {
-            builder.addAction(
-                android.R.drawable.ic_btn_speak_now,
-                "End call",
-                PendingIntent.getService(
-                    this,
-                    1,
-                    buildIntent(applicationContext, ACTION_CLOSE_CHAT),
-                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-                )
+        applyStateActions(builder)
+        // If the platform honors the swipe of this notification, the call
+        // ends and the notification re-posts as slumbering (see
+        // ACTION_NOTIFICATION_SWIPE). On current Android the swipe of an
+        // ongoing foreground-service notification is not honored - the
+        // system re-posts it unchanged - which README documents; the End
+        // call button remains the reliable way to hang up from here.
+        builder.setDeleteIntent(
+            PendingIntent.getService(
+                this,
+                3,
+                buildIntent(applicationContext, ACTION_NOTIFICATION_SWIPE),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
             )
-        }
+        )
         return builder.build()
+    }
+
+    /**
+     * One mapping from the call's state to the notification's actions, used
+     * by every notification render (so an update of the text can never drop
+     * the buttons again). See the pure mapping in the companion for the
+     * state-to-action table the unit suite verifies.
+     */
+    private fun applyStateActions(builder: NotificationCompat.Builder) {
+        val (label, action) = notificationActionFor(
+            ConversationStore.callActive.value,
+            _phase.value == PHASE_SLEEPING
+        )
+        val code = if (action == ACTION_END_CALL) 1 else 2
+        builder.addAction(
+            android.R.drawable.ic_btn_speak_now,
+            label,
+            PendingIntent.getService(
+                this,
+                code,
+                buildIntent(applicationContext, action),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+        )
     }
 
     /**
@@ -1262,9 +1329,8 @@ class WakeChatService : VoiceInteractionService() {
                     PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
                 )
             })
-            .build()
-
-        notificationManager.notify(NOTIFICATION_ID, notification)
+        applyStateActions(notification)
+        notificationManager.notify(NOTIFICATION_ID, notification.build())
     }
 
     /**
@@ -1293,7 +1359,7 @@ class WakeChatService : VoiceInteractionService() {
         // The service is coming alive: the capture is not open yet.
         PHASE_STARTUP -> "Starting up..."
         // The listening loop is stopped: present, but hearing nothing.
-        PHASE_SLEEPING -> "Sleeping; listening OFF"
+        PHASE_SLEEPING -> "Disabled; not listening"
         // The idle loop: the assistant is present but the wake word has not
         // been heard since the last exchange ended.
         PHASE_DETECTING -> "Slumbering; awaiting wake word"

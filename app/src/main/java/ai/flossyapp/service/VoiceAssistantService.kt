@@ -305,6 +305,11 @@ class VoiceAssistantService : Service() {
                 // the recording thread, and doing that here froze the input
                 // dispatch long enough to ANR the app.
                 serviceScope.launch {
+                    // One deliberate hang-up, one arbiter: the engine ends
+                    // the call wherever it lives (TTS stops immediately),
+                    // and the event still reaches the screen's view.
+                    ai.flossyapp.ui.common.VoiceCallEngine.instance(applicationContext)
+                        .hangUp("assistant service End call")
                     hangUpEvents.tryEmit(Unit)
                     stopListening()
                     stopForeground(android.app.Service.STOP_FOREGROUND_REMOVE)

@@ -8,6 +8,12 @@ android {
     namespace = "ai.flossyapp"
     
     // compileSdk 35 for Android 15.0 (API 35) compatibility
+    // Unit tests run on a plain JVM without an Android device: Android
+    // framework methods (LocaleList, Log) return defaults instead of raising
+    // "not mocked", so the engine's state machine can be tested as-is.
+    testOptions {
+        unitTests { isReturnDefaultValues = true }
+    }
     compileSdk = 35
 
     defaultConfig {
