@@ -27,7 +27,19 @@ enum class VoiceCallPhase {
     HEARD,
     TRANSCRIBING,
     THINKING,
-    SPEAKING
+    SPEAKING,
+    /**
+     * Wake-only: the service is coming alive but the capture is not open yet.
+     * A transient state between launch and the listening loop's first pass, so
+     * the notification never says a live state the pipeline has not reached.
+     */
+    STARTUP,
+    /**
+     * Wake-only: the service is alive but the listening loop is stopped - the
+     * assistant is present and hearing nothing. Distinct from [IDLE] so a
+     * stopped loop cannot read as one that is running.
+     */
+    SLEEPING
 }
 
 /**

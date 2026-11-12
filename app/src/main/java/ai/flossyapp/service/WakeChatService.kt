@@ -88,6 +88,8 @@ class WakeChatService : VoiceInteractionService() {
         val PHASE_DETECTING = ai.flossyapp.domain.model.VoiceCallPhase.LISTENING
         val PHASE_LISTENING = ai.flossyapp.domain.model.VoiceCallPhase.HEARD
         val PHASE_THINKING = ai.flossyapp.domain.model.VoiceCallPhase.THINKING
+        val PHASE_STARTUP = ai.flossyapp.domain.model.VoiceCallPhase.STARTUP
+        val PHASE_SLEEPING = ai.flossyapp.domain.model.VoiceCallPhase.SLEEPING
         val PHASE_SPEAKING = ai.flossyapp.domain.model.VoiceCallPhase.SPEAKING
 
         // How many of the newest wake-chat turns are sent to the LLM as context.
@@ -204,6 +206,9 @@ class WakeChatService : VoiceInteractionService() {
          */
         fun closeChat() {
             _messages.value = emptyList()
+            // The companion holds the state the app reads; the notification is
+            // the service's half and follows from the wake loop's next pass,
+            // which settles the phase here the moment the exchange is over.
             _phase.value = PHASE_DETECTING
             _lastActivity.value = System.currentTimeMillis()
         }
@@ -380,8 +385,7 @@ class WakeChatService : VoiceInteractionService() {
     override fun onLaunchVoiceAssistFromKeyguard() {
         // From the lock screen there is nothing of ours to draw over, so the
         // notification is the channel that carries the state.
-        _phase.value = PHASE_LISTENING
-        updateNotification(getPhaseText(PHASE_LISTENING))
+        setPhase(PHASE_LISTENING)
     }
 
     /**
@@ -392,8 +396,7 @@ class WakeChatService : VoiceInteractionService() {
      */
     override fun onPrepareToShowSession(args: android.os.Bundle, flags: Int) {
         raiseCard("")
-        _phase.value = PHASE_LISTENING
-        updateNotification(getPhaseText(PHASE_LISTENING))
+        setPhase(PHASE_LISTENING)
     }
 
     override fun onShowSessionFailed(args: android.os.Bundle) {
@@ -431,9 +434,10 @@ class WakeChatService : VoiceInteractionService() {
         stopSignal.set(false)
         wakeAbortSignal.set(false)
         // The popup is coming alive: the first state the user sees names the
-        // startup itself, before the loop settles into its slumber.
-        _phase.value = PHASE_DETECTING
-        updateNotification("Starting up...")
+        // startup itself, before the loop settles into its slumber. A phase of
+        // its own, not a raw string - the loop's first pass moves it on, and
+        // the notification follows the phase wherever it goes.
+        setPhase(PHASE_STARTUP)
         // The shared voice-call engine owns the microphone from here: one
         // persistent capture scored by Silero, the same capture the chat
         // screen uses when it is in a call. The wake loop and every exchange
@@ -452,9 +456,10 @@ class WakeChatService : VoiceInteractionService() {
         stopSignal.set(true)
         wakeAbortSignal.set(true)
         // The service survives a stop (only the listening loop ends), so the
-        // notification has to say the assistant is no longer hearing anything
-        // rather than leave the last live state on screen.
-        updateNotification("Sleeping; listening OFF")
+        // state has to say the assistant is no longer hearing anything rather
+        // than leave the last live state on screen. A phase of its own, not a
+        // raw string, for the same reason the startup is.
+        setPhase(PHASE_SLEEPING)
         // Give the microphone back through the engine: the shared capture
         // closes and any exchange still in flight is cut short, unless the
         // chat screen has already taken the mic for a call of its own.
@@ -473,7 +478,7 @@ class WakeChatService : VoiceInteractionService() {
         // was already on, captured before the next exchange replaces it.
         val scope = serviceScope
         scope.launch { endExchange() }
-        _phase.value = PHASE_IDLE
+        setPhase(PHASE_SLEEPING)
         serviceScope = newServiceScope()
         enrollmentDiagnosed = false
     }
@@ -511,7 +516,7 @@ class WakeChatService : VoiceInteractionService() {
      * listening never covers the screen it is on.
      */
     private fun lowerCard() {
-        _phase.value = PHASE_DETECTING
+        setPhase(PHASE_DETECTING)
     }
 
     /**
@@ -568,7 +573,7 @@ class WakeChatService : VoiceInteractionService() {
             // is the common case while the app simply listens. Silence must never
             // raise the overlay or report an error.
             _statusMessage.value = ""
-            _phase.value = PHASE_DETECTING
+            setPhase(PHASE_DETECTING)
             return false
         }
 
@@ -619,7 +624,7 @@ class WakeChatService : VoiceInteractionService() {
                     "agreement " + wakeAgreement(features, references, currentSettings.wakeWordSensitivity).joinToString(" ") + ", " +
                     "threshold ${formatCost(wakeCostThreshold(currentSettings.wakeWordSensitivity, references))}"
             )
-            _phase.value = PHASE_DETECTING
+            setPhase(PHASE_DETECTING)
             return false
         }
         return true
@@ -747,6 +752,12 @@ class WakeChatService : VoiceInteractionService() {
                 delay(500)
                 continue
             }
+            // The capture is live, so the startup is over: the loop's own
+            // settled state takes over from STARTUP here. This is the one
+            // transition out of "Starting up..." - without it the first
+            // notification stuck forever, because nothing downstream reads a
+            // phase that has not been re-rendered.
+            setPhase(PHASE_DETECTING)
             var currentSettings = settingsRepository.settingsFlow.value
             // A manual trigger from Settings runs the exchange without the wake
             // match, so the pipeline can be exercised on demand.
@@ -763,8 +774,7 @@ class WakeChatService : VoiceInteractionService() {
             // recognised on-device, so sending it to STT would put the wake word in
             // front of the request.
             raiseCard("")
-            _phase.value = PHASE_LISTENING
-            updateNotification(getPhaseText(PHASE_LISTENING))
+            setPhase(PHASE_LISTENING)
             // The window is raised the moment the phrase is heard, before the
             // request is recorded. A session that only appears once the reply is
             // ready tells the user nothing about the exchange they are in - they
@@ -812,8 +822,7 @@ class WakeChatService : VoiceInteractionService() {
                     // travels with the show, so the card keeps the conversation the
                     // user is still reading rather than blanking under a new
                     // question.
-                    _phase.value = PHASE_LISTENING
-                    updateNotification(getPhaseText(PHASE_LISTENING))
+                    setPhase(PHASE_LISTENING)
                     requestSession(SESSION_STATE_LISTENING, lastRequest, lastReply)
                     // The chime belongs to the microphone, not to the first turn: it
                     // is what tells the user a follow-up is being heard. Without it
@@ -878,7 +887,7 @@ class WakeChatService : VoiceInteractionService() {
             }
             endExchange()
         }
-        _phase.value = PHASE_IDLE
+        setPhase(PHASE_SLEEPING)
     }
 
     /**
@@ -964,7 +973,7 @@ class WakeChatService : VoiceInteractionService() {
             lastRequest = text
             lastReply = ""
             lastPaintMs = 0L
-            _phase.value = PHASE_THINKING
+            setPhase(PHASE_THINKING)
             touchChat()
             // The window is already up from the moment the phrase was heard,
             // so the words the user said replace the "I'm listening" card as
@@ -986,7 +995,7 @@ class WakeChatService : VoiceInteractionService() {
         override fun onPhase(phase: ai.flossyapp.domain.model.VoiceCallPhase) {
             when (phase) {
                 VoiceCallPhase.SPEAKING -> {
-                    _phase.value = PHASE_SPEAKING
+                    setPhase(PHASE_SPEAKING)
                     // The card says "Speaking..." while the reply is voiced,
                     // so the label matches the audio rather than the full
                     // reply appearing before it has been heard.
@@ -1001,7 +1010,7 @@ class WakeChatService : VoiceInteractionService() {
                     // The reply has been spoken, so the card settles on the
                     // two bubbles with no status label - a settled exchange is
                     // just the conversation.
-                    _phase.value = PHASE_LISTENING
+                    setPhase(PHASE_LISTENING)
                     requestSession(SESSION_STATE_REPLY, lastRequest, lastReply)
                 }
                 else -> {}
@@ -1212,7 +1221,24 @@ class WakeChatService : VoiceInteractionService() {
      * states rather than in microphone jargon: the phases below are the life
      * the popup is in, and every one tells the user what is happening now.
      */
+    /**
+     * The one way to move the wake chat's state: the phase and the notification
+     * are two views of one state, so they change together or not at all. Every
+     * raw updateNotification(text) that duplicated a phase's label is gone -
+     * a string written beside a phase change was what left "Starting up..."
+     * on the notification forever: the phase had moved on but nothing ever
+     * re-rendered it.
+     */
+    private fun setPhase(phase: ai.flossyapp.domain.model.VoiceCallPhase) {
+        _phase.value = phase
+        updateNotification(getPhaseText(phase))
+    }
+
     private fun getPhaseText(phase: ai.flossyapp.domain.model.VoiceCallPhase): String = when (phase) {
+        // The service is coming alive: the capture is not open yet.
+        PHASE_STARTUP -> "Starting up..."
+        // The listening loop is stopped: present, but hearing nothing.
+        PHASE_SLEEPING -> "Sleeping; listening OFF"
         // The idle loop: the assistant is present but the wake word has not
         // been heard since the last exchange ended.
         PHASE_DETECTING -> "Slumbering; awaiting wake word"
