@@ -12,6 +12,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.lazy.LazyColumn
 import ai.flossyapp.ui.common.CallAvatar
 import ai.flossyapp.ui.common.CallPose
+import ai.flossyapp.ui.common.ConversationStore
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -29,6 +30,8 @@ import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.pointer.pointerInput
@@ -98,9 +101,11 @@ fun ChatScreen(
     // Raised to cut a reply short while it is still being spoken - text-chat
     // TTS only, since a voice call's playback is aborted through the engine.
     val ttsAbortSignal = java.util.concurrent.atomic.AtomicBoolean(false)
-    // Set when the mic button pauses the wake service for a call, so the
-    // hang-up path knows to hand the microphone back to it.
-    var pausedWakeService by remember { mutableStateOf(false) }
+    // A call opened by the wake word is the same call this screen shows:
+    // the store says when one is live, whoever opened it, and the engine
+    // says who owns the microphone while it is.
+    val wakeCallActive by ConversationStore.callActive.collectAsState()
+    val wakeCallPhase by ConversationStore.phase.collectAsState()
 
     // Every coroutine that carries a piece of a voice call - the spoken cues
     // and the text-chat TTS. The exchange pipeline itself lives in the shared
@@ -260,6 +265,10 @@ fun ChatScreen(
         // A capture is already in flight - the re-arm after a spoken turn hands
         // back to this guard, and the user's own taps must not stack recorders.
         if (viewModel.dialogState.value.isListening) return
+        // A wake conversation is already a live call: the microphone belongs
+        // to it, and this screen is simply one of its views. Starting a second
+        // call here would steal an exchange the popup is mid-way through.
+        if (ConversationStore.callActive.value) return
         // Opening the call is one typed transition; every derived flag falls
         // out of it.
         viewModel.setDialogState(DialogMode.VOICE_CALL, VoiceCallPhase.LISTENING)
@@ -280,22 +289,13 @@ fun ChatScreen(
                 )
             }
         }
-        // The wake-chat service would hear the same words the screen is
-        // answering; wake detection and a voice call are different states and
-        // the microphone belongs to the call, so the service is stopped for
-        // the call's duration - and remembered, so hang-up hands the mic
-        // back to it.
-        if (ai.flossyapp.service.WakeChatService.isRunning) {
-            pausedWakeService = true
-            runCatching {
-                context.applicationContext.startService(
-                    ai.flossyapp.service.WakeChatService.buildIntent(
-                        context.applicationContext,
-                        ai.flossyapp.service.WakeChatService.ACTION_STOP
-                    )
-                )
-            }
-        }
+        // The wake service is no longer messaged at all: the engine owns the
+        // microphone, and taking it for a screen call is a handoff the engine
+        // performs, not a stop command the screen sends. The wake loop keeps
+        // running underneath and re-enters wake mode on its own the moment
+        // the engine releases the capture - even if this window died without
+        // ever running any hang-up code.
+        ConversationStore.setCallActive(true)
         launchVoiceJob {
             if (announce) withContext(Dispatchers.IO) { playListenStartCue() }
         }
@@ -323,21 +323,11 @@ fun ChatScreen(
         // was opened and closed mid-listen).
         val engine = ai.flossyapp.ui.common.VoiceCallEngine.instance(context.applicationContext)
         if (engine.mode == ai.flossyapp.ui.common.VoiceCallEngine.Mode.APP) {
-            engine.stop()
+            // A deliberate hang-up ends the call: no handoff - the wake
+            // service goes back to listening for the wake phrase.
+            engine.stopAppMode(handoffToWake = false)
         }
-        // The wake service was paused for this call: give the microphone back
-        // to it now that the call is over.
-        if (pausedWakeService) {
-            pausedWakeService = false
-            runCatching {
-                context.applicationContext.startService(
-                    ai.flossyapp.service.WakeChatService.buildIntent(
-                        context.applicationContext,
-                        ai.flossyapp.service.WakeChatService.ACTION_START
-                    )
-                )
-            }
-        }
+        ConversationStore.setCallActive(false)
         // Cancel every coroutine still carrying the call on the screen side -
         // the spoken cues, any text-chat TTS - so nothing can speak after the
         // user hung up.
@@ -375,11 +365,31 @@ fun ChatScreen(
 
     // Launching the app is a voice interaction: the screen's own pipeline takes
     // the microphone straight away, so the mic on the empty screen is already
-    // listening when the splash lifts. The background service is not started
-    // here - its answers never reach this chat and it would fight the screen
+    // listening when the splash lifts - but only when no call is already
+    // live: a wake conversation opened before the app was launched is the
+    // same call this screen shows, and starting a second one would fight it
     // for the microphone.
     LaunchedEffect(Unit) {
-        if (hasPermissions && settings.autoStartVoiceOnLaunch) startMicRecording()
+        if (hasPermissions && settings.autoStartVoiceOnLaunch && !ConversationStore.callActive.value) {
+            startMicRecording()
+        }
+    }
+
+    // If the window this call lives in goes away without any hang-up code
+    // running - the user swiped the app away mid-call - the composition is
+    // torn down here, so this is the last chance to release the screen's
+    // APP-mode capture. The engine marks the call as a handoff, and the wake
+    // service (whose loop never stopped) adopts it within its next retry
+    // slice: the call continues in the popup, with the End-call button in
+    // the notification and on the card.
+    DisposableEffect(Unit) {
+        onDispose {
+            val engine = ai.flossyapp.ui.common.VoiceCallEngine.instance(context.applicationContext)
+            if (engine.mode == ai.flossyapp.ui.common.VoiceCallEngine.Mode.APP) {
+                android.util.Log.d("ChatScreen", "Window gone mid-call: handing the call to the wake service")
+                engine.stopAppMode(handoffToWake = true)
+            }
+        }
     }
 
     // Conversation summarization state - trigger when message count exceeds threshold
@@ -567,7 +577,14 @@ fun ChatScreen(
                     Spacer(modifier = Modifier.height(8.dp))
                 }
 
-                if (messages.isEmpty()) {
+                // A call is live whether this screen opened it or the wake
+                // word did: the bot rides at the top of the screen either
+                // way, and the pose comes from whoever owns the call - the
+                // screen's dialog state for its own call, the shared store's
+                // phase for one opened by the wake word. Outside a call none
+                // of this is drawn at all.
+                val callUiLive = dialogState.isVoiceCall || wakeCallActive
+                if (messages.isEmpty() && !callUiLive) {
                     Spacer(modifier = Modifier.weight(1f))
                     Box(
                         modifier = Modifier
@@ -599,19 +616,29 @@ fun ChatScreen(
                     Spacer(modifier = Modifier.weight(1f))
                 } else {
                     // While a call is live the bot rides at the top of the
-                    // screen: the pose IS the status (listening, thinking,
-                    // speaking), and the log below is the conversation it is
-                    // having, fading out toward the bot instead of ending
-                    // flat at a header. Once the call ends the same log
-                    // renders cleanly, full strength - the call was the
-                    // overlay, the history was never touched.
-                    if (dialogState.isVoiceCall) {
+                    // screen from its very first frame - not only once the
+                    // first message exists - and the log below is the
+                    // conversation it is having, fading out toward the bot.
+                    // Once the call ends the same log renders cleanly, full
+                    // strength. Outside a call the bot is not drawn at all.
+                    if (callUiLive) {
                         CallAvatar(
-                            pose = when {
-                                dialogState.isSpeaking -> CallPose.SPEAKING
-                                dialogState.isThinking -> CallPose.THINKING
-                                dialogState.isListening -> CallPose.LISTENING
-                                else -> CallPose.CONNECTING
+                            pose = if (dialogState.isVoiceCall) {
+                                when {
+                                    dialogState.isSpeaking -> CallPose.SPEAKING
+                                    dialogState.isThinking -> CallPose.THINKING
+                                    dialogState.isListening -> CallPose.LISTENING
+                                    else -> CallPose.CONNECTING
+                                }
+                            } else {
+                                when (wakeCallPhase) {
+                                    VoiceCallPhase.SPEAKING -> CallPose.SPEAKING
+                                    VoiceCallPhase.THINKING,
+                                    VoiceCallPhase.TRANSCRIBING,
+                                    VoiceCallPhase.HEARD -> CallPose.THINKING
+                                    VoiceCallPhase.LISTENING -> CallPose.LISTENING
+                                    else -> CallPose.CONNECTING
+                                }
                             },
                             size = 72.dp,
                             modifier = Modifier.padding(top = 12.dp)
@@ -741,7 +768,7 @@ fun ChatScreen(
                     // The fade: the newest lines sink into the bot's space,
                     // so the call reads as one view - the bot above, the log
                     // it is writing below - rather than two stacked blocks.
-                    if (dialogState.isVoiceCall) {
+                    if (callUiLive) {
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()

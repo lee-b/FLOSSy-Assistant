@@ -12,7 +12,9 @@ import ai.flossyapp.FlossyApplication
 import ai.flossyapp.data.remote.ApiClient
 import ai.flossyapp.data.settings.SettingsRepository
 import ai.flossyapp.domain.model.ChatMessage
+import ai.flossyapp.domain.model.MessageRole
 import ai.flossyapp.domain.model.VoiceCallPhase
+import ai.flossyapp.ui.common.ConversationStore
 import ai.flossyapp.ui.common.bestMatchCost
 import ai.flossyapp.ui.common.extractWakeFeatures
 import ai.flossyapp.ui.common.loadWakeReferences
@@ -170,7 +172,10 @@ class WakeChatService : VoiceInteractionService() {
         // session window's own half cannot read these flows - it runs elsewhere -
         // and the notification below carries the same exchange.
 
-        private val _messages = MutableStateFlow<List<ChatMessage>>(emptyList())
+        // The conversation lives in the shared store, not here: the wake
+        // exchange, the fullscreen chat and (later) the history sidebar are
+        // views of one list, so opening the app mid-call shows the turns the
+        // popup is already drawing.
         private val _phase = MutableStateFlow(PHASE_IDLE)
         private val _statusMessage = MutableStateFlow("")
         // When the chat last saw activity. The idle-close watchdog compares this
@@ -179,7 +184,7 @@ class WakeChatService : VoiceInteractionService() {
         // - only has to move this stamp to keep the chat open.
         private val _lastActivity = MutableStateFlow(System.currentTimeMillis())
 
-        val messages: StateFlow<List<ChatMessage>> = _messages.asStateFlow()
+        val messages: StateFlow<List<ChatMessage>> get() = ConversationStore.messages
         val phase: StateFlow<ai.flossyapp.domain.model.VoiceCallPhase> = _phase.asStateFlow()
         val statusMessage: StateFlow<String> = _statusMessage.asStateFlow()
 
@@ -198,18 +203,25 @@ class WakeChatService : VoiceInteractionService() {
          * Close the chat: the exchange is over, so its history is dropped and the
          * card slides away.
          *
-         * A wake chat holds one conversation, not a log - nothing here is
-         * persisted, and the next wake phrase starts an empty card. The history
-         * only ever lives as long as the chat is open, which is what lets the
-         * LLM keep the turns of an exchange as context without the app becoming
-         * a second conversation history the user never sees.
+         * The conversation itself is not dropped here any more: it lives in
+         * the shared chat the fullscreen app renders, and a call that moves
+         * between the popup and the fullscreen view must keep its turns. Only
+         * the popup's own card state ends - the next popup opens blank because
+         * the bundle it is handed carries no request or reply.
          */
         fun closeChat() {
-            _messages.value = emptyList()
+            // The conversation itself is not dropped any more: it belongs to
+            // the shared chat the fullscreen app renders, and a call that
+            // continues there must keep the turns the popup was drawing. The
+            // card state alone is cleared - the next popup opens blank
+            // because the bundle it is handed carries no request or reply.
             // The companion holds the state the app reads; the notification is
             // the service's half and follows from the wake loop's next pass,
             // which settles the phase here the moment the exchange is over.
             _phase.value = PHASE_DETECTING
+            // The fullscreen view follows the same phase, so its call UI (if
+            // it was open) settles with the popup's.
+            ConversationStore.setPhase(PHASE_DETECTING)
             _lastActivity.value = System.currentTimeMillis()
         }
     }
@@ -564,7 +576,8 @@ class WakeChatService : VoiceInteractionService() {
         // still be honoured mid-window instead of only at its expiry.
         val clip = awaitEngineUtterance(
             timeoutMs = WAKE_IDLE_SECONDS * 1000L,
-            abort = wakeAbortSignal
+            abort = wakeAbortSignal,
+            breakOnHandoff = true
         )
         if (!listening) return false
 
@@ -699,7 +712,8 @@ class WakeChatService : VoiceInteractionService() {
      */
     private suspend fun awaitEngineUtterance(
         timeoutMs: Long,
-        abort: AtomicBoolean?
+        abort: AtomicBoolean?,
+        breakOnHandoff: Boolean = false
     ): ByteArray? {
         val engine = VoiceCallEngine.instance(appContext)
         val deadline = System.currentTimeMillis() + timeoutMs
@@ -709,6 +723,11 @@ class WakeChatService : VoiceInteractionService() {
             }
             if (slice != null) return slice
             if (abort?.get() == true || !listening) return null
+            // The screen just handed a live call back: cut the idle wait so
+            // the loop's next pass re-enters wake mode and adopts the
+            // conversation instead of leaving the user talking to nothing
+            // until this window expires.
+            if (breakOnHandoff && engine.hasHandoff()) return null
         }
         return null
     }
@@ -748,7 +767,8 @@ class WakeChatService : VoiceInteractionService() {
             // call is over. The capture is (re-)opened here every iteration,
             // so a capture that died - an app-mode session that stopped the
             // shared one, say - comes back without touching the loop.
-            if (!VoiceCallEngine.instance(appContext).startWakeMode()) {
+            val engine = VoiceCallEngine.instance(appContext)
+            if (!engine.startWakeMode()) {
                 delay(500)
                 continue
             }
@@ -760,8 +780,11 @@ class WakeChatService : VoiceInteractionService() {
             setPhase(PHASE_DETECTING)
             var currentSettings = settingsRepository.settingsFlow.value
             // A manual trigger from Settings runs the exchange without the wake
-            // match, so the pipeline can be exercised on demand.
-            val forced = manualTrigger
+            // match, so the pipeline can be exercised on demand. A handoff
+            // counts the same way: the screen just released a live call back
+            // to the wake service, so the conversation continues where it
+            // was instead of making the user say the wake phrase again.
+            val forced = manualTrigger || engine.consumeHandoff()
             manualTrigger = false
             if (!forced) {
                 // A fresh idle window: the abort flag is only a request to stop
@@ -774,6 +797,10 @@ class WakeChatService : VoiceInteractionService() {
             // recognised on-device, so sending it to STT would put the wake word in
             // front of the request.
             raiseCard("")
+            // One call, many surfaces: the fullscreen chat and the popup both
+            // draw from the same store while this conversation is live, and
+            // outside a call neither draws any of it.
+            ConversationStore.setCallActive(true)
             setPhase(PHASE_LISTENING)
             // The window is raised the moment the phrase is heard, before the
             // request is recorded. A session that only appears once the reply is
@@ -809,6 +836,15 @@ class WakeChatService : VoiceInteractionService() {
             // every open show re-sends what is already on the card instead.
             var lastRequest = ""
             var lastReply = ""
+            // A handoff inherits the conversation the screen was having: the
+            // popup card carries the last two turns so the user sees the same
+            // exchange they left on the fullscreen view.
+            if (ConversationStore.callActive.value) {
+                val recent = ConversationStore.messages.value
+                    .filter { it.role == MessageRole.USER || it.role == MessageRole.ASSISTANT }
+                lastRequest = recent.lastOrNull { it.role == MessageRole.USER }?.content ?: ""
+                lastReply = recent.lastOrNull { it.role == MessageRole.ASSISTANT }?.content ?: ""
+            }
             var firstTurn = true
             while (listening) {
                 // Settings are re-read per turn, so a user changing the reply or
@@ -964,12 +1000,12 @@ class WakeChatService : VoiceInteractionService() {
         // sent - an unbounded history would eventually overflow the model's
         // context.
         override fun history(): List<Map<String, String>> =
-            _messages.value.takeLast(MAX_LLM_CONTEXT).map { msg ->
+            ConversationStore.messages.value.takeLast(MAX_LLM_CONTEXT).map { msg ->
                 mapOf("role" to msg.role.name.lowercase(), "content" to msg.content)
             }
 
         override fun onUserMessage(text: String) {
-            _messages.update { current -> current + listOf(ChatMessage.user(text)) }
+            ConversationStore.addMessage(ChatMessage.user(text))
             lastRequest = text
             lastReply = ""
             lastPaintMs = 0L
@@ -983,9 +1019,7 @@ class WakeChatService : VoiceInteractionService() {
         }
 
         override fun onAssistantMessage(text: String, reasoning: String?) {
-            _messages.update { current ->
-                current + listOf(ChatMessage.assistant(text, reasoning))
-            }
+            ConversationStore.addMessage(ChatMessage.assistant(text, reasoning))
             lastReply = text
             // The reply has to reach the user while the app is minimized, so
             // it travels in the notification as well as on the overlay.
@@ -1127,6 +1161,9 @@ class WakeChatService : VoiceInteractionService() {
      * can act on survives the animation.
      */
     private suspend fun endExchange() {
+        // The call is over everywhere: the fullscreen view drops its call UI
+        // (and with it the avatar) the moment this lands.
+        ConversationStore.setCallActive(false)
         closeChat()
         for (frame in SINK_FRAMES - 1 downTo 0) {
             requestSession(
@@ -1183,14 +1220,29 @@ class WakeChatService : VoiceInteractionService() {
             )
         }
 
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Wake Chat")
             .setContentText(getPhaseText(phase))
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setContentIntent(intent)
-            .build()
+        // While a call is live the notification is a call surface of its own:
+        // the user must be able to hang up without opening the app, exactly
+        // like the End chat button on the popup card.
+        if (ConversationStore.callActive.value) {
+            builder.addAction(
+                android.R.drawable.ic_btn_speak_now,
+                "End call",
+                PendingIntent.getService(
+                    this,
+                    1,
+                    buildIntent(applicationContext, ACTION_CLOSE_CHAT),
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+            )
+        }
+        return builder.build()
     }
 
     /**
@@ -1231,6 +1283,9 @@ class WakeChatService : VoiceInteractionService() {
      */
     private fun setPhase(phase: ai.flossyapp.domain.model.VoiceCallPhase) {
         _phase.value = phase
+        // The fullscreen avatar draws its pose from the same phase the popup
+        // does, so both surfaces move as one call.
+        ConversationStore.setPhase(phase)
         updateNotification(getPhaseText(phase))
     }
 

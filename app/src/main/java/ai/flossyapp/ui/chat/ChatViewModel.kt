@@ -13,6 +13,7 @@ import androidx.lifecycle.viewModelScope
 import ai.flossyapp.data.remote.ApiClient
 import ai.flossyapp.data.settings.SettingsRepository
 import ai.flossyapp.domain.model.ChatMessage
+import ai.flossyapp.ui.common.ConversationStore
 import ai.flossyapp.domain.model.DialogMode
 import ai.flossyapp.domain.model.DialogState
 import ai.flossyapp.domain.model.MessageRole
@@ -34,9 +35,11 @@ class ChatViewModel(application: android.app.Application) : AndroidViewModel(app
     // App settings - exposed as StateFlow for UI observation
     val settings: StateFlow<ai.flossyapp.domain.model.AppSettings> = settingsRepository.settingsFlow
     
-    // Conversation messages - exposed as StateFlow for UI observation
-    private val _messages = MutableStateFlow<List<ChatMessage>>(emptyList())
-    val messages: StateFlow<List<ChatMessage>> = _messages.asStateFlow()
+    // The conversation is the shared store, not a private log: the wake
+    // popup, this chat and a call that moves between them all render one
+    // list, so a conversation started by the wake word is already here when
+    // the user opens the app mid-call.
+    val messages: StateFlow<List<ChatMessage>> get() = ConversationStore.messages
     
     // Dialog state - one typed machine instead of the stringly flags it used
     // to be, so the mode and its phase can never disagree with each other.
@@ -119,9 +122,7 @@ class ChatViewModel(application: android.app.Application) : AndroidViewModel(app
             content = content
         )
         
-        _messages.update { current ->
-            current + listOf(message)
-        }
+        ConversationStore.addMessage(message)
     }
     
     /**
@@ -142,7 +143,7 @@ class ChatViewModel(application: android.app.Application) : AndroidViewModel(app
             val reasoningBuilder = StringBuilder()
 
             try {
-                val messagesList = _messages.value.map { msg ->
+                val messagesList = ConversationStore.messages.value.map { msg ->
                     mapOf("role" to msg.role.name.lowercase(), "content" to msg.content)
                 }
 
@@ -209,9 +210,7 @@ class ChatViewModel(application: android.app.Application) : AndroidViewModel(app
             reasoningContent = reasoningContent
         )
         
-        _messages.update { current ->
-            current + listOf(message)
-        }
+        ConversationStore.addMessage(message)
     }
     
     /**
@@ -236,7 +235,7 @@ class ChatViewModel(application: android.app.Application) : AndroidViewModel(app
      * Clear all conversation history.
      */
     fun clearHistory() {
-        _messages.value = emptyList()
+        ConversationStore.clear()
     }
 
     // ==================== Conversation Summarization ====================
@@ -261,7 +260,7 @@ class ChatViewModel(application: android.app.Application) : AndroidViewModel(app
      */
     fun maybeSummarizeConversation(llmBaseUrl: String, apiKey: String?, model: String, timeoutSeconds: Long) {
         viewModelScope.launch {
-            val currentMessages = _messages.value
+            val currentMessages = ConversationStore.messages.value
             if (currentMessages.size > SUMMARY_THRESHOLD) {
                 android.util.Log.d("ChatViewModel", "Conversation has ${currentMessages.size} messages, triggering summarization...")
                 try {
@@ -302,8 +301,8 @@ class ChatViewModel(application: android.app.Application) : AndroidViewModel(app
                             timestamp = System.currentTimeMillis()
                         )
 
-                        _messages.value = listOf(summaryMessage) + recentMessages
-                        android.util.Log.d("ChatViewModel", "Conversation summarized. New count: ${_messages.value.size}")
+                        ConversationStore.setMessages(listOf(summaryMessage) + recentMessages)
+                        android.util.Log.d("ChatViewModel", "Conversation summarized. New count: ${ConversationStore.messages.value.size}")
                     }
                 } catch (e: Exception) {
                     android.util.Log.w("ChatViewModel", "Summarization failed: ${e.message}")

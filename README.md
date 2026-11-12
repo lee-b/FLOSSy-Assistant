@@ -21,7 +21,10 @@ mode genuinely hands-free and resilient:
   the user starts speaking. Speech is detected by the bundled Silero VAD network (silero_vad.onnx,
   both voice entry points - the chat screen's mic button and the wake phrase - run through the same
   `VoiceCallEngine` singleton: one persistent capture, one exchange at a time, and the mic owned by
-  whichever mode is active, so no recorder ever fights another for the device.
+  whichever mode is active, so no recorder ever fights another for the device. A call is **one
+  session across surfaces**: opening the fullscreen app mid-wake-call shows the same conversation
+  (shared `ConversationStore`), swiping the app away mid-call hands the call to the wake popup
+  (engine handoff), and the notification carries an End-call action while a call is live.
   2.3MB, run through ONNX Runtime with the NNAPI provider so a Pixel's NPU/GPU does the inference;
   CPU fallback elsewhere), which tells "human speaking" from "loud" - taps, fans and door slams
   are not utterances, whatever the device, the mic or the room. The utterance clip is cut on the

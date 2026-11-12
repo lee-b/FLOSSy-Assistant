@@ -183,6 +183,41 @@ class VoiceCallEngine private constructor(context: Context) {
         return true
     }
 
+    // A screen call that ended while it was still live - the user hung up,
+    // or the window that hosted it was swiped away - hands the microphone
+    // back to the wake service, and the wake service adopts the running
+    // conversation instead of making the user say the wake phrase again.
+    // The flag is consumed once by [WakeChatService] when its loop re-enters
+    // wake mode, because a handoff is a one-shot event.
+    @Volatile
+    private var pendingHandoff = false
+
+    /**
+     * Whether APP mode just released a live call. The wake service reads and
+     * clears this when it regains the capture, so the same conversation can
+     * continue in the popup without a fresh wake phrase.
+     */
+    fun consumeHandoff(): Boolean {
+        val handoff = pendingHandoff
+        pendingHandoff = false
+        return handoff
+    }
+
+    /** Whether a handoff is pending, without consuming it. */
+    fun hasHandoff(): Boolean = pendingHandoff
+
+    /**
+     * Leave APP mode: [handoffToWake] says whether the call was released
+     * because its window vanished (a handoff the wake service adopts - the
+     * conversation continues in the popup) or because the user hung up
+     * deliberately (no handoff - the call is over and the wake service goes
+     * back to listening for the wake phrase).
+     */
+    fun stopAppMode(handoffToWake: Boolean) {
+        pendingHandoff = handoffToWake && mode == Mode.APP
+        stop()
+    }
+
     /**
      * Leave whatever mode is active: the capture closes, running exchanges
      * are cancelled and cut short, and the mic is released for whoever wants
