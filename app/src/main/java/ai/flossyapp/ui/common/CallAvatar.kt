@@ -149,9 +149,16 @@ fun CallAvatar(pose: CallPose, size: Dp, modifier: Modifier = Modifier) {
                         translationY = -scan * size.value * 0.04f
                     )
                 ) {
-                    Eye(eyeColor, size * 0.13f, blink)
-                    Spacer(Modifier.width(size * 0.18f))
-                    Eye(eyeColor, size * 0.13f, blink)
+                    // Eyes lead the character, so they are sized to the
+                    // physical display they render on, not to the avatar's
+                    // nominal size: a Pixel 9a's popup runs the face small,
+                    // and at a fixed fraction the eyes disappeared into
+                    // two dots. A bigger share of the head keeps them
+                    // readable at every scale - and a character with larger
+                    // eyes reads as more alive, not more cartoonish.
+                    Eye(eyeColor, size * 0.19f, blink)
+                    Spacer(Modifier.width(size * 0.12f))
+                    Eye(eyeColor, size * 0.19f, blink)
                 }
             }
         }

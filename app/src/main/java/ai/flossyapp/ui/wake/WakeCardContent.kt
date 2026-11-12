@@ -120,7 +120,11 @@ private fun StatusRow(snap: WakeCardSnapshot) {
         Text(
             text = snap.statusLabel,
             color = Color(snap.statusColor),
-            fontSize = ssp(13f, snap)
+            // The status is the card's one line of prose - "Thinking…" at a
+            // whisper was exactly what the user called out - so it rides a
+            // larger base than the buttons and scales with the physical
+            // display like everything else.
+            fontSize = ssp(16f, snap)
         )
     }
 }
