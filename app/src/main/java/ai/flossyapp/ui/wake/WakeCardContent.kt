@@ -103,7 +103,7 @@ fun WakeCardContent(state: WakeCardState) {
             // The same bot the chat screen rides: while the reply is being
             // prepared the scanning pose is the card's only sign of life, so
             // the card never looks dead while thinking.
-            CallAvatar(pose = snap.pose, size = sdp(56f, snap), modifier = Modifier.align(Alignment.CenterHorizontally))
+            CallAvatar(pose = snap.pose, size = sdp(112f, snap), modifier = Modifier.align(Alignment.CenterHorizontally))
             Spacer(Modifier.height(sdp(8f, snap)))
             BubbleThread(snap, Modifier.weight(1f).fillMaxWidth())
             Spacer(Modifier.height(sdp(10f, snap)))

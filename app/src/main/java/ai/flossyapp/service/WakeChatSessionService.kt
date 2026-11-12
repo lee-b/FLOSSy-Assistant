@@ -367,7 +367,7 @@ private const val BUTTON_HEIGHT = 72
 
 // The room the bot face takes between the status and the bubbles, in design
 // units - scaled like every other length by the display factor.
-private const val AVATAR_HEIGHT = 100
+private const val AVATAR_HEIGHT = 200
 private const val BUTTON_RADIUS = 26f
 
 /**

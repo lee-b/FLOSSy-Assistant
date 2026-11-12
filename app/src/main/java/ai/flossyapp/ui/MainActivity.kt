@@ -342,17 +342,20 @@ class MainActivity : ComponentActivity() {
             }
 
             if (showSplash.value) {
-                // Splash screen with fade-in animation
+                // Splash screen with fade-in animation. The animated bot face
+                // (the same one the voice surfaces ride) fills about two
+                // thirds of the screen while the app loads, instead of a
+                // static microphone glyph.
                 Box(
                     modifier = Modifier.fillMaxSize(),
                     contentAlignment = Alignment.Center,
                     content = {
-                        Icon(
-                            imageVector = androidx.compose.material.icons.Icons.Default.Mic,
-                            contentDescription = null,
-                            modifier = Modifier.size(96.dp),
-                            tint = MaterialTheme.colorScheme.primary
-                        )
+                        BoxWithConstraints {
+                            ai.flossyapp.ui.common.CallAvatar(
+                                pose = ai.flossyapp.ui.common.CallPose.CONNECTING,
+                                size = maxWidth * 2f / 3f
+                            )
+                        }
                     }
                 )
             }
