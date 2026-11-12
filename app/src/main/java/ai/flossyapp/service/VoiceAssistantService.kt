@@ -22,9 +22,9 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationCompat.Builder
 import ai.flossyapp.FlossyApplication
 import ai.flossyapp.data.remote.ApiClient
-import ai.flossyapp.data.tools.ToolRegistry
+import ai.flossyapp.domain.model.ChatMessage
+import ai.flossyapp.ui.common.ConversationStore
 import ai.flossyapp.ui.common.preferredCaptureDevice
-import ai.flossyapp.ui.common.isNonSpeechTranscript
 import ai.flossyapp.ui.common.playListenEndCue
 import ai.flossyapp.ui.common.playListenStartCue
 import kotlinx.coroutines.*
@@ -81,6 +81,10 @@ class VoiceAssistantService : Service() {
 
         // Longest utterance kept before it is sent to STT
         private const val MAX_UTTERANCE_SECONDS = 60
+
+        // The latest turns the exchange sends to the LLM - the service runs
+        // hands-free all day, so an unbounded history would overflow context.
+        private const val MAX_LLM_CONTEXT = 8
         
         /**
          * Build an intent for this service with the given action.
@@ -155,9 +159,6 @@ class VoiceAssistantService : Service() {
     
     // Audio playback
     private var audioTrack: android.media.AudioTrack? = null
-    
-    @Volatile
-    private var isTtsPlaying = false
     
     // Notification manager
     private lateinit var notificationManager: NotificationManager
@@ -487,18 +488,16 @@ class VoiceAssistantService : Service() {
 
     /**
      * Stop the voice assistant with graceful shutdown.
-     * Waits for current TTS playback to finish, then properly cleans up resources.
      */
     private suspend fun stopListening() {
         currentAudioLevel = 0
-        
-        // If TTS is currently playing, wait briefly for it to finish before cancelling
-        if (isTtsPlaying) {
-            android.util.Log.d("VoiceAssistantService", "Waiting for TTS playback to complete...")
-            try {
-                Thread.sleep(2000L) // Wait up to 2 seconds for current speech to finish
-            } catch (e: InterruptedException) {
-                Thread.currentThread().interrupt()
+        // If an exchange the engine is carrying belongs to this service (the
+        // engine is otherwise idle), end it here: the engine's hang-up cancels
+        // the running exchange and stops the TTS immediately.
+        runCatching {
+            val engine = ai.flossyapp.ui.common.VoiceCallEngine.instance(applicationContext)
+            if (engine.mode == ai.flossyapp.ui.common.VoiceCallEngine.Mode.IDLE && engine.callActive) {
+                engine.hangUp("assistant service stopped")
             }
         }
         
@@ -727,8 +726,9 @@ class VoiceAssistantService : Service() {
     }
 
     /**
-     * Process a complete utterance: convert to WAV, transcribe via the STT
-     * endpoint, respond with the LLM and speak the response with TTS.
+     * Process a complete utterance: hand the clip to the one voice-call
+     * engine, which carries it through STT, the LLM (tools included) and
+     * synchronous TTS, reporting every step to [assistantExchangeHost].
      *
      * @param buffer The full accumulated speech samples (16-bit mono PCM).
      */
@@ -743,47 +743,95 @@ class VoiceAssistantService : Service() {
                 // Convert the full utterance to WAV bytes for the STT endpoint
                 val wavBytes = convertToWav(buffer, buffer.size)
                 
-                // Get settings from SettingsRepository
-                val currentSettings = settingsRepository.loadSettings()
-                val sttBaseUrl = currentSettings.sttBaseUrl
-                val apiKey = currentSettings.sttApiKey
-                val model = currentSettings.sttModelName
-                
-                // Check network before API call
+                // Check network before the pipeline runs
                 if (!checkNetworkAndHandle()) return@launch
                 
-                // Send to STT endpoint with retry logic
-                val transcribedText = try {
-                    executeWithRetry(
-                        operationName = "STT",
-                        maxRetries = MAX_RETRIES,
-                        delayMs = RETRY_DELAY_MS
-                    ) {
-                        ApiClient.transcribeAudio(
-                            baseUrl = sttBaseUrl,
-                            apiKey = apiKey,
-                            audioData = wavBytes,
-                            model = model,
-                            timeoutSeconds = currentSettings.httpTimeoutSeconds.toLong()
-                        )
-                    }
-                } catch (e: Exception) {
-                    handleError("STT failed after $MAX_RETRIES retries: ${e.message}")
-                    return@launch
-                }
-                
-                if (isNonSpeechTranscript(transcribedText)) {
-                    android.util.Log.d("VoiceAssistantService", "Ignoring non-speech transcript: $transcribedText")
-                    _state.value = STATE_LISTENING
-                    updateNotification("Listening...")
-                    return@launch
-                }
-
-                _currentMessage.value = transcribedText
-                processWithLLMAndRespond(transcribedText)
+                val engine = ai.flossyapp.ui.common.VoiceCallEngine.instance(applicationContext)
+                // The assistant service is another surface of the one
+                // conversation: the call is marked live by the store's own
+                // lifetime rules (fresh after a true end, resumed otherwise),
+                // and the exchange runs through the same seam the screen and
+                // the wake service use - there is no second STT/LLM/TTS
+                // pipeline anywhere.
+                engine.beginCall()
+                engine.runExchange(
+                    wavBytes,
+                    assistantExchangeHost,
+                    java.util.concurrent.atomic.AtomicBoolean(false)
+                )
             } catch (e: Exception) {
                 handleError("Voice processing error: ${e.message}")
             }
+        }
+    }
+
+    /**
+     * The host the engine reports this service's exchanges to: the phases
+     * become the notification's states, the turns join the one conversation
+     * every other surface renders, and errors go through the same recovery
+     * path the audio loop uses.
+     */
+    private val assistantExchangeHost = object : ai.flossyapp.ui.common.VoiceCallEngine.ExchangeHost {
+        // The service is mid-exchange from PROCESSING until the engine
+        // reports the phase back to IDLE, which is exactly when the exchange
+        // is still worth reporting to.
+        override fun isActive(): Boolean = _state.value != STATE_IDLE
+
+        override fun settings() = settingsRepository.loadSettings()
+
+        // The service runs hands-free all day, so only the latest turns are
+        // sent - an unbounded history would eventually overflow the model's
+        // context. The one conversation store is the source, exactly as for
+        // the screen and the wake service.
+        override fun history(): List<Map<String, String>> =
+            ConversationStore.messages.value.takeLast(MAX_LLM_CONTEXT).map { msg ->
+                mapOf("role" to msg.role.name.lowercase(), "content" to msg.content)
+            }
+
+        override fun onUserMessage(text: String) {
+            _currentMessage.value = text
+            ConversationStore.addMessage(ChatMessage.user(text))
+        }
+
+        override fun onAssistantMessage(text: String, reasoning: String?) {
+            ConversationStore.addMessage(ChatMessage.assistant(text, reasoning))
+        }
+
+        override fun onPhase(phase: ai.flossyapp.domain.model.VoiceCallPhase) {
+            when (phase) {
+                ai.flossyapp.domain.model.VoiceCallPhase.TRANSCRIBING -> {
+                    _state.value = STATE_PROCESSING
+                    updateNotification("Processing...")
+                }
+                ai.flossyapp.domain.model.VoiceCallPhase.THINKING -> {
+                    _state.value = STATE_PROCESSING
+                    updateNotification("Thinking...")
+                }
+                ai.flossyapp.domain.model.VoiceCallPhase.SPEAKING -> {
+                    _state.value = STATE_SPEAKING
+                    updateNotification("Speaking...")
+                }
+                // The exchange is over: back to listening, unless the service
+                // itself is stopping (IDLE).
+                else -> if (_state.value != STATE_IDLE) {
+                    _state.value = STATE_LISTENING
+                    updateNotification("Listening...")
+                }
+            }
+        }
+
+        override fun onStreamingContent(text: String) {
+            _currentMessage.value = text
+        }
+
+        override fun onStreamingReasoning(text: String) {}
+
+        override fun onSystemNote(text: String) {
+            android.util.Log.d("VoiceAssistantService", "System note: $text")
+        }
+
+        override fun onError(message: String) {
+            handleError(message)
         }
     }
 
@@ -809,103 +857,6 @@ class VoiceAssistantService : Service() {
         return false
     }
 
-    /**
-     * Process user input through LLM and respond with TTS.
-     */
-    private suspend fun processWithLLMAndRespond(userInput: String) {
-        _state.value = STATE_PROCESSING
-        
-        // Get settings from SettingsRepository
-        val currentSettings = settingsRepository.loadSettings()
-        val llmBaseUrl = currentSettings.llmBaseUrl
-        val apiKey = currentSettings.llmApiKey
-        val model = currentSettings.llmModelName
-        
-        try {
-            // Build conversation history for context
-            val messagesList = listOf(
-                mapOf("role" to "user", "content" to userInput)
-            )
-            
-            // Check network before LLM call
-            if (!checkNetworkAndHandle()) return
-            
-            var responseText = ""
-            try {
-                val response = executeWithRetry(
-                    operationName = "LLM",
-                    maxRetries = MAX_RETRIES,
-                    delayMs = RETRY_DELAY_MS
-                ) {
-                    ApiClient.chatCompletionWithTools(
-                        baseUrl = llmBaseUrl,
-                        apiKey = apiKey,
-                        messages = messagesList,
-                        model = model,
-                        stream = false,
-                        maxTokens = currentSettings.llmMaxTokens,
-                        reasoningBudgetTokens = currentSettings.llmReasoningBudgetTokens,
-                        chatTemplateKwargs = currentSettings.llmChatTemplateKwargs,
-                        systemPrompt = currentSettings.systemPrompt,
-                        // Every tool - internal handlers, search engines and
-                        // MCP servers - flows through the one registry seam;
-                        // "end_call" ends this interaction the same way the
-                        // notification's End call does.
-                        toolDescriptors = ToolRegistry.advertisedTools(currentSettings) { endCallFromTool() },
-                        // The answer to a tool call is fetched here so the loop in the API client
-                        // can hand the result back to the model and ask again in the same exchange.
-                        runTool = { name: String, argumentsJson: String ->
-                            ToolRegistry.runNamedTool(currentSettings, name, argumentsJson) { endCallFromTool() }
-                        },
-                        timeoutSeconds = currentSettings.httpTimeoutSeconds.toLong()
-                    )
-                }
-                responseText = response.content
-            } catch (e: Exception) {
-                throw RuntimeException("LLM call failed after $MAX_RETRIES retries: ${e.message}")
-            }
-            
-            if (responseText.isNotEmpty()) {
-                _currentMessage.value = responseText
-                
-                // Synthesize speech and play it back
-                _state.value = STATE_SPEAKING
-                updateNotification("Speaking...")
-                
-                // Check network before TTS call
-                if (!checkNetworkAndHandle()) return
-                
-                // One speech seam for the whole app: playTTSAudio applies the
-                // same speakableText filter (markdown asterisks, emoji, foreign
-                // scripts) the engine and the chat screen speak through, so no
-                // path can hand the TTS characters it reads out loud.
-                try {
-                    ai.flossyapp.ui.common.playTTSAudio(
-                        responseText,
-                        Pair(currentSettings.ttsBaseUrl, if (currentSettings.ttsApiKey.isBlank()) null else currentSettings.ttsApiKey),
-                        model = currentSettings.ttsModelName,
-                        voice = currentSettings.ttsVoiceName,
-                        responseFormat = currentSettings.ttsResponseFormat,
-                        enableStreaming = currentSettings.enableTtsStreaming,
-                        timeoutSeconds = currentSettings.httpTimeoutSeconds.toLong(),
-                        forbidNonLatin = currentSettings.forbidNonLatinTts
-                    )
-                } catch (e: Exception) {
-                    handleError("TTS failed: ${e.message}")
-                }
-                
-                // Return to listening mode if continuous conversation is enabled
-                if (_state.value != STATE_IDLE) {
-                    _state.value = STATE_LISTENING
-                    updateNotification("Listening...")
-                }
-            } else {
-                handleError("Empty LLM response")
-            }
-        } catch (e: Exception) {
-            handleError("Response processing error: ${e.message}")
-        }
-    }
 
     // ==================== Audio Helpers ====================
 
@@ -961,22 +912,6 @@ class VoiceAssistantService : Service() {
     private fun shortToLittleEndian(value: Int, bytes: ByteArray, pos: Int) {
         bytes[pos] = value.toByte()
         bytes[pos + 1] = (value shr 8).toByte()
-    }
-
-    /**
-     * Play audio bytes through the system speaker using AudioTrack.
-     * TTS endpoints return WAV files - the header is parsed to get the real
-     * sample rate and stripped before playback.
-     */
-    private suspend fun playAudio(audioBytes: ByteArray) {
-        // stopListening() waits while this flag is set so an in-flight response
-        // finishes before the foreground service tears down.
-        isTtsPlaying = true
-        try {
-            ai.flossyapp.ui.common.playAudioBytes(audioBytes)
-        } finally {
-            isTtsPlaying = false
-        }
     }
 
     // ==================== Notification Management ====================
