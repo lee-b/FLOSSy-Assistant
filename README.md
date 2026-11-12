@@ -282,6 +282,7 @@ app/
 │   │   ├── common/                     # Audio helpers, VAD, shared bubbles, wake-word matcher
 │   │   │   ├── CommonUtilities.kt
 │   │   │   ├── BubbleKit.kt            # The one bubble shell + scroll both chat views render through
+│   │   │   └── CallAvatar.kt           # The animated bot face both voice surfaces ride
 │   │   │   ├── WakeWordDetector.kt
 │   │   │   └── DefaultAssistant.kt     # Assistant-role oracle & picker intents
 │   │   └── theme/                      # Gruvbox Material3 colour schemes
