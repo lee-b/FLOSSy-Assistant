@@ -577,13 +577,17 @@ fun ChatScreen(
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
                             Icon(
                                 imageVector = Icons.Default.Mic,
-                                contentDescription = if (isRecording) "Stop recording" else "Start recording",
+                                // A voice call is a call, not a recording
+                                // session - the wording follows the call
+                                // metaphor everywhere, on and off the mic.
+                                contentDescription = if (isRecording) "Hang up" else "Start a voice call",
                                 modifier = Modifier.size(64.dp),
                                 tint = MaterialTheme.colorScheme.primary
                             )
                             Spacer(modifier = Modifier.height(16.dp))
                             Text(
-                                text = "Tap the microphone to start",
+                                text = if (isRecording) "In call - just say what you need"
+                                    else "Tap the microphone to start a call",
                                 style = MaterialTheme.typography.bodyLarge,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -1170,7 +1174,9 @@ private fun VoiceControlsBar(
                         }
                         Spacer(modifier = Modifier.width(4.dp))
                         Text(
-                            text = "Recording",
+                            // Same metaphor as the rest of the call UI: the
+                            // dot is the live call, never a recording lamp.
+                            text = "In call",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.error
                         )
@@ -1247,7 +1253,7 @@ private fun VoiceControlsBar(
                     ) {
                         Icon(
                             imageVector = Icons.Default.Mic,
-                            contentDescription = "Start recording",
+                            contentDescription = "Start a voice call",
                             tint = MaterialTheme.colorScheme.onPrimaryContainer,
                             modifier = Modifier.size(20.dp)
                         )

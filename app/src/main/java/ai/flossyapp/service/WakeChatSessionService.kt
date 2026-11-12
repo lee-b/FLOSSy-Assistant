@@ -8,6 +8,7 @@ import android.service.voice.VoiceInteractionSessionService
 import android.util.Log
 import android.view.Gravity
 import android.view.View
+import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
 import ai.flossyapp.ui.theme.TRANSPARENT
@@ -17,6 +18,7 @@ import ai.flossyapp.ui.theme.GRUVBOX_PRIMARY
 import ai.flossyapp.ui.theme.GRUVBOX_ERROR
 import ai.flossyapp.ui.theme.WAKE_CARD_SURFACE
 import ai.flossyapp.ui.theme.WAKE_CARD_ELEVATION
+import ai.flossyapp.ui.theme.GRUVBOX_SURFACE_LOW
 import ai.flossyapp.ui.theme.WAKE_USER_BUBBLE
 import ai.flossyapp.ui.theme.WAKE_REPLY_BUBBLE
 import ai.flossyapp.ui.theme.WAKE_PHASE_LISTENING
@@ -333,6 +335,18 @@ private const val DIVIDER_HEIGHT = 6
 private const val CARET_HEIGHT = 8
 
 /**
+ * The two ways out of the popup, drawn as buttons at the card's foot.
+ *
+ * One opens the full app (the assistant metaphor's "go to the assistant"), the
+ * other ends the exchange in the same red the app chat view's End Call wears -
+ * both surfaces read as one assistant. The height is the design value at
+ * [BASE_SHORT_EDGE]; the radius matches the reply bubble so the buttons read
+ * as part of the card rather than as system chrome.
+ */
+private const val BUTTON_HEIGHT = 72
+private const val BUTTON_RADIUS = 26f
+
+/**
  * How rounded the card and the bubbles inside it are.
  *
  * A flat `setBackgroundColor(Int)` paints a sharp rectangle, which is what the
@@ -387,6 +401,7 @@ private const val STATUS_DOT_GAP = 18
  * and applied with [android.widget.LinearLayout.setOrientation][setOrientation].
  */
 private const val VERTICAL = 1
+private const val HORIZONTAL = 0
 
 /**
  * How much text the card can show.
@@ -405,7 +420,18 @@ private const val VERTICAL = 1
  */
 private const val USER_MAX_LINES = 2
 private const val REPLY_MAX_LINES = 8
-private const val LINE_CHARS = 64
+
+/**
+ * How many characters one bubble line holds, derived rather than tuned: a
+ * character advances about as far as the text size is tall (the measured font
+ * metrics above), and a line's room is [BUBBLE_TEXT_WIDTH] - so the count is
+ * the width divided by the size. It is deliberately **not** multiplied by the
+ * display scale, because the font size scales by the same factor: multiplying
+ * both is what under-filled the bubbles on a smaller display (and the shipped
+ * constant was hard-coded to one reference screen, which is what made the
+ * budget a guess everywhere else).
+ */
+private const val LINE_CHARS = BUBBLE_TEXT_WIDTH / REPLY_TEXT_SIZE.toInt()
 
 /**
  * The session half of the wake pipeline.
@@ -516,15 +542,6 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
     private var scale = 1f
 
     /**
-     * Whether the next show is still the one that measures the display.
-     *
-     * Only the first show of an exchange can do the measuring, and it gets one
-     * attempt: if the card reads back nothing then, the exchange draws at the
-     * shipped design rather than measuring again on a window that is already cut.
-     */
-    private var measuring = true
-
-    /**
      * What the next show must draw, wrapped once so the window and the paint
      * agree on how many lines there are.
      */
@@ -572,6 +589,16 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
      * blink is driven.
      */
     private val caret = LinearLayout(context)
+
+    /**
+     * The row under the reply that carries the two ways out of the popup:
+     * opening the full app, and ending the exchange. The end button wears the
+     * same red the app chat view's End Call wears, so both surfaces read as
+     * one assistant.
+     */
+    private val buttonRow = LinearLayout(context)
+    private val openAppButton = Button(context)
+    private val endChatButton = Button(context)
 
     /**
      * The children that pin the card to a fixed size, the rows the bubbles sit
@@ -630,9 +657,9 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
         rescale()
         userShown = wrap(request, USER_MAX_LINES)
         replyShown = wrap(reply, REPLY_MAX_LINES)
-        if (measuring && state == SESSION_STATE_RISE) measureDisplay() else sizeWindow()
+        sizeWindow()
         metrics()
-        if (measuring) clearCard() else paint()
+        paint()
     }
 
     /**
@@ -705,30 +732,6 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
     }
 
     /**
-     * Leaves the first show's window exactly as the platform builds it, so the
-     * card can be read back as the display.
-     *
-     * A session cannot ask for a display or a density (see [BASE_SHORT_EDGE]), so
-     * the measurement is indirect: AOSP lays the session window out to fill the
-     * display while it is *not* yet visible, and the card is stretched to fill
-     * that window - the same relationship [sizeWindow] relies on for height. A
-     * show that never calls `setLayout` therefore puts a card the size of the
-     * display on screen, and [onShow] reads the short edge off it.
-     *
-     * Nothing is painted for this show (see [clearCard]), so the card that fills
-     * the display is invisible; the panel the platform paints behind it is still
-     * cleared, so the frame shows the screen underneath rather than a box over it.
-     */
-    private fun measureDisplay() {
-        val surface = windowSurface() ?: return
-        surface.setBackgroundDrawable(clearShape)
-        Log.i(
-            "WakeChatSessionService",
-            "Measurement show: leaving the window as the platform built it so the card can be read as the display"
-        )
-    }
-
-    /**
      * The current scale, applied to a design length.
      *
      * Every metric in this file is a design value at [BASE_SHORT_EDGE]; this is
@@ -751,6 +754,35 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
      * exchange that never measured leaves the shipped design alone.
      */
     private fun rescale() {
+        // The scale comes from the display, and the display is measured here
+        // directly: the indirect route - leaving the first window uncut so a
+        // stretched card could be read back in [onShow] - never worked, because
+        // onShow ran before the card was laid out and its width read 0. The
+        // exchange then drew at the shipped design for a 1840-px reference on a
+        // 1080-px phone: the whole 1668-px card went off the right edge, which
+        // is exactly the clipping the user reported. A session's context is a
+        // service, and any service can answer its own WindowManager, whose
+        // maximum metrics are the real display - no layout timing involved.
+        if (measuredShortEdge <= 0) {
+            val bounds = runCatching {
+                context.getSystemService(android.view.WindowManager::class.java)
+                    .maximumWindowMetrics
+            }.getOrNull()
+            if (bounds != null) {
+                val rect = bounds.bounds
+                measuredShortEdge = minOf(rect.width(), rect.height())
+                Log.i(
+                    "WakeChatSessionService",
+                    "Measured the display directly: ${rect.width()}x${rect.height()}, " +
+                        "short edge $measuredShortEdge px"
+                )
+            } else {
+                Log.i(
+                    "WakeChatSessionService",
+                    "The display could not be measured, so the card stays at the shipped design"
+                )
+            }
+        }
         if (measuredShortEdge <= 0) return
         val raw = measuredShortEdge.toFloat() / BASE_SHORT_EDGE
         val target = if (raw < MIN_SCALE) MIN_SCALE else if (raw > MAX_SCALE) MAX_SCALE else raw
@@ -793,30 +825,15 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
         divider.setPadding(0, px(DIVIDER_HEIGHT / 2), 0, px(DIVIDER_HEIGHT / 2))
         userLines.forEach { line -> line.textSize = pt(USER_TEXT_SIZE) }
         replyLines.forEach { line -> line.textSize = pt(REPLY_TEXT_SIZE) }
-    }
-
-    /**
-     * Draws nothing at all - what the measurement show paints.
-     *
-     * The measurement show's card is as large as the display, so any ink at all
-     * would cover the screen for a frame. An empty `TextView` measures nothing and
-     * a transparent background paints nothing, which is how the show contributes
-     * no ink while still measuring the way the real card does.
-     */
-    private fun clearCard() {
-        statusLine.text = ""
-        userLines.forEach { line -> line.text = "" }
-        replyLines.forEach { line -> line.text = "" }
-        card.background = clearShape
-        panel.background = clearShape
-        phaseChip.background = clearShape
-        divider.background = clearShape
-        caret.background = clearShape
-        statusLine.setTextColor(TRANSPARENT)
-        userBubble.background = clearShape
-        replyBubble.background = clearShape
-        userBubble.setPadding(0, 0, 0, 0)
-        replyBubble.setPadding(0, 0, 0, 0)
+        // The buttons are wired once but sized per show, like every other
+        // metric here, so a rescale between shows re-fits them too.
+        buttonRow.setPadding(0, px(BUBBLE_GAP), 0, 0)
+        openAppButton.textSize = pt(STATUS_SIZE + 3f)
+        endChatButton.textSize = pt(STATUS_SIZE + 3f)
+        (openAppButton.layoutParams as? LinearLayout.LayoutParams)?.let { lp ->
+            lp.height = px(BUTTON_HEIGHT); openAppButton.layoutParams = lp }
+        (endChatButton.layoutParams as? LinearLayout.LayoutParams)?.let { lp ->
+            lp.height = px(BUTTON_HEIGHT); endChatButton.layoutParams = lp }
     }
 
     /**
@@ -864,6 +881,42 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
         panel.addView(replyRow)
         replyRow.setGravity(Gravity.TOP or Gravity.RIGHT)
         replyRow.addView(replyBubble)
+        // The row is a horizontal container like the bubble rows, and the two
+        // buttons split the inner width between them with weights, so they
+        // always fill the card rather than hugging their labels.
+        buttonRow.setOrientation(HORIZONTAL)
+        openAppButton.setGravity(Gravity.CENTER)
+        endChatButton.setGravity(Gravity.CENTER)
+        openAppButton.setAllCaps(false)
+        endChatButton.setAllCaps(false)
+        openAppButton.background = rounded(GRUVBOX_SURFACE_LOW, BUTTON_RADIUS)
+        endChatButton.background = rounded(GRUVBOX_ERROR, BUTTON_RADIUS)
+        openAppButton.setTextColor(GRUVBOX_ON_SURFACE)
+        endChatButton.setTextColor(GRUVBOX_ON_SURFACE)
+        // Opening the full app is the one thing a session is allowed to do
+        // with an activity: startAssistantActivity is the sanctioned path and
+        // the platform grants it inside a voice interaction, where a service's
+        // own startActivity would be refused as a background launch.
+        openAppButton.setOnClickListener {
+            try {
+                val launch = context.packageManager.getLaunchIntentForPackage(context.packageName)
+                if (launch != null) startAssistantActivity(launch)
+            } catch (e: Exception) {
+                Log.w("WakeChatSessionService", "Could not open the app: ${e.message}")
+            }
+        }
+        // Ending the chat is the service's call, not the session's: the state
+        // both halves share lives over there, and its close animation is the
+        // one way the card sinks everywhere at once.
+        endChatButton.setOnClickListener {
+            try {
+                context.startService(
+                    WakeChatService.buildIntent(context, WakeChatService.ACTION_CLOSE_CHAT)
+                )
+            } catch (e: Exception) {
+                Log.w("WakeChatSessionService", "Could not end the chat: ${e.message}")
+            }
+        }
         replyBubble.setOrientation(VERTICAL)
         replyLines.forEach { line ->
             replyBubble.addView(line)
@@ -871,8 +924,11 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
             line.setTextColor(GRUVBOX_PRIMARY)
         }
         replyBubble.addView(caret)
+        panel.addView(buttonRow)
+        buttonRow.addView(openAppButton, LinearLayout.LayoutParams(0, 0, 1f))
+        buttonRow.addView(endChatButton, LinearLayout.LayoutParams(0, 0, 1f))
         metrics()
-        if (measuring) clearCard() else paint()
+        paint()
         return stage
     }
 
@@ -912,6 +968,12 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
         caret.setPadding(0, caretPad, 0, caretPad)
         caret.background =
             if (state == SESSION_STATE_STREAMING && caretFrame % 2 == 0) caretShape else clearShape
+        // The buttons belong to an open exchange only: a closed card sinks
+        // with nothing left to act on, and an empty row would still measure
+        // its padding and hold the card open over nothing.
+        buttonRow.visibility = if (closed) View.GONE else View.VISIBLE
+        openAppButton.visibility = buttonRow.visibility
+        endChatButton.visibility = buttonRow.visibility
         userShown.forEachIndexed { index, line ->
             if (index < userLines.size) userLines[index].text = line
         }
@@ -980,8 +1042,13 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
             if (replyLineCount == 0) 0
             else px(BUBBLE_PADDING) * 2 + replyLineCount * px(LINE_HEIGHT) + px(CARET_HEIGHT)
         // The rule measures to its own padding whatever it paints, so it always
-        // costs the card this much room.
-        return px(CARD_TOP_PADDING) + px(CARD_BOTTOM_PADDING) + status + px(DIVIDER_HEIGHT) + user + answer
+        // costs the card this much room. The button row rides along on every
+        // open card: the two ways out of the popup are part of the card the
+        // same way the bubbles are, so the window is cut tall enough for them.
+        val buttons =
+            if (userLineCount == 0 && replyLineCount == 0) 0
+            else px(BUBBLE_GAP) + px(BUTTON_HEIGHT)
+        return px(CARD_TOP_PADDING) + px(CARD_BOTTOM_PADDING) + status + px(DIVIDER_HEIGHT) + user + answer + buttons
     }
 
     /**
@@ -1096,30 +1163,8 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
      * The close is requested by [WakeChatService] through
      * [SESSION_STATE_CLOSE], which [paint] already draws as nothing, so the
      * window is invisible even if finishing it only hides it.
-     *
-     * The read-back happens here because AOSP has laid the window out before it
-     * shows it: after the show that left it as the platform built it, the card
-     * measures to the display less [WINDOW_OVERHEAD], which is the only display
-     * measurement available to a session (see [BASE_SHORT_EDGE]). A card that
-     * reads back nothing leaves the scale at 1, which is the shipped design.
      */
     override fun onShow(args: android.os.Bundle?, showFlags: Int) {
-        if (measuring) {
-            measuring = false
-            val short = if (card.width < card.height) card.width else card.height
-            if (short > 0) {
-                measuredShortEdge = short + WINDOW_OVERHEAD
-                Log.i(
-                    "WakeChatSessionService",
-                    "Measured the display off a stretched card: ${card.width}x${card.height}, short edge $measuredShortEdge px"
-                )
-            } else {
-                Log.i(
-                    "WakeChatSessionService",
-                    "The stretched card measured nothing, so the card stays at the shipped design"
-                )
-            }
-        }
         Log.i(
             "WakeChatSessionService",
             "Shown state=$state scale=$scale stageW=${stage.width} stageH=${stage.height} cardW=${card.width} cardH=${card.height} panelW=${panel.width} panelH=${panel.height} rowW=${statusRow.width} chipW=${phaseChip.width} chipH=${phaseChip.height} statusW=${statusLine.width} statusH=${statusLine.height} divH=${divider.height} u0W=${userLines[0].width} u0H=${userLines[0].height} u0T=${userLines[0].text.length} r0T=${replyLines[0].text.length} userBW=${userBubble.width} userBH=${userBubble.height} replyBW=${replyBubble.width} replyBH=${replyBubble.height} userRowW=${userRow.width} replyRowW=${replyRow.width}"
@@ -1139,23 +1184,34 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
      * wrapped line can never be wider than the line the card can hold.
      */
     private fun wrap(text: String, maxLines: Int): List<String> {
-        val lines = mutableListOf<String>()
-        val budget = px(LINE_CHARS)
+        val all = mutableListOf<String>()
+        // Characters per line is scale-invariant - see LINE_CHARS - so the
+        // budget is the design value, never re-scaled here.
+        val budget = LINE_CHARS
         var rest = text.trim()
-        while (rest.isNotEmpty() && lines.size < maxLines) {
-            val last = lines.size == maxLines - 1
+        while (rest.isNotEmpty()) {
             var cut = rest.length
             if (cut > budget) {
-                val room = if (last) budget - 1 else budget
-                val space = rest.substring(0, room).lastIndexOf(' ')
-                cut = if (space > room / 3) space else room
+                val space = rest.substring(0, budget).lastIndexOf(' ')
+                cut = if (space > budget / 3) space else budget
             }
-            var line = rest.substring(0, cut).trim()
+            all.add(rest.substring(0, cut).trim())
             rest = rest.substring(cut).trim()
-            if (last && rest.isNotEmpty()) line += "…"
-            lines.add(line)
         }
-        return lines
+        // A reply longer than the pool scrolls up like a chat, it does not
+        // stop at the first screenful: the oldest lines are dropped and the
+        // newest ones stay, so the tail the user is waiting for is always the
+        // text on the card. Wrapping only the first pool of lines is what
+        // made a growing answer look frozen - the head never changed while
+        // everything arrived below it, invisible.
+        return if (all.size > maxLines) {
+            val scrolled = all.subList(all.size - maxLines, all.size)
+            // The ellipsis is taken inside the first line's budget, so the
+            // scrolled line can never widen the bubble.
+            var first = scrolled[0]
+            if (first.length > budget - 1) first = first.substring(0, budget - 1).trim()
+            listOf("…$first") + scrolled.subList(1, scrolled.size)
+        } else all
     }
 
     /**
@@ -1169,7 +1225,6 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
         request = ""
         reply = ""
         riseProgress = 0f
-        measuring = true
         measuredShortEdge = 0
         scale = 1f
     }

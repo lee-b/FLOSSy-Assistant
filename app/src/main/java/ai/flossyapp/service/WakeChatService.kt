@@ -108,8 +108,13 @@ class WakeChatService : VoiceInteractionService() {
         // How often the sliced utterance waits and the barge-in pass re-check
         // their aborts, so a stop or a manual trigger is honoured mid-window
         // instead of only at the window's expiry.
-        private const val UTTERANCE_POLL_MS = 250L
-        private const val WAKE_POLL_MS = 500L
+        // Poll slices are short because they bound two latencies: how long a
+        // stop or a manual trigger can sit unacknowledged mid-window, and how
+        // far behind the stream the barge-in matcher can lag. The old 250/500
+        // ms values showed up in the exchange's feel - half a second of the
+        // round trip was the poll, not the pipeline.
+        private const val UTTERANCE_POLL_MS = 100L
+        private const val WAKE_POLL_MS = 250L
         // How often the idle-close watchdog re-reads the activity stamp. The
         // length of the wait itself is the user's setting, never a constant.
         private const val TOUCH_POLL_MS = 200L
@@ -134,12 +139,16 @@ class WakeChatService : VoiceInteractionService() {
         // on this side alone and cannot drift out of step with the session; the round
         // trip to the session's process per show is what bounds how many frames are
         // worth asking for.
-        private const val RISE_FRAME_MS = 45L
-        private const val RISE_FRAMES = 9
+        // The climb is four round trips at most: each frame is a full session
+        // show and the window is on screen from the first, so nine frames held
+        // the card half a second in transit - dead time the user read as the
+        // assistant being slow to wake.
+        private const val RISE_FRAME_MS = 40L
+        private const val RISE_FRAMES = 4
         // The same ladder run backwards when the exchange closes, so the card sinks
         // and fades out the way it came in rather than blinking out.
-        private const val SINK_FRAME_MS = 45L
-        private const val SINK_FRAMES = 7
+        private const val SINK_FRAME_MS = 40L
+        private const val SINK_FRAMES = 4
         // How often a reply that is still arriving is re-shown, so the answer
         // bubble grows with the stream without a round trip per token.
         private const val SESSION_REPAINT_MS = 300L
@@ -421,7 +430,10 @@ class WakeChatService : VoiceInteractionService() {
         listening = true
         stopSignal.set(false)
         wakeAbortSignal.set(false)
+        // The popup is coming alive: the first state the user sees names the
+        // startup itself, before the loop settles into its slumber.
         _phase.value = PHASE_DETECTING
+        updateNotification("Starting up...")
         // The shared voice-call engine owns the microphone from here: one
         // persistent capture scored by Silero, the same capture the chat
         // screen uses when it is in a call. The wake loop and every exchange
@@ -439,6 +451,10 @@ class WakeChatService : VoiceInteractionService() {
         listening = false
         stopSignal.set(true)
         wakeAbortSignal.set(true)
+        // The service survives a stop (only the listening loop ends), so the
+        // notification has to say the assistant is no longer hearing anything
+        // rather than leave the last live state on screen.
+        updateNotification("Sleeping; listening OFF")
         // Give the microphone back through the engine: the shared capture
         // closes and any exchange still in flight is cut short, unless the
         // chat screen has already taken the mic for a call of its own.
@@ -1190,12 +1206,24 @@ class WakeChatService : VoiceInteractionService() {
         notificationManager.notify(NOTIFICATION_ID, notification)
     }
 
+    /**
+     * The wake chat is a digital assistant that lives beside the user, always
+     * present and ready to help, so the notification speaks in that metaphor's
+     * states rather than in microphone jargon: the phases below are the life
+     * the popup is in, and every one tells the user what is happening now.
+     */
     private fun getPhaseText(phase: ai.flossyapp.domain.model.VoiceCallPhase): String = when (phase) {
-        PHASE_DETECTING -> "Listening for the wake word"
-        PHASE_LISTENING -> "Heard it - go ahead"
-        PHASE_THINKING -> "Thinking..."
-        PHASE_SPEAKING -> "Speaking..."
-        else -> "Idle"
+        // The idle loop: the assistant is present but the wake word has not
+        // been heard since the last exchange ended.
+        PHASE_DETECTING -> "Slumbering; awaiting wake word"
+        // The chime has played: the assistant is awake and the microphone is
+        // open for the request.
+        PHASE_LISTENING -> "Awake; awaiting instructions"
+        // The request is on its way to the model.
+        PHASE_THINKING -> "Responding..."
+        // The reply is being voiced.
+        PHASE_SPEAKING -> "Responding..."
+        else -> "Awake"
     }
 
     // Two decimals, not one: the whole sensitivity slider spans 0.377 to 0.448, and a

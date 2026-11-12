@@ -323,6 +323,12 @@ system's "Default digital assistant" page and select FLOSSy Assistant, then star
 `onReady: the system has bound this app as its voice interaction service` once the platform has
 really bound it; if that line never appears, the selection is the problem, not the code.
 
+### The Wake Card Draws Off the Screen Edge
+The card's scale comes from the display, measured directly through the session's
+`WindowManager.maximumWindowMetrics`. If the log line `Measured the display directly` never
+appears, the exchange falls back to the shipped design (tuned for a 1840-px short edge) and
+the card overruns a smaller screen - the fallback, not the rule, is the failure.
+
 ### Audio Issues
 - Grant microphone permission in Settings → Permissions
 - Check that audio format matches your STT service requirements (16 kHz, mono, 16-bit PCM)

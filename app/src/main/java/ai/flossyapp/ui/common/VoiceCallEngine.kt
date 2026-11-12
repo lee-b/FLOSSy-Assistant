@@ -417,21 +417,25 @@ class VoiceCallEngine private constructor(context: Context) {
     }
 
     /**
-     * Opens the persistent capture if it is not already live. The mode at
-     * construction decides where each completed utterance goes, so the
-     * callback reads the mode once and routes accordingly.
+     * Opens the persistent capture if it is not already live. Where each
+     * completed utterance goes is read from the live [mode] at utterance
+     * time, not captured at construction: the capture is shared, so a wake
+     * session that opened it and a chat call that inherited it must both see
+     * their own routing. Reading the mode once was the bug that deafened the
+     * chat screen - the capture opened in WAKE mode kept sending every
+     * utterance to the wake channel nobody drains after the screen took
+     * over, so the mic button produced no transcript at all.
      */
     @Synchronized
     private fun ensureCapture() {
         if (capture != null) return
-        val startedAtMode = mode
         val cap = StreamingCallCapture(
             appContext,
             java.util.concurrent.atomic.AtomicBoolean(false),
             captureGate,
             vad
         ) { clip ->
-            when (startedAtMode) {
+            when (mode) {
                 Mode.WAKE -> utteranceChannel.trySend(clip)
                 Mode.APP -> {
                     val host = appHost ?: return@StreamingCallCapture
@@ -448,7 +452,7 @@ class VoiceCallEngine private constructor(context: Context) {
         // belongs off whatever thread called this.
         Thread {
             val started = cap.start()
-            android.util.Log.d("VoiceCallEngine", "Capture started=$started mode=$startedAtMode")
+            android.util.Log.d("VoiceCallEngine", "Capture started=$started mode=$mode")
         }.start()
     }
 }
