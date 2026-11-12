@@ -140,46 +140,23 @@ fun ChatScreen(
     var ttsPlayedMessageIndex by remember { mutableIntStateOf(-1) }
 
     LaunchedEffect(messages.size, streamingContent.value, streamingReasoning.value, settings) {
-        val layout = lazyListState.layoutInfo
-        // Auto-scroll to the bottom only while the user is already near it -
-        // chasing every streamed chunk would yank the list away from somebody
-        // scrolling back through the reply, which made the list unscrollable
-        // exactly while a response was playing.
-        if (layout.totalItemsCount > 0 && lazyListState.isNearBottom()) {
-            val lastVisible = layout.visibleItemsInfo.lastOrNull() ?: return@LaunchedEffect
-            // The layoutInfo snapshot can be stale here: this effect runs on
-            // the recomposition that appends a message, often BEFORE LazyList
-            // has laid the new item out, so totalItemsCount and visibleItemsInfo
-            // still describe the old list. Comparing against messages.size (a
-            // fresh value, this effect's key) is the only trustworthy test for
-            // "a bubble exists that we have not brought into view yet" - the
-            // stale comparison fell through to the overflow branch, which
-            // measured the OLD bubble, found it fully visible, and scrolled
-            // nothing. That is the exact "not scrolling at all" failure.
-            if (lastVisible.index < messages.size - 1) {
-                // The bottom item is entirely off-screen - LazyList only lays
-                // out what is visible, so no overflow is computable here and
-                // the old overflow-only check could never take the first step
-                // (nothing overflows, so nothing scrolls, so nothing ever
-                // becomes visible). Pull the last item into view once; its
-                // position clamps to the bottom when it is short, and pins
-                // its top when it is tall - which the branch below then
-                // chases on the next recomposition.
-                lazyListState.scrollToItem(messages.size - 1)
-            } else {
-                // Scroll by the distance the last item's bottom sits below the
-                // viewport bottom, not by item index: an absolute jump pins an
-                // item's *top*, so every line a growing response added past its
-                // previous end fell below the fold. Re-reading the layout each
-                // recomposition chases the bottom as the reply grows.
-                val overflow = lastVisible.offset + lastVisible.size - layout.viewportSize.height
-                if (overflow > 0) {
-                    lazyListState.scroll {
-                        scrollBy(overflow.toFloat())
-                    }
-                }
-            }
-        }
+        if (messages.isEmpty()) return@LaunchedEffect
+        // isNearBottom() reads the CURRENT layoutInfo. On the recomposition
+        // that appends a message, that snapshot is often stale - which is
+        // exactly "were we at the bottom before the new bubble": the perfect
+        // condition. If the user had scrolled back through the reply, they
+        // are not near the bottom and we leave the list alone; chasing every
+        // streamed chunk otherwise yanks the list and made it unscrollable
+        // while a response was playing.
+        if (!lazyListState.isNearBottom()) return@LaunchedEffect
+        // Bottom-align the last bubble: scrollToItem pins the item's top,
+        // so a tall bubble would sit with its bottom below the fold (the
+        // previous complaint). Passing Int.MAX_VALUE as scrollOffset pushes
+        // the item's start past the viewport top; the list clamps at its
+        // maximum scroll, leaving the bubble's BOTTOM at the viewport bottom
+        // - for tall and short bubbles alike. Re-running on every streaming
+        // key keeps the bottom pinned while the reply grows.
+        lazyListState.scrollToItem(messages.size - 1, Int.MAX_VALUE)
 
         // Track last assistant message for auto-TTS - only trigger when streaming is COMPLETE
         val lastMsg = messages.lastOrNull { it.role == ai.flossyapp.domain.model.MessageRole.ASSISTANT }
