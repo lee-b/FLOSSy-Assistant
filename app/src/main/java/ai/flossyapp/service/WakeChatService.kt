@@ -10,16 +10,14 @@ import androidx.annotation.RequiresPermission
 import androidx.core.app.NotificationCompat
 import ai.flossyapp.FlossyApplication
 import ai.flossyapp.data.remote.ApiClient
-import ai.flossyapp.data.remote.McpClient
 import ai.flossyapp.data.settings.SettingsRepository
 import ai.flossyapp.domain.model.ChatMessage
+import ai.flossyapp.domain.model.VoiceCallPhase
 import ai.flossyapp.ui.common.bestMatchCost
 import ai.flossyapp.ui.common.extractWakeFeatures
-import ai.flossyapp.ui.common.isNonSpeechTranscript
 import ai.flossyapp.ui.common.loadWakeReferences
 import ai.flossyapp.ui.common.playWakeCue
-import ai.flossyapp.ui.common.playTTSAudio
-import ai.flossyapp.ui.common.recordAudioWithVAD
+import ai.flossyapp.ui.common.VoiceCallEngine
 import ai.flossyapp.ui.common.referenceFrameCount
 import ai.flossyapp.ui.common.wakeAgreement
 import ai.flossyapp.ui.common.wakeCostThreshold
@@ -54,6 +52,12 @@ import kotlinx.coroutines.withContext
 class WakeChatService : VoiceInteractionService() {
 
     companion object Constants {
+        // Whether the wake-chat service is currently alive. The chat screen
+        // reads this before pausing the service, because a voice call and the
+        // hands-free listener must not both hold the microphone - and with the
+        // shared engine there is only one capture to hold it.
+        @Volatile
+        var isRunning = false
         const val NOTIFICATION_ID = 3001
         const val CHANNEL_ID = "wake_chat_channel"
 
@@ -101,6 +105,11 @@ class WakeChatService : VoiceInteractionService() {
         // turn. The speakers sit beside the microphone, so the tail of the reply
         // that was just voiced would otherwise be recorded as the next question.
         private const val MIC_REARM_MS = 350L
+        // How often the sliced utterance waits and the barge-in pass re-check
+        // their aborts, so a stop or a manual trigger is honoured mid-window
+        // instead of only at the window's expiry.
+        private const val UTTERANCE_POLL_MS = 250L
+        private const val WAKE_POLL_MS = 500L
         // How often the idle-close watchdog re-reads the activity stamp. The
         // length of the wait itself is the user's setting, never a constant.
         private const val TOUCH_POLL_MS = 200L
@@ -201,6 +210,12 @@ class WakeChatService : VoiceInteractionService() {
         SettingsRepository(appContext)
     }
 
+    // The host the shared engine reports every exchange to. One for the
+    // service's lifetime: it carries what the card is showing across turns
+    // and conversations, so an open show always re-sends the exchange the
+    // user is still looking at rather than blanking it.
+    private val exchangeHost = WakeExchangeHost()
+
     private val stopSignal = AtomicBoolean(false)
 
     // Aborts the clip the idle wake pass is holding without closing the chat, so a
@@ -280,6 +295,7 @@ class WakeChatService : VoiceInteractionService() {
 
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        isRunning = true
         when (intent?.action) {
             // The app's own hands-free switch, and the action the system uses when
             // it opens this service as its voice interaction service - both mean
@@ -406,6 +422,14 @@ class WakeChatService : VoiceInteractionService() {
         stopSignal.set(false)
         wakeAbortSignal.set(false)
         _phase.value = PHASE_DETECTING
+        // The shared voice-call engine owns the microphone from here: one
+        // persistent capture scored by Silero, the same capture the chat
+        // screen uses when it is in a call. The wake loop and every exchange
+        // below draw their clips and their full pipeline from the engine, so
+        // there is never a second recorder beside the screen's - the old
+        // per-window recorder read a silent device whenever both paths were
+        // live, which is where "Could not hear the request" came from.
+        VoiceCallEngine.instance(applicationContext).startWakeMode()
 
         val scope = serviceScope
         scope.launch { wakeLoop() }
@@ -415,6 +439,11 @@ class WakeChatService : VoiceInteractionService() {
         listening = false
         stopSignal.set(true)
         wakeAbortSignal.set(true)
+        // Give the microphone back through the engine: the shared capture
+        // closes and any exchange still in flight is cut short, unless the
+        // chat screen has already taken the mic for a call of its own.
+        val engine = VoiceCallEngine.instance(applicationContext)
+        if (engine.mode == VoiceCallEngine.Mode.WAKE) engine.stop()
         // The mid-turn watcher is holding the microphone when a stop arrives
         // between turns, so it has to be told to let go as well - otherwise the
         // next exchange opens a second recorder beside the one still running.
@@ -507,17 +536,15 @@ class WakeChatService : VoiceInteractionService() {
     private suspend fun waitForWake(
         currentSettings: ai.flossyapp.domain.model.AppSettings
     ): Boolean {
-        val clip = withContext(Dispatchers.IO) {
-            recordAudioWithVAD(
-                context = appContext,
-                // The idle pass watches its own abort signal rather than the service
-                // stop signal, so letting go of a clip of quiet room does not look
-                // like stopping the service.
-                stopSignal = wakeAbortSignal,
-                maxSeconds = WAKE_CLIP_SECONDS,
-                noSpeechTimeoutMs = WAKE_IDLE_SECONDS * 1000L
-            )
-        }
+        // The shared capture delivers complete utterances: Silero decides
+        // where speech starts and ends, so the clip that arrives is always
+        // the phrase itself, cut on the network's own span rather than an
+        // energy gate. The wait is sliced so a manual trigger or a stop can
+        // still be honoured mid-window instead of only at its expiry.
+        val clip = awaitEngineUtterance(
+            timeoutMs = WAKE_IDLE_SECONDS * 1000L,
+            abort = wakeAbortSignal
+        )
         if (!listening) return false
 
         if (clip == null || clip.isEmpty()) {
@@ -601,35 +628,95 @@ class WakeChatService : VoiceInteractionService() {
     private suspend fun bargeInWatcher(
         currentSettings: ai.flossyapp.domain.model.AppSettings
     ): Boolean {
-        while (!bargeInAbortSignal.get()) {
-            val clip = withContext(Dispatchers.IO) {
-                recordAudioWithVAD(
-                    context = appContext,
-                    stopSignal = bargeInAbortSignal,
-                    maxSeconds = WAKE_CLIP_SECONDS,
-                    noSpeechTimeoutMs = WAKE_IDLE_SECONDS * 1000L
-                )
+        // The shared capture is already recording - the gate only decides what
+        // becomes an utterance, not what is heard - so the watcher follows the
+        // live chunks through a spoken reply instead of opening a second
+        // recorder beside it, which is exactly the contention the old
+        // beside-the-turn recorder created.
+        val engine = VoiceCallEngine.instance(appContext)
+        // A rolling buffer of the last few seconds of 32ms chunks: long enough
+        // for the phrase, short enough that a phrase said at the start of a
+        // turn does not keep matching for the whole turn.
+        val window = java.util.ArrayDeque<FloatArray>()
+        val windowChunks = 94 // ~3s of 32ms chunks
+        engine.chunkListener = { chunk ->
+            synchronized(window) {
+                window.add(chunk)
+                while (window.size > windowChunks) window.removeFirst()
             }
-            // The caller released the watcher, or the window timed out - either way
-            // there is nothing to match, and the loop re-checks the release before
-            // opening another window.
-            if (clip == null || clip.isEmpty()) continue
-
-            val references = loadWakeReferences(appContext)
-            if (references.isEmpty()) continue
-
-            val features = extractWakeFeatures(clip)
-            if (!wakeWordHeard(features, references, currentSettings.wakeWordSensitivity)) continue
-
-            wakeInterruptSignal.set(true)
-            android.util.Log.w(
-                "WakeChatService",
-                "Wake phrase heard mid-turn: clip ${referenceFrameCount(features)} frames, " +
-                    "threshold ${formatCost(wakeCostThreshold(currentSettings.wakeWordSensitivity, references))}"
-            )
-            return true
         }
-        return false
+        val references = loadWakeReferences(appContext)
+        try {
+            while (!bargeInAbortSignal.get()) {
+                delay(WAKE_POLL_MS)
+                if (references.isEmpty()) continue
+                val clip = synchronized(window) {
+                    if (window.size < 16) null else floatChunksToWav(window.toList())
+                } ?: continue
+
+                val features = extractWakeFeatures(clip)
+                if (!wakeWordHeard(features, references, currentSettings.wakeWordSensitivity)) continue
+
+                wakeInterruptSignal.set(true)
+                android.util.Log.w(
+                    "WakeChatService",
+                    "Wake phrase heard mid-turn: clip ${referenceFrameCount(features)} frames, " +
+                        "threshold ${formatCost(wakeCostThreshold(currentSettings.wakeWordSensitivity, references))}"
+                )
+                return true
+            }
+            return false
+        } finally {
+            engine.chunkListener = null
+        }
+    }
+
+    /**
+     * The next complete utterance from the shared capture, waited for in
+     * slices so an abort can still be honoured mid-window; null when the
+     * window expired or the abort was raised first.
+     */
+    private suspend fun awaitEngineUtterance(
+        timeoutMs: Long,
+        abort: AtomicBoolean?
+    ): ByteArray? {
+        val engine = VoiceCallEngine.instance(appContext)
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            val slice = withTimeoutOrNull(UTTERANCE_POLL_MS) {
+                engine.nextUtterance(deadline - System.currentTimeMillis())
+            }
+            if (slice != null) return slice
+            if (abort?.get() == true || !listening) return null
+        }
+        return null
+    }
+
+    /**
+     * Wrap the live 32ms chunks back into a WAV clip the wake matcher can
+     * score, 16 kHz mono 16-bit as everywhere else in the pipeline.
+     */
+    private fun floatChunksToWav(chunks: List<FloatArray>): ByteArray {
+        val sampleCount = chunks.sumOf { it.size }
+        val pcm = ShortArray(sampleCount)
+        var idx = 0
+        for (chunk in chunks) for (v in chunk) {
+            pcm[idx++] = (v * 32767f).toInt().toShort()
+        }
+        val dataSize = sampleCount * 2
+        val out = java.io.ByteArrayOutputStream(44 + dataSize)
+        fun le16(v: Int) { out.write(v); out.write(v shr 8) }
+        fun le32(v: Int) { le16(v); le16(v shr 16) }
+        out.writeBytes("RIFF".toByteArray())
+        le32(36 + dataSize)
+        out.writeBytes("WAV ".toByteArray())
+        out.writeBytes("fmt ".toByteArray())
+        le32(16); le16(1); le16(1)
+        le32(16000); le32(32000); le16(2); le16(16)
+        out.writeBytes("data".toByteArray())
+        le32(dataSize)
+        for (v in pcm) { out.write(v.toInt() and 0xFF); out.write((v.toInt() shr 8) and 0xFF) }
+        return out.toByteArray()
     }
 
     private suspend fun wakeLoop() {
@@ -714,55 +801,37 @@ class WakeChatService : VoiceInteractionService() {
                 // holding the microphone open for a minute. The silence that *ends*
                 // an utterance stays the configured VAD behaviour, so a request
                 // that begins late is still recorded in full.
-                val requestClip = withContext(Dispatchers.IO) {
-                    recordAudioWithVAD(
-                        context = appContext,
-                        stopSignal = stopSignal,
-                        silenceThresholdMs = currentSettings.vadMinSilenceDurationMs
-                            .coerceIn(200, 5000).toLong(),
-                        noSpeechTimeoutMs = silenceWindowMs
-                    )
-                }
+                // The request is the next complete utterance the shared
+                // capture hears, within the user's window; nothing heard ends
+                // the conversation, exactly as before. The wait is sliced so
+                // a stop can still be honoured mid-window.
+                val requestClip = awaitEngineUtterance(
+                    timeoutMs = silenceWindowMs,
+                    abort = if (stopSignal.get()) stopSignal else null
+                )
                 if (!listening) break
-                // Whether the window holds speech at all, kept apart from whether
-                // that speech became usable words: the two end the conversation
-                // differently, and only one of them is silence.
-                val heardSomething = requestClip != null && requestClip.isNotEmpty()
-                val request = if (!heardSomething) {
-                    ""
-                } else {
-                    // A request clip that only holds whisper.cpp's bracketed markers is
-                    // not speech, so it must not reach the LLM either.
-                    val requestText = transcribe(currentSettings, requestClip) ?: ""
-                    if (isNonSpeechTranscript(requestText)) "" else requestText
-                }
-
-                if (request.isBlank()) {
+                // Nothing at all inside the window is the end of the
+                // conversation rather than a failed turn: the reason is shown
+                // for a readable beat and then the card closes, so a silent
+                // room never looks like an assistant still waiting for a
+                // request. Speech the engine heard but STT could not make
+                // usable words of is handled inside the exchange itself - the
+                // same spoken misheard prompt the screen's path gives - and
+                // the turn simply ends here like any other.
+                if (requestClip == null) {
                     _statusMessage.value = "Could not hear the request"
                     updateNotification("Could not hear the request")
-                    if (!heardSomething) {
-                        // Nothing at all inside the window is the end of the
-                        // conversation rather than a failed turn. The reason is shown
-                        // for a readable beat and then the card closes: holding it up
-                        // for the whole close window here would make a silent room look
-                        // like an assistant that is still waiting for a request.
-                        holdWhileQuiet(CLOSED_HINT_MS)
-                        break
-                    }
-                    // Speech was heard but it is not usable words - the marker-only
-                    // transcript whisper.cpp answers with, or a clip that is all noise.
-                    // The user is mid-conversation and clearly still talking, so this
-                    // is a failed turn, not the end of one: closing here would end a
-                    // conversation on the first mumbled request. The reason is shown
-                    // and the microphone is re-armed under the user's close window,
-                    // which is what ends the conversation if they really have stopped.
-                    silenceWindowMs = currentSettings.wakeChatCloseSeconds.coerceIn(1, 300) * 1000L
-                    continue
+                    holdWhileQuiet(CLOSED_HINT_MS)
+                    break
                 }
 
-                lastRequest = request
-                lastReply = answer(request, currentSettings)
-                if (wakeInterruptSignal.get()) {
+                // The exchange now runs entirely in the shared engine - STT,
+                // the LLM with its tools, and the synchronous reply - while
+                // this host renders each step onto the card and notification.
+                val interrupted = answerExchange(requestClip, currentSettings)
+                lastRequest = exchangeHost.lastRequest
+                lastReply = exchangeHost.lastReply
+                if (interrupted) {
                     // The user said the phrase during this turn, so the turn is over
                     // and the next one starts straight away: waiting for silence here
                     // would make an interruption look like the end of the
@@ -792,30 +861,29 @@ class WakeChatService : VoiceInteractionService() {
      * the LLM and speaking the reply. Both paths share this so the exchange
      * behaves identically whichever one heard the user.
      */
-    private suspend fun answer(
-        request: String,
+    /**
+     * Carry one complete request utterance through the shared engine - STT,
+     * the LLM with its tools, and the synchronous spoken reply - while this
+     * service's host renders every step onto the card, the notification and
+     * the session window. Returns whether a wake phrase interrupted the turn.
+     *
+     * This is the same pipeline the chat screen's voice call runs, so the two
+     * owners behave identically whichever one heard the user.
+     */
+    private suspend fun answerExchange(
+        requestClip: ByteArray,
         currentSettings: ai.flossyapp.domain.model.AppSettings
-    ): String {
-        _messages.update { current ->
-            current + listOf(ChatMessage.user(request))
-        }
-        _phase.value = PHASE_THINKING
-        touchChat()
-        // The window is already up from the moment the phrase was heard, so the
-        // words the user said replace the "I'm listening" card as soon as they
-        // are known - the user can see what was heard while the answer is being
-        // produced.
-        requestSession(SESSION_STATE_REQUEST, request, "")
-
-        // A second wake phrase heard while this turn is in flight cuts it short, so
-        // the microphone is held beside the LLM and the speakers rather than only
-        // between turns. The flags are cleared per turn: a previous interruption
-        // must not be read as a current one.
+    ): Boolean {
+        // A second wake phrase heard while this turn is in flight cuts it
+        // short, so the microphone is held beside the LLM and the speakers
+        // rather than only between turns. The flags are cleared per turn: a
+        // previous interruption must not be read as a current one.
         wakeInterruptSignal.set(false)
         bargeInAbortSignal.set(false)
-        // The watcher is a child of the listening scope, so it is cancelled with
-        // the service. Its own failure must not cancel that scope, because an
-        // interrupted recording is not the end of the assistant's whole session.
+        // The watcher is a child of the listening scope, so it is cancelled
+        // with the service. Its own failure must not cancel that scope,
+        // because an interrupted recording is not the end of the assistant's
+        // whole session.
         val interruptWatcher = serviceScope.async {
             try {
                 bargeInWatcher(currentSettings)
@@ -825,63 +893,121 @@ class WakeChatService : VoiceInteractionService() {
             }
         }
 
-        val reply = complete(currentSettings, request, wakeInterruptSignal)
+        val engine = VoiceCallEngine.instance(appContext)
+        val job = engine.runExchange(requestClip, exchangeHost, wakeInterruptSignal)
+        // The exchange is carried on the engine's scope; this loop must not
+        // re-arm the microphone until the reply has actually been spoken, so
+        // the job is awaited here.
+        job?.join()
 
-        if (reply.isNotBlank() && !wakeInterruptSignal.get()) {
-            _messages.update { current ->
-                current + listOf(ChatMessage.assistant(reply))
-            }
-            // The reply has to reach the user while the app is minimized, so it
-            // travels in the notification as well as on the overlay.
-            updateNotification(reply)
-            // Ask the system to draw the exchange over whatever the device is
-            // showing, before the reply is spoken - the user can read it while
-            // they listen.
-            requestSession(SESSION_STATE_REPLY, request, reply)
-            _phase.value = PHASE_SPEAKING
-            // The card says "Speaking…" while the reply is voiced, so the label
-            // matches the audio rather than the full reply appearing before it has
-            // been heard.
-            requestSession(SESSION_STATE_SPEAKING, request, reply)
-            // Speaking the reply is activity right up to its last syllable, so
-            // the close clock is stamped before it starts - the next turn's
-            // microphone window is measured from here, never from mid-audio.
-            touchChat()
-            playTTSAudio(
-                text = reply,
-                ttsSettings = Pair(
-                    currentSettings.ttsBaseUrl,
-                    if (currentSettings.ttsApiKey.isBlank()) null else currentSettings.ttsApiKey
-                ),
-                model = currentSettings.ttsModelName,
-                voice = currentSettings.ttsVoiceName,
-                responseFormat = currentSettings.ttsResponseFormat,
-                enableStreaming = currentSettings.enableTtsStreaming,
-                timeoutSeconds = currentSettings.httpTimeoutSeconds.toLong(),
-                // The phrase can be said again while the reply is still being
-                // voiced, and the rest of it must not keep talking over the user.
-                abortSignal = wakeInterruptSignal
-            )
-            // The reply has been spoken, so the card settles on the two bubbles
-            // with no status label - a settled exchange is just the conversation.
-            requestSession(SESSION_STATE_REPLY, request, reply)
-        } else if (wakeInterruptSignal.get()) {
-            // The turn was cut short, so the half an answer that arrived is not
-            // kept as a reply the user never heard, and nothing is spoken over the
-            // phrase they are already saying.
-            android.util.Log.w(
-                "WakeChatService",
-                "Turn interrupted by the wake word - ${reply.length} chars of answer dropped"
-            )
-        }
-        // The platform hosts one microphone at a time, so the beside-the-turn
-        // recorder has to have let go before the next turn opens its own window.
-        // It is released here rather than right after the LLM call so the phrase can
+        // The platform hosts one microphone at a time, so the barge-in
+        // listener has to have let go before the next turn re-arms. It is
+        // released here rather than right after the LLM call so the phrase can
         // still be said over a reply that is being voiced.
         bargeInAbortSignal.set(true)
         interruptWatcher.await()
-        return reply
+        return wakeInterruptSignal.get()
     }
+
+    /**
+     * The wake service's view of the shared exchange: every step the engine
+     * reports lands on the card, the notification and the session window the
+     * same way the old inline pipeline drew them.
+     */
+    private inner class WakeExchangeHost : VoiceCallEngine.ExchangeHost {
+        // What the card is showing, kept across turns so an open show always
+        // carries the conversation the user is still reading.
+        var lastRequest = ""
+        var lastReply = ""
+        var lastPaintMs = 0L
+
+        override fun isActive(): Boolean = listening && !stopSignal.get()
+
+        override fun settings() = settingsRepository.settingsFlow.value
+
+        // The service runs hands-free all day, so only the latest turns are
+        // sent - an unbounded history would eventually overflow the model's
+        // context.
+        override fun history(): List<Map<String, String>> =
+            _messages.value.takeLast(MAX_LLM_CONTEXT).map { msg ->
+                mapOf("role" to msg.role.name.lowercase(), "content" to msg.content)
+            }
+
+        override fun onUserMessage(text: String) {
+            _messages.update { current -> current + listOf(ChatMessage.user(text)) }
+            lastRequest = text
+            lastReply = ""
+            lastPaintMs = 0L
+            _phase.value = PHASE_THINKING
+            touchChat()
+            // The window is already up from the moment the phrase was heard,
+            // so the words the user said replace the "I'm listening" card as
+            // soon as they are known - the user can see what was heard while
+            // the answer is being produced.
+            requestSession(SESSION_STATE_REQUEST, text, "")
+        }
+
+        override fun onAssistantMessage(text: String, reasoning: String?) {
+            _messages.update { current ->
+                current + listOf(ChatMessage.assistant(text, reasoning))
+            }
+            lastReply = text
+            // The reply has to reach the user while the app is minimized, so
+            // it travels in the notification as well as on the overlay.
+            updateNotification(text)
+        }
+
+        override fun onPhase(phase: ai.flossyapp.domain.model.VoiceCallPhase) {
+            when (phase) {
+                VoiceCallPhase.SPEAKING -> {
+                    _phase.value = PHASE_SPEAKING
+                    // The card says "Speaking..." while the reply is voiced,
+                    // so the label matches the audio rather than the full
+                    // reply appearing before it has been heard.
+                    requestSession(SESSION_STATE_SPEAKING, lastRequest, lastReply)
+                    // Speaking the reply is activity right up to its last
+                    // syllable, so the close clock is stamped before it
+                    // starts - the next turn's microphone window is measured
+                    // from here, never from mid-audio.
+                    touchChat()
+                }
+                VoiceCallPhase.IDLE -> {
+                    // The reply has been spoken, so the card settles on the
+                    // two bubbles with no status label - a settled exchange is
+                    // just the conversation.
+                    _phase.value = PHASE_LISTENING
+                    requestSession(SESSION_STATE_REPLY, lastRequest, lastReply)
+                }
+                else -> {}
+            }
+        }
+
+        override fun onStreamingContent(text: String) {
+            touchChat()
+            // The answer bubble grows with the stream, throttled so the card
+            // is not re-shown once per token.
+            val now = System.currentTimeMillis()
+            if (now - lastPaintMs >= SESSION_REPAINT_MS) {
+                lastPaintMs = now
+                requestSession(SESSION_STATE_STREAMING, lastRequest, visibleReply(text))
+            }
+        }
+
+        override fun onStreamingReasoning(text: String) {
+            // Reasoning is never drawn on the card.
+        }
+
+        override fun onSystemNote(text: String) {
+            _statusMessage.value = text
+            updateNotification(text)
+        }
+
+        override fun onError(message: String) {
+            _statusMessage.value = message
+            updateNotification(message)
+        }
+    }
+
 
     /**
      * Raise the session window with the card climbing up from the bottom edge.
@@ -980,101 +1106,7 @@ class WakeChatService : VoiceInteractionService() {
         requestSession(SESSION_STATE_CLOSE, "", "", 0f)
     }
 
-    /**
-     * Transcribe a recorded clip with the configured STT endpoint, returning null
-     * on failure and surfacing the reason in [statusMessage].
-     */
-    private suspend fun transcribe(
-        currentSettings: ai.flossyapp.domain.model.AppSettings,
-        wavBytes: ByteArray
-    ): String? {
-        return try {
-            withContext(Dispatchers.IO) {
-                ApiClient.transcribeAudio(
-                    baseUrl = currentSettings.sttBaseUrl,
-                    apiKey = if (currentSettings.sttApiKey.isBlank()) null else currentSettings.sttApiKey,
-                    audioData = wavBytes,
-                    model = currentSettings.sttModelName,
-                    timeoutSeconds = currentSettings.httpTimeoutSeconds.toLong()
-                )
-            }
-        } catch (e: Exception) {
-            android.util.Log.w("WakeChatService", "STT failed: ${e.message}")
-            _statusMessage.value = "STT failed: ${e.message}"
-            // The reason has to reach the user while the app is minimized, so it
-            // travels in the notification as well as on the overlay.
-            updateNotification("STT failed: ${e.message}")
-            null
-        }
-    }
 
-    /**
-     * Ask the LLM endpoint for a reply to [request], using the recent wake-chat history as context.
-     */
-    private suspend fun complete(
-        currentSettings: ai.flossyapp.domain.model.AppSettings,
-        request: String,
-        abortSignal: java.util.concurrent.atomic.AtomicBoolean? = null
-    ): String {
-        // The service runs hands-free all day, so only the latest turns are sent -
-        // an unbounded history would eventually overflow the model's context.
-        val history = _messages.value.takeLast(MAX_LLM_CONTEXT).map { msg ->
-            mapOf("role" to msg.role.name.lowercase(), "content" to msg.content)
-        }
-        // Tools are offered only when the user opted in, because discovery sits on the critical
-        // path of the request: an install that never enabled MCP pays nothing.
-        val toolDescriptors =
-            if (currentSettings.mcpReady) McpClient.advertisedTools(currentSettings.mcpServerUrls, currentSettings.mcpLazyTools)
-            else emptyList()
-        // The answer as it has arrived so far, and when it was last drawn.
-        var streamed = ""
-        var lastPaintMs = 0L
-        return try {
-            ApiClient.chatCompletionWithTools(
-                baseUrl = currentSettings.llmBaseUrl,
-                apiKey = if (currentSettings.llmApiKey.isBlank()) null else currentSettings.llmApiKey,
-                messages = history,
-                model = currentSettings.llmModelName,
-                maxTokens = currentSettings.llmMaxTokens,
-                reasoningBudgetTokens = currentSettings.llmReasoningBudgetTokens,
-                chatTemplateKwargs = currentSettings.llmChatTemplateKwargs,
-                systemPrompt = currentSettings.systemPrompt,
-                toolDescriptors = toolDescriptors,
-                // The answer to a tool call is fetched here so the loop in the API client can
-                // hand the result back to the model and ask again in the same exchange.
-                runTool = { name: String, argumentsJson: String ->
-                    McpClient.runNamedTool(currentSettings.mcpServerUrls, name, argumentsJson)
-                },
-                // Text arriving on the stream is activity on the chat, so the
-                // close clock follows the answer as it is written rather than
-                // waiting for it to finish.
-                onChunk = { chunk ->
-                    touchChat()
-                    // Reasoning deltas carry the separator marker and are never
-                    // drawn; content deltas grow the answer bubble as they arrive,
-                    // throttled to [SESSION_REPAINT_MS] so the card is not
-                    // re-shown once per token.
-                    if (!chunk.startsWith("\u0001")) {
-                        streamed += chunk
-                        val now = System.currentTimeMillis()
-                        if (now - lastPaintMs >= SESSION_REPAINT_MS) {
-                            lastPaintMs = now
-                            requestSession(SESSION_STATE_STREAMING, request, visibleReply(streamed))
-                        }
-                    }
-                },
-                timeoutSeconds = currentSettings.httpTimeoutSeconds.toLong(),
-                // The phrase can be said again while the answer is still being
-                // thought, and the deltas after it are not wanted any more.
-                abortSignal = abortSignal
-            ).content
-        } catch (e: Exception) {
-            android.util.Log.w("WakeChatService", "LLM failed: ${e.message}")
-            _statusMessage.value = "LLM failed: ${e.message}"
-            updateNotification("LLM failed: ${e.message}")
-            ""
-        }
-    }
 
     /**
      * The part of a reply that is safe to draw while it is still arriving.
@@ -1179,6 +1211,7 @@ class WakeChatService : VoiceInteractionService() {
 
     override fun onDestroy() {
         super.onDestroy()
+        isRunning = false
         android.util.Log.d("WakeChatService", "Service destroying - stopping the listening loop")
         connectionWaitingScope.cancel()
         stopListening()

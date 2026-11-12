@@ -159,6 +159,17 @@ class StreamingCallCapture(
     private var restoreRoute: (() -> Unit)? = null
     private var thread: Thread? = null
 
+    /**
+     * Live 32ms chunks of float samples, delivered on the capture thread to
+     * whoever is watching the raw stream - the wake service's barge-in
+     * matcher follows the microphone through a spoken reply this way, without
+     * opening a second recorder. Null while nobody listens. Chunks flow
+     * regardless of the gate: the gate only decides what becomes an
+     * utterance, not what is heard.
+     */
+    @Volatile
+    var chunkListener: ((FloatArray) -> Unit)? = null
+
     /** Opens the route and starts streaming. True when capture is live. */
     fun start(): Boolean {
         val restore = beginCommunicationCapture(context)
@@ -225,6 +236,10 @@ class StreamingCallCapture(
                 val read = rec.read(buffer, 0, buffer.size)
                 if (read <= 0) continue
                 for (i in 0 until read) chunkF[i] = buffer[i] / 32768f
+                // Raw chunks first: a watcher sees the stream even while the
+                // gate is closed, which is how a wake phrase said over a
+                // spoken reply still reaches the matcher.
+                chunkListener?.invoke(chunkF.copyOf(read))
                 val prob = stream.score(chunkF.copyOf(read))
 
                 // While the assistant speaks, this stream hears its own reply:

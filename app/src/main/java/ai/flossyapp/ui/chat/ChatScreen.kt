@@ -42,6 +42,7 @@ import ai.flossyapp.ui.common.isNonSpeechTranscript
 import ai.flossyapp.ui.common.loadPinnedMessages
 import ai.flossyapp.ui.common.playTTSAudio
 import ai.flossyapp.domain.model.DialogMode
+import ai.flossyapp.domain.model.MessageRole
 import ai.flossyapp.domain.model.DialogState
 import ai.flossyapp.domain.model.VoiceCallPhase
 import ai.flossyapp.ui.common.playListenEndCue
@@ -91,31 +92,15 @@ fun ChatScreen(
     var showMenu by remember { mutableStateOf(false) }
     var menuExpanded by remember { mutableStateOf(false) }
     var lastAssistantMessage by remember { mutableStateOf<String?>(null) }
-    var recordedAudioBytes by remember { mutableStateOf<ByteArray?>(null) }
-    var isRecordingActive by remember { mutableStateOf(false) }
-    val recordingStopSignal = java.util.concurrent.atomic.AtomicBoolean(false)
-    // Raised to cut a reply short while it is still being spoken.
+    // Raised to cut a reply short while it is still being spoken - text-chat
+    // TTS only, since a voice call's playback is aborted through the engine.
     val ttsAbortSignal = java.util.concurrent.atomic.AtomicBoolean(false)
-    // Raised when the user ends a call mid-listen, so the half-heard utterance
-    // is discarded instead of sent on to STT.
-    val discardCurrentUtterance = java.util.concurrent.atomic.AtomicBoolean(false)
 
-    // Every coroutine that carries a piece of a voice call - the exchange
-    // pipeline, its re-arms, the spoken prompts. Hanging up cancels them all,
-    // so a call can neither answer nor speak a word after its user ended it.
+    // Every coroutine that carries a piece of a voice call - the spoken cues
+    // and the text-chat TTS. The exchange pipeline itself lives in the shared
+    // VoiceCallEngine, which cancels its own jobs on hang-up.
     val voiceJobs = java.util.concurrent.ConcurrentLinkedQueue<kotlinx.coroutines.Job>()
 
-    // One capture held open for the whole call. The gate says when VAD may
-    // act: closed while the assistant speaks, so the mic never hears its own
-    // reply as an utterance.
-    val captureGate = java.util.concurrent.atomic.AtomicBoolean(true)
-    // Serializes exchanges: one utterance is being carried through STT ->
-    // LLM -> TTS at a time, so replies can never speak over each other.
-    val exchangeRunning = java.util.concurrent.atomic.AtomicBoolean(false)
-    var streamingCapture: ai.flossyapp.ui.common.StreamingCallCapture? = null
-    // Assigned once handleUtterance exists: the capture thread invokes this
-    // to hand an utterance to the screen's pipeline.
-    var onUtteranceReady: ((ByteArray) -> Unit)? = null
     val coroutineScope = rememberCoroutineScope()
 
     /**
@@ -129,12 +114,45 @@ fun ChatScreen(
         return job
     }
     val context = LocalContext.current
-    // The bundled Silero network: speech or not, whatever the device, the
-    // input or the room. Loaded once for the whole screen's lifetime.
-    val sileroVad = remember {
-        ai.flossyapp.ui.common.SileroVad(context.applicationContext)
-    }
     val lazyListState = rememberLazyListState()
+
+    /**
+     * The screen's view of the shared voice-call engine: the pipeline runs in
+     * the engine (one capture, one exchange at a time, STT -> LLM -> TTS), and
+     * this host is how the exchange lands in this chat - bubbles, phases and
+     * streaming partials all through the ChatViewModel.
+     */
+    val voiceCallHost = remember {
+        object : ai.flossyapp.ui.common.VoiceCallEngine.ExchangeHost {
+            override fun isActive(): Boolean = viewModel.dialogState.value.isVoiceCall
+            override fun settings() = settings
+            override fun history(): List<Map<String, String>> =
+                viewModel.messages.value.map { msg ->
+                    mapOf("role" to msg.role.name.lowercase(), "content" to msg.content)
+                }
+            override fun onUserMessage(text: String) { viewModel.addMessage(MessageRole.USER, text) }
+            override fun onAssistantMessage(text: String, reasoning: String?) {
+                viewModel.addMessage(MessageRole.ASSISTANT, text, reasoning)
+            }
+            override fun onPhase(phase: VoiceCallPhase) {
+                // Only forward phases while a call is actually open: the
+                // engine's exchange sets IDLE at its end even when the call
+                // was already hung up, and that must not yank a text chat
+                // back into voice mode.
+                if (viewModel.dialogState.value.isVoiceCall) viewModel.setDialogPhase(phase)
+            }
+            override fun onStreamingContent(text: String) { viewModel.updateStreamingContent(text) }
+            override fun onStreamingReasoning(text: String) { viewModel.updateStreamingReasoning(text) }
+            override fun onSystemNote(text: String) {
+                // SYSTEM-role messages render in the chat but are never sent
+                // to the LLM, so this stays display-only.
+                viewModel.addMessage(MessageRole.SYSTEM, text)
+            }
+            override fun onError(message: String) {
+                android.util.Log.e("ChatScreen", "Voice interaction failed: $message")
+            }
+        }
+    }
 
     // Auto-scroll to bottom when new messages or streaming content arrives
     var ttsPlayedMessageIndex by remember { mutableIntStateOf(-1) }
@@ -228,6 +246,10 @@ fun ChatScreen(
     // the large microphone on the empty-state screen, so both start the same
     // capture and the big icon is not decoration. Tapping either one again ends
     // the recording the same way.
+    // One recording routine shared by the small mic button on the input bar and
+    // the large microphone on the empty-state screen, so both start the same
+    // capture and the big icon is not decoration. Tapping either one again ends
+    // the recording the same way.
     fun startMicRecording(announce: Boolean = true) {
         // A capture is already in flight - the re-arm after a spoken turn hands
         // back to this guard, and the user's own taps must not stack recorders.
@@ -236,11 +258,11 @@ fun ChatScreen(
         // out of it.
         viewModel.setDialogState(DialogMode.VOICE_CALL, VoiceCallPhase.LISTENING)
         ttsAbortSignal.set(false)
-        discardCurrentUtterance.set(false)
-        // The background service would hear the same words and answer a second
-        // time (its replies never reach this chat), so while a voice call is
-        // open the screen owns the microphone. Only an already-running service
-        // is paused - starting one here would raise its foreground notification
+        // The background services would hear the same words and answer a second
+        // time (their replies never reach this chat), so while a voice call is
+        // open the screen owns the microphone - through the shared engine, which
+        // holds one capture for the whole call. Only already-running services
+        // are paused; starting one here would raise its foreground notification
         // for nothing.
         if (ai.flossyapp.service.VoiceAssistantService.isRunning) {
             runCatching {
@@ -252,258 +274,26 @@ fun ChatScreen(
                 )
             }
         }
-        recordedAudioBytes = null
-        recordingStopSignal.set(false)
-
-        // One capture for the whole call: it streams continuously, and each
-        // complete utterance lands here while the stream keeps running, so a
-        // turn begins the instant the previous one ends - no re-arm sleep,
-        // and no re-arm that can silently fail.
+        // The wake-chat service would hear the same words the screen is
+        // answering; with the engine unified there is one capture, so the
+        // service is stopped rather than allowed to open its own recorder.
+        if (ai.flossyapp.service.WakeChatService.isRunning) {
+            runCatching {
+                context.applicationContext.startService(
+                    ai.flossyapp.service.WakeChatService.buildIntent(
+                        context.applicationContext,
+                        ai.flossyapp.service.WakeChatService.ACTION_STOP
+                    )
+                )
+            }
+        }
         launchVoiceJob {
             if (announce) withContext(Dispatchers.IO) { playListenStartCue() }
-            // The call may have ended between the tap and this job's turn on
-            // the queue: a capture opened then would outlive the call, hear
-            // the room (or the reply's own echo) and keep trading utterances
-            // with a person who has already hung up.
-            if (!viewModel.dialogState.value.isVoiceCall || recordingStopSignal.get()) {
-                android.util.Log.d("ChatScreen", "Call ended before capture opened, not starting")
-                return@launchVoiceJob
-            }
-            val capture = ai.flossyapp.ui.common.StreamingCallCapture(
-                context.applicationContext,
-                recordingStopSignal,
-                captureGate,
-                sileroVad
-            ) { clip ->
-                // Invoked on the capture thread: hop to the screen scope and
-                // carry the utterance through STT -> LLM -> TTS as before.
-                onUtteranceReady?.invoke(clip)
-            }
-            streamingCapture = capture
-            withContext(Dispatchers.IO) { capture.start() }
         }
-    }
-
-    // One exchange at a time, and while one runs the gate is closed: the
-    // mic must not hear its own reply as a new utterance. Setting the gate
-    // here, on the exchange's own entry and exit, is race-free - a phase
-    // effect on recomposition can lag a frame and let the reply's first
-    // echo back in as a "new" utterance, which is exactly the overlap two
-    // concurrent exchanges used to produce.
-
-    /**
-     * Carries one complete utterance from the streaming capture through the
-     * exchange: transcribe, answer, speak. Runs as a voice job, so hanging
-     * up cancels it mid-flight.
-     */
-    suspend fun handleUtterance(wavBytes: ByteArray) {
-        // A second utterance while one exchange runs is either self-echo or
-        // the user talking over the reply; both are dropped, and the capture
-        // keeps listening for the next real turn after this one ends.
-        if (!exchangeRunning.compareAndSet(false, true)) {
-            android.util.Log.d("ChatScreen", "Exchange already running, dropping the new utterance")
-            return
-        }
-        captureGate.set(false)
-        try {
-            viewModel.setDialogPhase(VoiceCallPhase.TRANSCRIBING)
-
-            // The user ended the call while this take was still being
-            // heard - the half-captured words are theirs to drop, not
-            // to send on to STT.
-            if (discardCurrentUtterance.get()) {
-                viewModel.endVoiceCall()
-                return
-            }
-
-            val transcribedText = withContext(Dispatchers.IO) {
-                            ai.flossyapp.data.remote.ApiClient.transcribeAudio(
-                                baseUrl = settings.sttBaseUrl,
-                                apiKey = if (settings.sttApiKey.isBlank()) null else settings.sttApiKey,
-                                audioData = wavBytes,
-                                model = settings.sttModelName,
-                                timeoutSeconds = settings.httpTimeoutSeconds.toLong()
-                            )
-                        }
-
-                        // whisper.cpp answers silence with markers like [BLANK_AUDIO]; they must not
-                        // become a user message or reach the LLM (same guard as the other services).
-                        val nonSpeech = isNonSpeechTranscript(transcribedText)
-                        if (nonSpeech) {
-                            android.util.Log.d("ChatScreen", "Ignoring non-speech transcript: $transcribedText")
-                        }
-
-                        if (!nonSpeech && transcribedText.isNotBlank()) {
-                            android.util.Log.d("ChatScreen", "STT result: $transcribedText")
-                            viewModel.addMessage(ai.flossyapp.domain.model.MessageRole.USER, transcribedText)
-                            viewModel.setDialogPhase(VoiceCallPhase.THINKING)
-
-                            var fullResponse = StringBuilder()
-                            var reasoningContent = StringBuilder()
-
-                            withContext(Dispatchers.IO) {
-                                // Include the full conversation history for context
-                                val history = viewModel.messages.value.map { msg ->
-                                    mapOf("role" to msg.role.name.lowercase(), "content" to msg.content)
-                                }
-
-                                ai.flossyapp.data.remote.ApiClient.chatCompletion(
-                                    baseUrl = settings.llmBaseUrl,
-                                    apiKey = if (settings.llmApiKey.isBlank()) null else settings.llmApiKey,
-                                    messages = history,
-                                    model = settings.llmModelName,
-                                    stream = true,
-                                    maxTokens = settings.llmMaxTokens,
-                                    reasoningBudgetTokens = settings.llmReasoningBudgetTokens,
-                                    chatTemplateKwargs = settings.llmChatTemplateKwargs,
-                                    systemPrompt = settings.systemPrompt,
-                                    timeoutSeconds = settings.httpTimeoutSeconds.toLong()
-                                ) { chunk: String ->
-                                    if (chunk.startsWith("\u0001")) {
-                                        reasoningContent.append(chunk.substring(1))
-                                        viewModel.updateStreamingReasoning(reasoningContent.toString())
-                                    } else {
-                                        fullResponse.append(chunk)
-                                        viewModel.updateStreamingContent(fullResponse.toString())
-                                    }
-                                }
-                            }
-
-                            var finalText = fullResponse.toString().trim()
-                            val reasoningText = reasoningContent.toString().trim()
-                            // Hands-free: the user cannot read a screen, so an
-                            // answer worth nothing on the display is still worth
-                            // hearing something from. Speech filtering (forbidden
-                            // characters, emoji) can also leave an otherwise fine
-                            // reply empty - either way, the silence gets a voice.
-                            val speakableText = if (settings.forbidNonLatinTts) finalText.filter { c ->
-                                c.isWhitespace() || c.code < 0x250
-                            }.trim() else finalText
-                            if (viewModel.dialogState.value.isVoiceCall &&
-                                (finalText.isEmpty() || speakableText.isEmpty())) {
-                                android.util.Log.d("ChatScreen", "LLM gave nothing speakable (${finalText.length} chars raw), filling with a spoken fallback")
-                                finalText = "Hmm, I'm not sure what to say to that."
-                            }
-                            android.util.Log.d("ChatScreen", "Voice LLM response: ${finalText.length} chars, reasoning: ${reasoningText.length} chars")
-
-                            withContext(Dispatchers.Main) {
-                                if (finalText.isNotEmpty()) {
-                                    viewModel.addMessage(
-                                        ai.flossyapp.domain.model.MessageRole.ASSISTANT,
-                                        finalText,
-                                        if (reasoningText.isNotEmpty()) reasoningText else null
-                                    )
-                                } else {
-                                    Toast.makeText(context, "No response from LLM", Toast.LENGTH_SHORT).show()
-                                }
-                                // Clear streaming state AFTER the final message is added
-                                viewModel.updateStreamingContent("")
-                                if (reasoningText.isNotEmpty()) {
-                                    viewModel.updateStreamingReasoning("")
-                                }
-                                // A voice call speaks its own reply here,
-                                // inside the exchange: the gate must not
-                                // reopen until the speaker has actually
-                                // finished, so the capture can never hear its
-                                // own output. (The auto-TTS effect used to
-                                // carry this playback in a separate job, which
-                                // let the exchange return - and the gate
-                                // re-open - while the reply was still on the
-                                // speaker.)
-                                if (viewModel.dialogState.value.isVoiceCall && finalText.isNotEmpty()) {
-                                    viewModel.setDialogPhase(VoiceCallPhase.SPEAKING)
-                                    try {
-                                        ttsAbortSignal.set(false)
-                                        playTTSAudio(
-                                            finalText,
-                                            Pair(settings.ttsBaseUrl, if (settings.ttsApiKey.isBlank()) null else settings.ttsApiKey),
-                                            model = settings.ttsModelName,
-                                            voice = settings.ttsVoiceName,
-                                            responseFormat = settings.ttsResponseFormat,
-                                            enableStreaming = settings.enableTtsStreaming,
-                                            timeoutSeconds = settings.httpTimeoutSeconds.toLong(),
-                                            forbidNonLatin = settings.forbidNonLatinTts,
-                                            abortSignal = ttsAbortSignal,
-                                            onTtsTooSlow = {
-                                                viewModel.addMessage(ai.flossyapp.domain.model.MessageRole.SYSTEM,
-                                                    "The TTS server or connection is too slow for real-time speech.")
-                                                launchVoiceJob { ai.flossyapp.ui.common.playWaitingCue() }
-                                            }
-                                        )
-                                    } finally {
-                                        viewModel.setDialogPhase(VoiceCallPhase.IDLE)
-                                    }
-                                }
-                                viewModel.setDialogPhase(VoiceCallPhase.IDLE)
-                            }
-                        } else {
-                            // Nothing intelligible came back: hands-free means
-                            // spoken, not printed - the screen may be off or
-                            // away, so a toast would never be seen.
-                            withContext(Dispatchers.Main) {
-                                viewModel.setDialogPhase(VoiceCallPhase.IDLE)
-                            }
-                            if (viewModel.dialogState.value.isVoiceCall) {
-                                // Spoken inside the exchange, like the reply:
-                                // the gate stays shut until the prompt has
-                                // finished, so the capture cannot hear it.
-                                ttsAbortSignal.set(false)
-                                if (viewModel.dialogState.value.isVoiceCall) viewModel.setDialogPhase(VoiceCallPhase.SPEAKING)
-                                try {
-                                    playTTSAudio(
-                                        "Sorry, I misheard you. Please repeat.",
-                                        Pair(settings.ttsBaseUrl, if (settings.ttsApiKey.isBlank()) null else settings.ttsApiKey),
-                                        model = settings.ttsModelName,
-                                        voice = settings.ttsVoiceName,
-                                        responseFormat = settings.ttsResponseFormat,
-                                        enableStreaming = settings.enableTtsStreaming,
-                                        timeoutSeconds = settings.httpTimeoutSeconds.toLong(),
-                                        forbidNonLatin = settings.forbidNonLatinTts,
-                                        abortSignal = ttsAbortSignal
-                                    )
-                                } finally {
-                                    if (viewModel.dialogState.value.isVoiceCall) viewModel.setDialogPhase(VoiceCallPhase.IDLE)
-                                }
-                            }
-                        }
-                    } catch (e: java.util.concurrent.CancellationException) {
-                        // Hanging up cancelled this job on purpose - falling
-                        // through to the error toast would greet the person
-                        // who just ended the call with an error popup.
-                        throw e
-                    } catch (e: Exception) {
-                        withContext(Dispatchers.Main) {
-                            viewModel.setDialogPhase(VoiceCallPhase.IDLE)
-                            android.util.Log.e("ChatScreen", "Voice interaction failed", e)
-                            Toast.makeText(context.applicationContext, "Error: ${e.message}", Toast.LENGTH_LONG).show()
-                        }
-                    }
-        finally {
-            exchangeRunning.set(false)
-            // Reopen only if the call is still on and nothing is speaking; a
-            // hung-up call has a closed capture, and a closed gate cannot
-            // hear anything. Checking the phase too keeps the gate shut for
-            // as long as the speaker is audible, whatever path spoke.
-            val d = viewModel.dialogState.value
-            captureGate.set(d.isVoiceCall && !d.isSpeaking)
-        }
-    }
-    // The capture thread has no Compose scope: it calls through this
-    // property, which launchVoiceJob hops back onto the screen's scope.
-    onUtteranceReady = { clip ->
-        launchVoiceJob { handleUtterance(clip) }
-    }
-
-    /**
-     * Ends an in-flight recording and lets its VAD stop send the clip on.
-     */
-    fun stopMicRecording() {
-        android.util.Log.d("ChatScreen", "Manual stop recording requested")
-        // Set unconditionally: the capture may still be *opening* (its job
-        // queued behind the hang-up), and a signal set before it checks is
-        // the only thing standing between it and a capture that outlives
-        // the call.
-        recordingStopSignal.set(true)
+        // The engine owns the capture and the exchange pipeline from here:
+        // every complete utterance arrives at voiceCallHost as one exchange.
+        ai.flossyapp.ui.common.VoiceCallEngine.instance(context.applicationContext)
+            .startAppMode(voiceCallHost)
     }
 
     /**
@@ -517,17 +307,12 @@ fun ChatScreen(
         // and the spoken output all fall away together.
         viewModel.endVoiceCall()
         ttsAbortSignal.set(true)
-        discardCurrentUtterance.set(true)
-        stopMicRecording()
-        // Close the persistent capture: its thread ends with the call.
-        streamingCapture?.stop()
-        streamingCapture = null
-        // Cancel every coroutine still carrying the call - the exchange
-        // pipeline, its re-arms, any spoken prompt it was about to give - so
-        // nothing can transcribe, answer, or speak after the user hung up.
-        // The abort signal above only silences what is already on the speaker;
-        // the cancellations stop the rest of the pipeline that hasn't spoken
-        // yet.
+        // Hand the microphone back: the engine closes the shared capture,
+        // cancels its exchange jobs and aborts any playback still running.
+        ai.flossyapp.ui.common.VoiceCallEngine.instance(context.applicationContext).stop()
+        // Cancel every coroutine still carrying the call on the screen side -
+        // the spoken cues, any text-chat TTS - so nothing can speak after the
+        // user hung up.
         for (job in voiceJobs) job.cancel()
         // The downbeat is the call's closing sound - it plays once, here,
         // never between the turns inside the call.
@@ -708,7 +493,7 @@ fun ChatScreen(
                     onInputFocused = {
                         // Typing and voice capture are two ways of saying the same
                         // thing; the keyboard taking focus means the recording ends.
-                        if (viewModel.dialogState.value.isListening) stopMicRecording()
+                        if (viewModel.dialogState.value.isListening) stopVoiceCall()
                     },
                     onSendText = { text ->
                         if (text.isNotBlank()) {
