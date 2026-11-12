@@ -156,8 +156,6 @@ class VoiceAssistantService : Service() {
     // Audio playback
     private var audioTrack: android.media.AudioTrack? = null
     
-    // TTS speech queue - FIFO queue for pending speech text
-    private val ttsSpeechQueue = java.util.concurrent.ConcurrentLinkedQueue<String>()
     @Volatile
     private var isTtsPlaying = false
     
@@ -877,36 +875,23 @@ class VoiceAssistantService : Service() {
                 // Check network before TTS call
                 if (!checkNetworkAndHandle()) return
                 
+                // One speech seam for the whole app: playTTSAudio applies the
+                // same speakableText filter (markdown asterisks, emoji, foreign
+                // scripts) the engine and the chat screen speak through, so no
+                // path can hand the TTS characters it reads out loud.
                 try {
-                    val ttsBaseUrl = currentSettings.ttsBaseUrl
-                    val audioBytes = try {
-                        executeWithRetry(
-                            operationName = "TTS",
-                            maxRetries = MAX_RETRIES,
-                            delayMs = RETRY_DELAY_MS
-                        ) {
-                            ApiClient.synthesizeSpeech(
-                                baseUrl = ttsBaseUrl,
-                                apiKey = currentSettings.ttsApiKey,
-                                text = responseText,
-                                model = currentSettings.ttsModelName,
-                                voice = currentSettings.ttsVoiceName,
-                                responseFormat = currentSettings.ttsResponseFormat,
-                                timeoutSeconds = currentSettings.httpTimeoutSeconds.toLong()
-                            )
-                        }
-                    } catch (e: Exception) {
-                        throw RuntimeException("TTS failed after $MAX_RETRIES retries: ${e.message}")
-                    }
-                    
-                    playAudio(audioBytes)
+                    ai.flossyapp.ui.common.playTTSAudio(
+                        responseText,
+                        Pair(currentSettings.ttsBaseUrl, if (currentSettings.ttsApiKey.isBlank()) null else currentSettings.ttsApiKey),
+                        model = currentSettings.ttsModelName,
+                        voice = currentSettings.ttsVoiceName,
+                        responseFormat = currentSettings.ttsResponseFormat,
+                        enableStreaming = currentSettings.enableTtsStreaming,
+                        timeoutSeconds = currentSettings.httpTimeoutSeconds.toLong(),
+                        forbidNonLatin = currentSettings.forbidNonLatinTts
+                    )
                 } catch (e: Exception) {
                     handleError("TTS failed: ${e.message}")
-                }
-                
-                // Process next queued speech after playback completes
-                serviceScope.launch {
-                    processNextQueuedSpeech()
                 }
                 
                 // Return to listening mode if continuous conversation is enabled
@@ -991,84 +976,6 @@ class VoiceAssistantService : Service() {
             ai.flossyapp.ui.common.playAudioBytes(audioBytes)
         } finally {
             isTtsPlaying = false
-        }
-    }
-
-    /**
-     * Queue speech text for TTS playback. If TTS is currently playing,
-     * the new text is added to a FIFO queue and will be played after
-     * the current speech completes.
-     */
-    private fun queueSpeechForTts(text: String) {
-        ttsSpeechQueue.add(text)
-        android.util.Log.d("VoiceAssistantService", "Queued TTS speech (${ttsSpeechQueue.size} items in queue)")
-    }
-
-    /**
-     * Process the next item in the TTS speech queue.
-     * Synthesizes and plays the queued text, then recursively processes
-     * the next item if there are more queued.
-     */
-    private suspend fun processNextQueuedSpeech() {
-        val nextText = ttsSpeechQueue.poll()
-        if (nextText.isNullOrEmpty()) {
-            isTtsPlaying = false
-            return
-        }
-
-        isTtsPlaying = true
-        _state.value = STATE_SPEAKING
-        updateNotification("Speaking...")
-
-        try {
-            val currentSettings = settingsRepository.loadSettings()
-            
-            if (!checkNetworkAndHandle()) {
-                // If no network, skip this item and process next
-                isTtsPlaying = false
-                serviceScope.launch {
-                    delay(500L)
-                    processNextQueuedSpeech()
-                }
-                return
-            }
-
-            val audioBytes = try {
-                executeWithRetry(
-                    operationName = "TTS-Queue",
-                    maxRetries = MAX_RETRIES,
-                    delayMs = RETRY_DELAY_MS
-                ) {
-                    ApiClient.synthesizeSpeech(
-                        baseUrl = currentSettings.ttsBaseUrl,
-                        apiKey = currentSettings.ttsApiKey,
-                        text = nextText,
-                        model = currentSettings.ttsModelName,
-                        voice = currentSettings.ttsVoiceName,
-                        responseFormat = currentSettings.ttsResponseFormat,
-                        timeoutSeconds = currentSettings.httpTimeoutSeconds.toLong()
-                    )
-                }
-            } catch (e: Exception) {
-                android.util.Log.e("VoiceAssistantService", "TTS queue failed for queued message: ${e.message}")
-                isTtsPlaying = false
-                serviceScope.launch {
-                    delay(500L)
-                    processNextQueuedSpeech()
-                }
-                return
-            }
-
-            playAudio(audioBytes)
-        } catch (e: Exception) {
-            android.util.Log.e("VoiceAssistantService", "TTS queue processing error: ${e.message}")
-            isTtsPlaying = false
-        }
-
-        // Process next item in queue after this one completes
-        serviceScope.launch {
-            delay(200L) // Brief pause between queued messages
-            processNextQueuedSpeech()
         }
     }
 
