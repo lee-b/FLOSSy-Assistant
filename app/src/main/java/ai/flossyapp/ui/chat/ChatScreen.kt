@@ -161,6 +161,11 @@ fun ChatScreen(
             }
             override fun onError(message: String) {
                 android.util.Log.e("ChatScreen", "Voice interaction failed: $message")
+                // The failure is part of the conversation: the user asked for
+                // something and got nothing, so the reason belongs in the chat
+                // itself - not only in logcat, which is what the endless
+                // waiting cues with no explanation used to be.
+                viewModel.addMessage(MessageRole.SYSTEM, "The request failed: $message")
             }
         }
     }
@@ -1010,6 +1015,13 @@ internal fun MessageBubble(
                         }
                     }
                 }
+            }
+
+            // The tool calls this assistant turn made: one compact row per
+            // call, tap to expand the input and the output. Drawn from the
+            // shared bubble kit, so the wake card shows the same rows.
+            if (!isUser && message.toolCalls != null) {
+                ai.flossyapp.ui.common.ToolCallRows(toolCalls = message.toolCalls)
             }
 
             // Read aloud button - only show for assistant messages

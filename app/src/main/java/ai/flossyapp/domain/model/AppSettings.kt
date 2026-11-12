@@ -66,30 +66,35 @@ data class AppSettings(
     val forbidNonLatinTts: Boolean = true,
 
     // MCP tool servers (Model Context Protocol over streamable HTTP, no stdio).
+    // Kept only to upgrade an old install into tool instances: the Tools tab
+    // edits the structured document below instead, and the flat fields are not
+    // read once "tools_config" exists on disk.
     val enableMcpTools: Boolean = false,
-    // One server endpoint per line. Their tools are offered to the model, which is
-    // what lets it answer "what time is it" from a clock tool instead of guessing.
+    // One server endpoint per line.
     val mcpServerUrls: String = "",
-    // Offer one meta-tool that names a server tool as an argument instead of
-    // putting every schema in the request, which keeps a large tool list out of
-    // the context window.
-    val mcpLazyTools: Boolean = true,
-    
+
+    // The structured tool configuration: internal handlers, search engines and
+    // MCP servers, each an instance with its own switch and settings. Serialized
+    // by ToolsConfig; blank means the migration has not run yet.
+    val toolsConfig: String = "",
+
     // System Prompt - the language rule is part of the shipped default, named
     // by the device's own locale, not by whatever the conversation is in.
     // The prompt is sent verbatim, so its formatting matters: a previous
     // version prefixed every line with a literal '|' (raw-string leftovers),
     // and that strange wall of pipes is exactly the kind of noise that made
     // a Chinese-trained model slip into Chinese despite the language line.
+    // The default is the prompt the user has tuned on their own device; it
+    // is carried in code so a fresh install and a factory reset land on it.
     val systemPrompt: String = """
-You are FLOSSyAssistant, running on the user's Android device.
-Respond in $userLanguage only, unless the user explicitly asks for another language. Never output characters from other scripts.
+You are Jarvis, a helpful assistant running on the user's Android device.
+Respond in English only, unless the user explicitly asks for another language. Maintain brief, natural conversational dialog, suitable for voice calls. Always remember that the user is communicating with you via phone keyboard and imperfect ASR, and do your best to interpret the dialog you receive as coherent English.
 Answer in one or two short sentences, in plain words that will be read aloud.
-Give the answer directly: do not explain your reasoning, list steps, repeat the question or greet the user.
-Never use markdown, bullet points, numbering or emoji.
+Give the answer directly: do not explain your reasoning, list steps, repeat the question or greet the user. Do not be lazy; do not suggest that the user try other solutions if the user requested you to act.
+Never use markdown, bullet points, numbering, emoji or other output which would be awkwardly pronounced by a TTS model unless explicitly requested.
 If you are unsure or cannot help, say so honestly in one short sentence.""".trim() + "\n",
     // Wake Word Configuration
-    val wakeWordName: String = "hey assistant",
+    val wakeWordName: String = "hey jarvis",
     val wakeWordSensitivity: Float = 0.5f,
     val enableWakeWordDetection: Boolean = true,
     // How long the app waits for the request once the wake phrase has matched.
@@ -130,6 +135,14 @@ If you are unsure or cannot help, say so honestly in one short sentence.""".trim
     // Localization
     val preferredLocale: String = "" // empty = use system default
 ) {
+    /** Every tool instance the Tools tab lists, in the order the user arranged. */
+    val toolInstances: List<ToolInstance>
+        get() = ToolsConfig.fromJson(toolsConfig).instances
+
+    /** True when at least one enabled tool is fully configured. */
+    val toolsReady: Boolean
+        get() = toolInstances.any { it.enabled && it.configured }
+
     /**
      * True while every base URL is still the shipped placeholder. Nothing can work in that
      * state, so the Settings screen shows a "configure endpoints" prompt instead of letting

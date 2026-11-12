@@ -107,6 +107,11 @@ dependencies {
     implementation(libs.accompanist.permissions)
 
     // Testing
+    // The android.jar org.json stubs answer null for every call under
+    // isReturnDefaultValues, so a real implementation rides the test
+    // classpath: the tool document the app serializes with org.json is
+    // then testable on the JVM exactly as it will run on the device.
+    testImplementation("org.json:json:20240303")
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)

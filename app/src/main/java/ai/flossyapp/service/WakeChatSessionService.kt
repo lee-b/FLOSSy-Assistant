@@ -27,6 +27,7 @@ import ai.flossyapp.ui.theme.WAKE_PHASE_THINKING
 import ai.flossyapp.ui.theme.WAKE_PHASE_ANSWERING
 import ai.flossyapp.ui.theme.WAKE_DIVIDER
 import ai.flossyapp.ui.wake.WakeCardContent
+import ai.flossyapp.domain.model.ToolCallRecord
 import ai.flossyapp.ui.wake.WakeCardSnapshot
 import ai.flossyapp.ui.wake.WakeCardState
 import androidx.compose.ui.platform.ComposeView
@@ -80,6 +81,14 @@ const val SESSION_STATE_KEY = "state"
  * is handed.
  */
 const val SESSION_ANIM_KEY = "anim"
+
+/**
+ * The tool calls of the current exchange, carried into the session as one
+ * JSON document (the same wire the other keys use). The card draws one
+ * compact row per call with tap-to-expand input and output, so the tool
+ * step between question and answer is visible hands-free too.
+ */
+const val SESSION_TOOLCALLS_KEY = "tool_calls"
 
 /**
  * The window is being raised and the card is still climbing from the bottom edge.
@@ -517,6 +526,13 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
     private var reply = ""
 
     /**
+     * The exchange's tool calls, parsed from the service's JSON document at
+     * each show. The card draws one compact row per call; tap-to-expand is
+     * the shared kit's own behaviour.
+     */
+    private val toolCalls = mutableListOf<ToolCallRecord>()
+
+    /**
      * How far through the climb or sink the next show is, from "0" at the bottom
      * edge to "1" settled at rest.
      *
@@ -610,6 +626,22 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
         state = args.getString(SESSION_STATE_KEY) ?: ""
         request = args.getString(SESSION_REQUEST_KEY) ?: ""
         reply = args.getString(SESSION_REPLY_KEY) ?: ""
+        // The tool calls arrive as one JSON document; a corrupt one costs
+        // nothing but the rows, never the card itself.
+        toolCalls.clear()
+        runCatching {
+            val doc = org.json.JSONArray(args.getString(SESSION_TOOLCALLS_KEY) ?: "[]")
+            for (i in 0 until doc.length()) {
+                val node = doc.getJSONObject(i)
+                toolCalls.add(
+                    ToolCallRecord(
+                        name = node.optString("name"),
+                        arguments = node.optString("arguments"),
+                        result = node.optString("result")
+                    )
+                )
+            }
+        }.onFailure { android.util.Log.w("WakeChatSession", "Tool calls unread: ${it.message}") }
         riseProgress = settledProgress(args.getString(SESSION_ANIM_KEY))
         rescale()
         // The bubbles are Compose now, so they wrap themselves; the line counts
@@ -839,6 +871,7 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
             chipColor = ink(phaseColor()),
             request = request,
             reply = reply,
+            toolCalls = toolCalls.toList(),
             streaming = state == SESSION_STATE_STREAMING,
             pose = pose(),
             alpha = riseProgress,
@@ -1119,6 +1152,7 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
         state = ""
         request = ""
         reply = ""
+        toolCalls.clear()
         riseProgress = 0f
         measuredShortEdge = 0
         scale = 1f

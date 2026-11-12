@@ -1,7 +1,7 @@
 package ai.flossyapp.ui.common
 
 import ai.flossyapp.data.remote.ApiClient
-import ai.flossyapp.data.remote.McpClient
+import ai.flossyapp.data.tools.ToolRegistry
 import ai.flossyapp.domain.model.AppSettings
 import ai.flossyapp.domain.model.VoiceCallPhase
 import ai.flossyapp.ui.common.playWaitingCue
@@ -70,6 +70,14 @@ class VoiceCallEngine private constructor(context: Context?) {
             }
         }
 
+        // Whether the app's own activity is in the foreground. The wake
+        // service reads this to stay quiet while the app is on screen: the
+        // wake word must not start an exchange, and the popup must not be
+        // drawn over an app the user is looking at. MainActivity keeps it
+        // current from its own lifecycle callbacks.
+        @Volatile
+        var isAppOnScreen: Boolean = false
+
         /**
          * Test-only construction: the engine's state machine is android-free,
          * so the unit suite builds instances without a context and never
@@ -95,8 +103,9 @@ class VoiceCallEngine private constructor(context: Context?) {
             AppSettings,
             List<Map<String, String>>,
             ((String) -> Unit)?,
-            java.util.concurrent.atomic.AtomicBoolean?
-        ) -> String = { s, messages, onChunk, abort ->
+            java.util.concurrent.atomic.AtomicBoolean?,
+            (() -> Unit)?
+        ) -> String = { s, messages, onChunk, abort, onEndCall ->
             ApiClient.chatCompletionWithTools(
                 baseUrl = s.llmBaseUrl,
                 apiKey = if (s.llmApiKey.isBlank()) null else s.llmApiKey,
@@ -107,14 +116,20 @@ class VoiceCallEngine private constructor(context: Context?) {
                 reasoningBudgetTokens = s.llmReasoningBudgetTokens,
                 chatTemplateKwargs = s.llmChatTemplateKwargs,
                 systemPrompt = s.systemPrompt,
-                toolDescriptors = if (s.mcpReady) McpClient.advertisedTools(s.mcpServerUrls, s.mcpLazyTools) else emptyList(),
+                // Every tool - internal handlers, search engines and MCP
+                // servers - flows through the one registry seam.
+                toolDescriptors = ToolRegistry.advertisedTools(s, onEndCall),
                 runTool = { name: String, argumentsJson: String ->
-                    McpClient.runNamedTool(s.mcpServerUrls, name, argumentsJson)
+                    ToolRegistry.runNamedTool(s, name, argumentsJson, onEndCall)
                 },
                 abortSignal = abort,
                 timeoutSeconds = s.httpTimeoutSeconds.toLong(),
                 onChunk = onChunk
-            ).content ?: ""
+            // No `?: ""` here: a reply the server did not produce is an
+            // error condition, not an empty success. A failure throws to the
+            // exchange, which reports it through the host - the caller is
+            // never handed a blank string dressed up as an answer.
+            ).content
         }
         internal var ttsRunner: suspend (
             String,
@@ -496,6 +511,12 @@ class VoiceCallEngine private constructor(context: Context?) {
         // left the flag (and the closed capture gate) latched forever, and
         // every later utterance was silently dropped.
         val job = jobScope.launch {
+            // Declared before the try so the finally can reach it: a Job
+            // cannot complete while an active child runs, so an infinite
+            // waiting-cue that is never cancelled holds the whole exchange
+            // alive - and kept the ticks playing long after a failed tool
+            // round had ended the real work.
+            var waitingCue: kotlinx.coroutines.Job? = null
             if (!exchangeMutex.tryLock()) {
                 log("Exchange already running, dropping the new utterance", level="d")
                 return@launch
@@ -536,7 +557,7 @@ class VoiceCallEngine private constructor(context: Context?) {
                     // this exchange, so it dies with the exchange - cancelled
                     // the moment speech starts (or the exchange fails), and
                     // silent for fast replies inside the grace window.
-                    val waitingCue = launch {
+                    waitingCue = launch {
                         delay(WAITING_CUE_GRACE_MS)
                         while (true) {
                             waitingCueRunner()
@@ -547,11 +568,14 @@ class VoiceCallEngine private constructor(context: Context?) {
                     val fullResponse = StringBuilder()
                     val reasoningContent = StringBuilder()
 
-                    // Tools are offered only when the user opted in, because
-                    // discovery sits on the critical path of the request: an
-                    // install that never enabled MCP pays nothing. The same
-                    // call serves both owners, so the wake service keeps its
-                    // tool access and the screen keeps its plain path.
+                    // Tools are offered only when at least one instance is
+                    // enabled and configured, because discovery sits on the
+                    // critical path of the request: an install that never
+                    // enabled a tool pays nothing. The same call serves both
+                    // owners, so the wake service keeps its tool access and
+                    // the screen keeps its plain path. The model can end the
+                    // call itself ("end_call"), and it goes through the same
+                    // deliberate hang-up every surface uses.
                     withContext(Dispatchers.IO) {
                         llmRunner(settings, host.history(), { chunk: String ->
                             if (chunk.startsWith("\u0001")) {
@@ -561,7 +585,7 @@ class VoiceCallEngine private constructor(context: Context?) {
                                 fullResponse.append(chunk)
                                 host.onStreamingContent(fullResponse.toString())
                             }
-                        }, ttsAbort)
+                        }, ttsAbort) { hangUp("model asked to end the call") }
                     }
 
                     var finalText = fullResponse.toString().trim()
@@ -571,9 +595,13 @@ class VoiceCallEngine private constructor(context: Context?) {
                     // something from. Speech filtering (forbidden characters,
                     // emoji) can also leave an otherwise fine reply empty -
                     // either way, the silence gets a voice.
-                    val speakableText = if (settings.forbidNonLatinTts) finalText.filter { c ->
-                        c.isWhitespace() || c.code < 0x250
-                    }.trim() else finalText
+                    // The same filter the synthesis itself applies, so the
+                    // "nothing speakable" check agrees with what the TTS will
+                    // actually be handed - an answer that survives the speech
+                    // whitelist is spoken, one that does not is replaced.
+                    val speakableText = if (settings.forbidNonLatinTts) {
+                        ai.flossyapp.ui.common.speakableText(finalText)
+                    } else finalText
                     if (finalText.isEmpty() || speakableText.isEmpty()) {
                         log("LLM gave nothing speakable (${finalText.length} chars raw), filling with a spoken fallback")
                         finalText = "Hmm, I'm not sure what to say to that."
@@ -591,7 +619,7 @@ class VoiceCallEngine private constructor(context: Context?) {
                         // Speech has arrived, so the thinking ticks have done
                         // their job - they stop before the first syllable,
                         // never over the reply.
-                        waitingCue.cancel()
+                        waitingCue?.cancel()
                         host.onPhase(VoiceCallPhase.SPEAKING)
                         try {
                             ttsAbortSignal.set(false)
@@ -628,6 +656,10 @@ class VoiceCallEngine private constructor(context: Context?) {
                 host.onPhase(VoiceCallPhase.IDLE)
                 host.onError(e.message ?: "unknown error")
             } finally {
+                // The cue dies with the exchange on every path, not only the
+                // one that reaches speech: a swallowed failure must never
+                // leave the ticks playing after the work is gone.
+                waitingCue?.cancel()
                 // Reopen only if the call is still on; a hung-up call has a
                 // closed capture, and a closed gate cannot hear anything.
                 // The engine's own call flag is the arbiter here, not the

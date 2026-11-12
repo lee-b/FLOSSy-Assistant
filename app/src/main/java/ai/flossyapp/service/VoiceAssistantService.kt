@@ -22,7 +22,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationCompat.Builder
 import ai.flossyapp.FlossyApplication
 import ai.flossyapp.data.remote.ApiClient
-import ai.flossyapp.data.remote.McpClient
+import ai.flossyapp.data.tools.ToolRegistry
 import ai.flossyapp.ui.common.preferredCaptureDevice
 import ai.flossyapp.ui.common.isNonSpeechTranscript
 import ai.flossyapp.ui.common.playListenEndCue
@@ -300,25 +300,40 @@ class VoiceAssistantService : Service() {
             ACTION_STOP -> serviceScope.launch { stopListening() }
             ACTION_PAUSE -> serviceScope.launch { pauseService() }
             ACTION_RESUME -> serviceScope.launch { resumeService() }
-            ACTION_END_CALL -> {
-                // Off the main thread: stopListening() waits for TTS and joins
-                // the recording thread, and doing that here froze the input
-                // dispatch long enough to ANR the app.
-                serviceScope.launch {
-                    // One deliberate hang-up, one arbiter: the engine ends
-                    // the call wherever it lives (TTS stops immediately),
-                    // and the event still reaches the screen's view.
-                    ai.flossyapp.ui.common.VoiceCallEngine.instance(applicationContext)
-                        .hangUp("assistant service End call")
-                    hangUpEvents.tryEmit(Unit)
-                    stopListening()
-                    stopForeground(android.app.Service.STOP_FOREGROUND_REMOVE)
-                    stopSelf()
-                }
-            }
+            ACTION_END_CALL -> endCallAndStop()
         }
-        
+
         return START_STICKY
+    }
+
+    /**
+     * The one deliberate end point of this service's interaction, shared by
+     * the notification action and the model's own "end_call" tool.
+     *
+     * Off the main thread: stopListening() waits for TTS and joins the
+     * recording thread, and doing that here froze the input dispatch long
+     * enough to ANR the app.
+     */
+    private fun endCallAndStop() {
+        serviceScope.launch {
+            // One deliberate hang-up, one arbiter: the engine ends
+            // the call wherever it lives (TTS stops immediately),
+            // and the event still reaches the screen's view.
+            ai.flossyapp.ui.common.VoiceCallEngine.instance(applicationContext)
+                .hangUp("assistant service End call")
+            hangUpEvents.tryEmit(Unit)
+            stopListening()
+            stopForeground(android.app.Service.STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
+    }
+
+    /**
+     * What the model's "end_call" tool does: the same end point, invoked
+     * from inside a running exchange instead of from the notification.
+     */
+    private fun endCallFromTool() {
+        endCallAndStop()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -834,11 +849,15 @@ class VoiceAssistantService : Service() {
                         reasoningBudgetTokens = currentSettings.llmReasoningBudgetTokens,
                         chatTemplateKwargs = currentSettings.llmChatTemplateKwargs,
                         systemPrompt = currentSettings.systemPrompt,
-                        toolDescriptors = if (currentSettings.mcpReady) McpClient.advertisedTools(currentSettings.mcpServerUrls, currentSettings.mcpLazyTools) else emptyList(),
+                        // Every tool - internal handlers, search engines and
+                        // MCP servers - flows through the one registry seam;
+                        // "end_call" ends this interaction the same way the
+                        // notification's End call does.
+                        toolDescriptors = ToolRegistry.advertisedTools(currentSettings) { endCallFromTool() },
                         // The answer to a tool call is fetched here so the loop in the API client
                         // can hand the result back to the model and ask again in the same exchange.
                         runTool = { name: String, argumentsJson: String ->
-                            McpClient.runNamedTool(currentSettings.mcpServerUrls, name, argumentsJson)
+                            ToolRegistry.runNamedTool(currentSettings, name, argumentsJson) { endCallFromTool() }
                         },
                         timeoutSeconds = currentSettings.httpTimeoutSeconds.toLong()
                     )

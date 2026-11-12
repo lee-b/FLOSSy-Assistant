@@ -82,8 +82,133 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     private val enrollmentSilenceMs = 1000L
     private val enrollmentNoSpeechMs = 5000L
 
-    private val _settings = MutableStateFlow(repository.loadSettings())
+    // Two copies of the settings: what is persisted (committed) and what the
+    // screen is editing (the draft). Every field change lands in the draft
+    // only, so the bottom bar can apply, undo, reset or cancel the whole tab
+    // set as one act instead of persisting a half-finished edit.
+    private val _committed = MutableStateFlow(repository.loadSettings())
+    private val _settings = MutableStateFlow(_committed.value)
     val settings: StateFlow<ai.flossyapp.domain.model.AppSettings> = _settings.asStateFlow()
+
+    /** The settings as last applied to disk; the draft reverts here on undo/cancel. */
+    val committedSettings: StateFlow<ai.flossyapp.domain.model.AppSettings> = _committed.asStateFlow()
+
+    /** The settings a fresh install ships with, tools included. */
+    private fun shippedDefaults() = ai.flossyapp.domain.model.AppSettings()
+        .copy(toolsConfig = ai.flossyapp.domain.model.ToolsConfig.default().toJson())
+
+    /**
+     * Persists the draft and makes it the new committed state.
+     */
+    fun applyEdits() {
+        repository.updateSettings(_settings.value)
+        _committed.value = _settings.value
+    }
+
+    /**
+     * Throws away every unapplied edit.
+     */
+    fun undoEdits() {
+        _settings.value = _committed.value
+    }
+
+    /**
+     * Puts the shipped defaults in the draft; nothing is written until Apply.
+     */
+    fun resetEdits() {
+        _settings.value = shippedDefaults()
+    }
+
+    /**
+     * Cancels editing: the draft returns to what is persisted, without a write.
+     */
+    fun cancelEdits() {
+        _settings.value = _committed.value
+    }
+
+    /** True while the draft differs from what is persisted. */
+    fun hasUnappliedEdits(): Boolean = _settings.value != _committed.value
+
+    // ==================== Tool instance management ====================
+
+    /**
+     * Rewrites the tool document in the draft with one transform applied.
+     */
+    private fun mutateTools(transform: (MutableList<ai.flossyapp.domain.model.ToolInstance>) -> Unit) {
+        _settings.update { current ->
+            val config = ai.flossyapp.domain.model.ToolsConfig.fromJson(current.toolsConfig)
+            val instances = config.instances.toMutableList()
+            transform(instances)
+            current.copy(toolsConfig = ai.flossyapp.domain.model.ToolsConfig(instances).toJson())
+        }
+    }
+
+    /**
+     * Adds one tool instance of a supported type. A single-instance type can
+     * be present only once; a multi-instance type (search engines, MCP
+     * servers) can be added again and again. The new instance starts off and
+     * unconfigured, so its enable check is ghosted until its settings are in.
+     */
+    fun addToolInstance(type: String) {
+        val spec = ai.flossyapp.domain.model.ToolTypes.byType(type) ?: return
+        val config = ai.flossyapp.domain.model.ToolsConfig.fromJson(_settings.value.toolsConfig)
+        if (!spec.multiInstance && config.instances.any { it.type == type }) return
+        val defaultEnabled = when (type) {
+            // URL retrieval starts off: it is the one tool that can pour a
+            // large document into the context, so it is an explicit choice.
+            ai.flossyapp.domain.model.ToolTypes.TYPE_GET_URL -> false
+            ai.flossyapp.domain.model.ToolTypes.TYPE_END_CALL,
+            ai.flossyapp.domain.model.ToolTypes.TYPE_GET_DATETIME,
+            ai.flossyapp.domain.model.ToolTypes.TYPE_GET_LOCALE,
+            ai.flossyapp.domain.model.ToolTypes.TYPE_ROLL_DICE -> true
+            else -> false
+        }
+        mutateTools { list ->
+            list.add(
+                ai.flossyapp.domain.model.ToolInstance(
+                    id = "tool-" + UUID.randomUUID().toString(),
+                    type = type,
+                    enabled = defaultEnabled,
+                    settingsJson = "{}"
+                )
+            )
+        }
+    }
+
+    /**
+     * Removes the one instance named by [id] - the only removal the Tools tab
+     * offers, since the checkmarks are enable/disable switches, never a
+     * selection.
+     */
+    fun removeToolInstance(id: String) {
+        mutateTools { list -> list.removeAll { it.id == id } }
+    }
+
+    /**
+     * Flips one instance's enable switch. A type whose settings are still
+     * missing cannot be switched on: a tool the model cannot reach must not
+     * be advertised (the UI ghosts the check as well).
+     */
+    fun toggleToolInstance(id: String, enabled: Boolean) {
+        val config = ai.flossyapp.domain.model.ToolsConfig.fromJson(_settings.value.toolsConfig)
+        val target = config.instances.firstOrNull { it.id == id } ?: return
+        if (enabled && !target.configured) return
+        mutateTools { list ->
+            val index = list.indexOfFirst { it.id == id }
+            if (index >= 0) list[index] = list[index].copy(enabled = enabled)
+        }
+    }
+
+    /**
+     * Rewrites one instance's settings document with [transform], which is
+     * where a cog dialog's fields land.
+     */
+    fun updateToolInstance(id: String, transform: (ai.flossyapp.domain.model.ToolInstance) -> ai.flossyapp.domain.model.ToolInstance) {
+        mutateTools { list ->
+            val index = list.indexOfFirst { it.id == id }
+            if (index >= 0) list[index] = transform(list[index])
+        }
+    }
 
     /**
      * Update a single setting by key.
@@ -140,10 +265,10 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
             "enableTtsStreaming" -> _settings.update { it.copy(enableTtsStreaming = value as Boolean) }
             "forbidNonLatinTts" -> _settings.update { it.copy(forbidNonLatinTts = value as Boolean) }
 
-            // MCP tool servers
+            // The flat MCP fields are no longer edited: the Tools tab owns the
+            // configuration through the tool instance actions above.
             "enableMcpTools" -> _settings.update { it.copy(enableMcpTools = value as Boolean) }
             "mcpServerUrls" -> _settings.update { it.copy(mcpServerUrls = value as String) }
-            "mcpLazyTools" -> _settings.update { it.copy(mcpLazyTools = value as Boolean) }
 
             // Advanced / Debug Settings
             "debugLoggingEnabled" -> _settings.update { it.copy(debugLoggingEnabled = value as Boolean) }
@@ -157,10 +282,11 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     }
 
     /**
-     * Reset all settings to defaults.
+     * Factory reset: defaults everywhere, persisted at once.
      */
     fun resetToDefaults() {
-        _settings.value = ai.flossyapp.domain.model.AppSettings()
+        _settings.value = shippedDefaults()
+        applyEdits()
         _llmStatus.value = null
         _sttStatus.value = null
         _ttsStatus.value = null
@@ -202,7 +328,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
      */
     fun loadPreset(preset: PresetEntry) {
         _settings.value = preset.settings
-        repository.updateSettings(_settings.value)
+        applyEdits()
         // A preset carries its own base URLs, so the previous health checks no longer
         // describe the endpoints that are now configured.
         _llmStatus.value = null

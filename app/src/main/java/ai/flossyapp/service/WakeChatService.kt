@@ -11,8 +11,10 @@ import androidx.core.app.NotificationCompat
 import ai.flossyapp.FlossyApplication
 import ai.flossyapp.data.remote.ApiClient
 import ai.flossyapp.data.settings.SettingsRepository
+import ai.flossyapp.data.tools.ToolRegistry
 import ai.flossyapp.domain.model.ChatMessage
 import ai.flossyapp.domain.model.MessageRole
+import ai.flossyapp.domain.model.ToolCallRecord
 import ai.flossyapp.domain.model.VoiceCallPhase
 import ai.flossyapp.ui.common.ConversationStore
 import ai.flossyapp.ui.common.bestMatchCost
@@ -305,6 +307,11 @@ class WakeChatService : VoiceInteractionService() {
     @Volatile
     private var serviceScope = newServiceScope()
 
+    // The tool calls of the live exchange, in order. The registry's hub is
+    // the one seam: every run the model makes lands here, whether the engine
+    // or the screen's pipeline ran it, and the card shows what it can reach.
+    private val pendingToolCalls = mutableListOf<ToolCallRecord>()
+
     private fun newServiceScope() = CoroutineScope(Dispatchers.Default + Job())
 
     // Watches the API client's rate-limit waiting state for the whole service
@@ -352,13 +359,19 @@ class WakeChatService : VoiceInteractionService() {
             // thread exactly as the listening loop does.
             ACTION_CLOSE_CHAT -> serviceScope.launch { endExchange() }
             ACTION_TRIGGER_EXCHANGE -> triggerExchange()
-            ACTION_END_CALL -> serviceScope.launch {
+            // Hang-ups run synchronously, not via serviceScope.launch: a
+            // launch on a scope that is being replaced or cancelled (the
+            // service tearing down under the swipe) is dropped silently, and
+            // a dropped hang-up leaves the running exchange - and its tippy
+            // taps - alive with no surface left to stop it. hangUp is not a
+            // suspend call, so the main thread can carry it directly.
+            ACTION_END_CALL -> {
                 VoiceCallEngine.instance(applicationContext).hangUp("notification End call")
-                endExchange()
+                serviceScope.launch { endExchange() }
             }
-            ACTION_NOTIFICATION_SWIPE -> serviceScope.launch {
+            ACTION_NOTIFICATION_SWIPE -> {
                 VoiceCallEngine.instance(applicationContext).hangUp("notification swiped away")
-                endExchange()
+                serviceScope.launch { endExchange() }
                 // The swipe cannot remove an ongoing foreground-service
                 // notification for good: the platform re-posts it. Re-post
                 // it as slumbering, never as a live call, so what the user
@@ -494,6 +507,17 @@ class WakeChatService : VoiceInteractionService() {
 
         val scope = serviceScope
         scope.launch { wakeLoop() }
+        // Tool runs flow into the card: every finished call is remembered for
+        // the exchange that made it and drawn as its own compact row.
+        scope.launch {
+            ToolRegistry.toolCallEvents.collect { event ->
+                synchronized(pendingToolCalls) {
+                    pendingToolCalls.add(
+                        ToolCallRecord(name = event.name, arguments = event.arguments, result = event.result)
+                    )
+                }
+            }
+        }
     }
 
     private fun stopListening() {
@@ -820,6 +844,15 @@ class WakeChatService : VoiceInteractionService() {
             val forced = manualTrigger || engine.consumeHandoff()
             manualTrigger = false
             if (!forced) {
+                // The app is on screen as an app proper (Settings included):
+                // the wake word stays silent and the popup never rises over
+                // it. A manual trigger (forced) is the user's own request
+                // from Settings and still runs; a handoff continues an
+                // exchange the screen deliberately released.
+                if (VoiceCallEngine.isAppOnScreen) {
+                    delay(500)
+                    continue
+                }
                 // A fresh idle window: the abort flag is only a request to stop
                 // waiting for the phrase, so it must not stay set for the next one.
                 wakeAbortSignal.set(false)
@@ -1042,6 +1075,9 @@ class WakeChatService : VoiceInteractionService() {
 
         override fun onUserMessage(text: String) {
             ConversationStore.addMessage(ChatMessage.user(text))
+            // A new turn starts with no tool calls: the rows belong to the
+            // exchange that made them, and last turn's must not leak in.
+            synchronized(pendingToolCalls) { pendingToolCalls.clear() }
             lastRequest = text
             lastReply = ""
             lastPaintMs = 0L
@@ -1164,6 +1200,22 @@ class WakeChatService : VoiceInteractionService() {
             args.putString(SESSION_STATE_KEY, state)
             args.putString(SESSION_REQUEST_KEY, request)
             args.putString(SESSION_REPLY_KEY, reply)
+            // The exchange's tool calls ride along as one JSON document, so
+            // the card can draw the step between question and answer.
+            args.putString(
+                SESSION_TOOLCALLS_KEY,
+                synchronized(pendingToolCalls) {
+                    val doc = org.json.JSONArray()
+                    for (call in pendingToolCalls) {
+                        val node = org.json.JSONObject()
+                        node.put("name", call.name)
+                        node.put("arguments", call.arguments)
+                        node.put("result", call.result)
+                        doc.put(node)
+                    }
+                    doc.toString()
+                }
+            )
             // Only the climb and the sink read this: every other state is settled,
             // and the default above says so without spelling 1.0 at every call site.
             args.putString(SESSION_ANIM_KEY, progress.toString())

@@ -995,6 +995,23 @@ private fun playPcmAudioOnOwnTrack(pcmBytes: ByteArray, sampleRate: Int, abortSi
 }
 
 /**
+ * What may reach the speech engine: letters, digits, whitespace, and the
+ * punctuation that carries prosody - sentence marks, comma, apostrophe (so
+ * "it's" is not spoken as "its"), hyphen, colon and bracketing quotes.
+ * Everything else - markdown asterisks, underscores, code symbols, emoji,
+ * foreign scripts - is stripped before synthesis, because a TTS reads each
+ * of those out loud ("star, star, star...") where the reader wanted emphasis.
+ * The visible text is never touched; this is the speech-side filter alone.
+ */
+fun speakableText(text: String): String {
+    return text.trim().filter { c ->
+        c.isLetterOrDigit() && c.code < 0x250 ||
+            c.isWhitespace() ||
+            c in ".,'!?;:-()\"\u2019\u201c\u201d"
+    }.trim()
+}
+
+/**
  * Split text into sentences based on common punctuation marks.
  */
 fun splitIntoSentences(text: String): List<String> {
@@ -1100,17 +1117,13 @@ suspend fun playTTSAudio(
          return
      }
 
-     // Even with the language rule in the system prompt, a model can slip a
-     // run of foreign characters into a reply, and the TTS then reads each
-     // one out - "Chinese letter, chinese letter...". Anything outside the
-     // Latin alphabet (and the punctuation and whitespace around it) is
-     // dropped before synthesis; the visible text keeps it, only speech
-     // does not. Latin script ends at U+024F, and Greek, Cyrillic and CJK
-     // all live past it, so a single range check covers every script the
-     // model is likely to leak.
-     val cleanText = if (forbidNonLatin) text.trim().filter { c ->
-         c.isWhitespace() || c.code < 0x250
-     }.trim() else text.trim()
+     // Even with the language rule in the system prompt, a model can slip
+     // characters the speech engine pronounces badly (markdown asterisks,
+     // underscores, foreign scripts, emoji) into a reply, and the TTS then
+     // reads every one of them out. Speech keeps letters, digits, spaces and
+     // the few punctuations that carry prosody; the visible text keeps it all,
+     // only speech does not.
+     val cleanText = if (forbidNonLatin) speakableText(text) else text.trim()
 if (cleanText.isEmpty()) {
          return
      }

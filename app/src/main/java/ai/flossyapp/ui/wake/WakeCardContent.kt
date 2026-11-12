@@ -1,6 +1,8 @@
 package ai.flossyapp.ui.wake
 
+import ai.flossyapp.domain.model.ToolCallRecord
 import ai.flossyapp.ui.common.BubblePinEffect
+import ai.flossyapp.ui.common.ToolCallRows
 import ai.flossyapp.ui.common.CallAvatar
 import ai.flossyapp.ui.common.CallPose
 import ai.flossyapp.ui.common.ChatBubble
@@ -58,6 +60,9 @@ data class WakeCardSnapshot(
     val chipColor: Int,
     val request: String,
     val reply: String,
+    // The tool calls this exchange made, drawn from the shared bubble kit:
+    // one compact row per call, tap to expand input and output.
+    val toolCalls: List<ToolCallRecord> = emptyList(),
     val streaming: Boolean,
     // What the bot is doing right now: the pose carries the "I am alive and
     // working" signal, most importantly while thinking - a still card reads
@@ -145,12 +150,28 @@ private fun BubbleThread(snap: WakeCardSnapshot, modifier: Modifier) {
         if (snap.request.isNotBlank()) {
             item { ChatBubble(text = snap.request, isUser = true) }
         }
+        if (snap.toolCalls.isNotEmpty()) {
+            item {
+                ToolCallRows(
+                    toolCalls = snap.toolCalls,
+                    // The card is drawn at the session's measured scale: the
+                    // rows shrink with it, like every other kit surface.
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        }
         if (snap.reply.isNotBlank()) {
             item { ChatBubble(text = snap.reply, isUser = false, streaming = snap.streaming) }
         }
     }
-    // The reply is the last item when it exists; otherwise the request is.
-    val lastIndex = if (snap.reply.isNotBlank()) 1 else if (snap.request.isNotBlank()) 0 else -1
+    // The reply is the last item when it exists; otherwise the tool rows or
+    // the request are, so the pin effect still knows where the bottom is.
+    val lastIndex = when {
+        snap.reply.isNotBlank() -> 2
+        snap.toolCalls.isNotEmpty() -> 1
+        snap.request.isNotBlank() -> 0
+        else -> -1
+    }
     BubblePinEffect(listState, lastIndex, snap.streaming, snap.request.length, snap.reply.length)
 }
 

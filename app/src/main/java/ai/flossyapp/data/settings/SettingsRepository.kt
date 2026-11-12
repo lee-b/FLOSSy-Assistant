@@ -61,9 +61,12 @@ class SettingsRepository(private val context: Context) {
             ttsResponseFormat = sharedPreferences.getString("tts_response_format", defaults.ttsResponseFormat) ?: defaults.ttsResponseFormat,
             enableTtsStreaming = sharedPreferences.getBoolean("enable_tts_streaming", defaults.enableTtsStreaming),
             forbidNonLatinTts = sharedPreferences.getBoolean("forbid_non_latin_tts", defaults.forbidNonLatinTts),
+            // The flat MCP fields are read only to upgrade an old install into
+            // tool instances; once "tools_config" exists they are never
+            // consulted again and the Tools tab owns the configuration.
             enableMcpTools = sharedPreferences.getBoolean("enable_mcp_tools", defaults.enableMcpTools),
             mcpServerUrls = sharedPreferences.getString("mcp_server_urls", defaults.mcpServerUrls) ?: defaults.mcpServerUrls,
-            mcpLazyTools = sharedPreferences.getBoolean("mcp_lazy_tools", defaults.mcpLazyTools),
+            toolsConfig = migratedToolsConfig(),
 
             autoTtsEnabled = sharedPreferences.getBoolean("auto_tts_enabled", defaults.autoTtsEnabled),
             autoExpandReasoning = sharedPreferences.getBoolean("auto_expand_reasoning", defaults.autoExpandReasoning),
@@ -120,9 +123,7 @@ class SettingsRepository(private val context: Context) {
             putString("tts_response_format", settings.ttsResponseFormat)
             putBoolean("enable_tts_streaming", settings.enableTtsStreaming)
             putBoolean("forbid_non_latin_tts", settings.forbidNonLatinTts)
-            putBoolean("enable_mcp_tools", settings.enableMcpTools)
-            putString("mcp_server_urls", settings.mcpServerUrls)
-            putBoolean("mcp_lazy_tools", settings.mcpLazyTools)
+            putString("tools_config", settings.toolsConfig)
 
             putBoolean("auto_tts_enabled", settings.autoTtsEnabled)
             putBoolean("auto_expand_reasoning", settings.autoExpandReasoning)
@@ -170,6 +171,26 @@ class SettingsRepository(private val context: Context) {
         }
         
         _settingsFlow.value = loadSettings()
+    }
+
+    /**
+     * The structured tool document, upgrading an old install on first read.
+     *
+     * A store without "tools_config" carries only the flat MCP settings, so
+     * its servers become MCP instances here and the document is written back
+     * at once - after that first write the flat fields are never read again.
+     * A factory reset clears the document too, so the next load rebuilds the
+     * shipped defaults (the internal tools, no servers).
+     */
+    private fun migratedToolsConfig(): String {
+        if (sharedPreferences.contains("tools_config")) {
+            return sharedPreferences.getString("tools_config", "") ?: ""
+        }
+        val legacyOn = sharedPreferences.getBoolean("enable_mcp_tools", defaults.enableMcpTools)
+        val legacyUrls = sharedPreferences.getString("mcp_server_urls", defaults.mcpServerUrls) ?: defaults.mcpServerUrls
+        val migrated = ai.flossyapp.domain.model.ToolsConfig.migrateFromLegacy(legacyOn, legacyUrls).toJson()
+        sharedPreferences.edit().putString("tools_config", migrated).apply()
+        return migrated
     }
 
     // ==================== Preset Management ====================
@@ -254,9 +275,7 @@ class SettingsRepository(private val context: Context) {
         appendStr(sb, "ttsApiKey", settings.ttsApiKey)
         appendStr(sb, "ttsResponseFormat", settings.ttsResponseFormat)
         appendBool(sb, "enableTtsStreaming", settings.enableTtsStreaming)
-        appendBool(sb, "enableMcpTools", settings.enableMcpTools)
-        appendStr(sb, "mcpServerUrls", settings.mcpServerUrls)
-        appendBool(sb, "mcpLazyTools", settings.mcpLazyTools)
+        appendStr(sb, "toolsConfig", settings.toolsConfig)
         appendStr(sb, "systemPrompt", settings.systemPrompt)
         appendStr(sb, "wakeWordName", settings.wakeWordName)
         appendBool(sb, "enableWakeWordDetection", settings.enableWakeWordDetection)
@@ -354,7 +373,18 @@ class SettingsRepository(private val context: Context) {
                 enableTtsStreaming = extractBool("enableTtsStreaming", base.enableTtsStreaming),
                 enableMcpTools = extractBool("enableMcpTools", base.enableMcpTools),
                 mcpServerUrls = extract("mcpServerUrls", base.mcpServerUrls),
-                mcpLazyTools = extractBool("mcpLazyTools", base.mcpLazyTools),
+                // A preset from an older build has no tool document but does
+                // carry the flat MCP fields, so the same upgrade that runs on a
+                // stored settings file runs here; a fresh preset name falls
+                // back to the shipped internal tools.
+                toolsConfig = extract("toolsConfig", "").ifBlank {
+                    ai.flossyapp.domain.model.ToolsConfig
+                        .migrateFromLegacy(
+                            extractBool("enableMcpTools", false),
+                            extract("mcpServerUrls", "")
+                        )
+                        .toJson()
+                },
                 systemPrompt = extract("systemPrompt", base.systemPrompt),
                 wakeWordName = extract("wakeWordName", base.wakeWordName),
                 enableWakeWordDetection = extractBool("enableWakeWordDetection", base.enableWakeWordDetection),

@@ -12,6 +12,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import ai.flossyapp.data.remote.ApiClient
 import ai.flossyapp.data.settings.SettingsRepository
+import ai.flossyapp.data.tools.ToolRegistry
 import ai.flossyapp.domain.model.ChatMessage
 import ai.flossyapp.ui.common.ConversationStore
 import ai.flossyapp.domain.model.DialogMode
@@ -31,6 +32,26 @@ class ChatViewModel(application: android.app.Application) : AndroidViewModel(app
     
     private val context = application.applicationContext
     private val settingsRepository = SettingsRepository(context)
+
+    init {
+        // Every tool run the model makes becomes its own compact row in the
+        // conversation, so the invisible step between question and answer is
+        // visible. The registry's hub is the one seam: it carries runs from
+        // the screen's own pipeline and the wake exchange alike.
+        viewModelScope.launch {
+            ToolRegistry.toolCallEvents.collect { event ->
+                ConversationStore.addMessage(
+                    ChatMessage.assistantToolCall(
+                        ai.flossyapp.domain.model.ToolCallRecord(
+                            name = event.name,
+                            arguments = event.arguments,
+                            result = event.result
+                        )
+                    )
+                )
+            }
+        }
+    }
     
     // App settings - exposed as StateFlow for UI observation
     val settings: StateFlow<ai.flossyapp.domain.model.AppSettings> = settingsRepository.settingsFlow

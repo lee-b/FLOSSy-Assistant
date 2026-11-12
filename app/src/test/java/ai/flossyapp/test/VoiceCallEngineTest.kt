@@ -109,7 +109,7 @@ class VoiceCallEngineTest {
             kotlinx.coroutines.delay(10000)
         }
         VoiceCallEngine.sttRunner = { _, _ -> "hello" }
-        VoiceCallEngine.llmRunner = { _, _, _, _ -> "a reply" }
+        VoiceCallEngine.llmRunner = { _, _, _, _, _ -> "a reply" }
         VoiceCallEngine.waitingCueRunner = { true }
 
         val host = FakeHost()
@@ -131,7 +131,7 @@ class VoiceCallEngineTest {
             throw AssertionError("TTS must not run after the call was hung up")
         }
         VoiceCallEngine.sttRunner = { _, _ -> "hello" }
-        VoiceCallEngine.llmRunner = { _, _, _, _ ->
+        VoiceCallEngine.llmRunner = { _, _, _, _, _ ->
             llmStarted.complete(Unit)
             kotlinx.coroutines.delay(5000) // hang-up cancels the exchange here
             "a reply"
@@ -156,7 +156,7 @@ class VoiceCallEngineTest {
         engine.hangUp("reset test")
         val sttRan = CompletableDeferred<Unit>()
         VoiceCallEngine.sttRunner = { _, _ -> sttRan.complete(Unit); "hello" }
-        VoiceCallEngine.llmRunner = { _, _, _, _ -> "ok" }
+        VoiceCallEngine.llmRunner = { _, _, _, _, _ -> "ok" }
         VoiceCallEngine.ttsRunner = { _, _, _, _ -> }
         VoiceCallEngine.waitingCueRunner = { true }
 
@@ -173,7 +173,7 @@ class VoiceCallEngineTest {
         val firstInLlm = CompletableDeferred<Unit>()
         val releaseFirst = CompletableDeferred<Unit>()
         VoiceCallEngine.sttRunner = { _, _ -> "hello" }
-        VoiceCallEngine.llmRunner = { _, _, _, _ ->
+        VoiceCallEngine.llmRunner = { _, _, _, _, _ ->
             firstInLlm.complete(Unit)
             releaseFirst.await()
             "a reply"

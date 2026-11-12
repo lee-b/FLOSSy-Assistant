@@ -94,7 +94,7 @@ object ApiClient {
         apiKey: String? = null,
         messages: List<Map<String, String>>,
         model: String,
-        temperature: Float = 7.0f,
+        temperature: Float = 0.7f,
         maxTokens: Int = 1024,
         systemPrompt: String? = null,
         stream: Boolean = true,
@@ -141,7 +141,7 @@ object ApiClient {
         apiKey: String? = null,
         messages: List<Map<String,String>>,
         model: String,
-        temperature: Float = 7.0f,
+        temperature: Float = 0.7f,
         maxTokens: Int = 1024,
         systemPrompt: String? = null,
         stream: Boolean = true,
@@ -159,27 +159,56 @@ object ApiClient {
         history.addAll(messages)
         var reply = ChatResponse(content = "")
         for (round in 1..maxToolRounds) {
-            reply = chatCompletion(
-                baseUrl = baseUrl,
-                apiKey = apiKey,
-                messages = history,
-                model = model,
-                temperature = temperature,
-                maxTokens = maxTokens,
-                stream = stream,
-                reasoningBudgetTokens = reasoningBudgetTokens,
-                chatTemplateKwargs = chatTemplateKwargs,
-                timeoutSeconds = timeoutSeconds,
-                tools = tools,
-                abortSignal = abortSignal,
-                onChunk = onChunk
-            )
+            // A mid-exchange round that fails (a transient 5xx or a lost
+            // stream) is retried once: the model is mid-thought and a single
+            // retry is what turns a flaky server into a finished exchange.
+            // Feeding a failed round back to the model is impossible - there
+            // is no reply to answer - so after the retry the failure
+            // propagates to the caller, who reports it in words.
+            // A local suspend function: the retry may re-enter the network
+            // path, and the round itself is already suspend context.
+            suspend fun roundCall(): ChatResponse {
+                return chatCompletion(
+                    baseUrl = baseUrl,
+                    apiKey = apiKey,
+                    messages = history,
+                    model = model,
+                    temperature = temperature,
+                    maxTokens = maxTokens,
+                    stream = stream,
+                    reasoningBudgetTokens = reasoningBudgetTokens,
+                    chatTemplateKwargs = chatTemplateKwargs,
+                    timeoutSeconds = timeoutSeconds,
+                    tools = tools,
+                    abortSignal = abortSignal,
+                    onChunk = onChunk
+                )
+            }
+            reply = try {
+                roundCall()
+            } catch (e: IOException) {
+                if (abortSignal?.get() == true) throw e
+                android.util.Log.w("ApiClient", "Tool round $round failed (${e.message}); retrying once")
+                roundCall()
+            }
             if (reply.toolCalls.isEmpty()) return reply
             if (runTool == null) return reply
             if (abortSignal?.get() == true) return reply
             history.add(assistantToolCallTurn(reply))
             for (call in reply.toolCalls) {
-                val outcome = runTool(call.name, call.arguments)
+                // A tool that throws must not end the exchange: the model is
+                // told the tool is not working right now and can answer in
+                // words, try a different tool, or give up gracefully. Only an
+                // abort interrupts the round after this point.
+                val outcome = try {
+                    runTool(call.name, call.arguments)
+                } catch (e: Exception) {
+                    if (abortSignal?.get() == true) return reply
+                    android.util.Log.w("ApiClient", "Tool ${call.name} threw: ${e.message}")
+                    "The tool ${call.name} is not working right now" +
+                        (e.message?.let { ": $it" } ?: ".") +
+                        " Tell the user the action could not be completed."
+                }
                 history.add(
                     mapOf(
                         "role" to "tool",
@@ -330,9 +359,13 @@ object ApiClient {
             try {
                 executeWithRateLimitRetry(client, request).use { response ->
                     if (!response.isSuccessful) {
-                        val errorBody = response.body?.string() ?: "No error body"
+                        // The body is the diagnosis: a strict server names the
+                        // exact parse error ("Missing tool call type", a
+                        // JSON tail) that the code alone never could. Trimmed
+                        // so a huge HTML error page cannot flood the chat.
+                        val errorBody = response.body?.string()?.take(300) ?: "no body"
                         android.util.Log.e("ApiClient", "Chat completion failed: ${response.code} - $errorBody")
-                        throw IOException("Chat completion failed: ${response.code}")
+                        throw IOException("Chat completion failed: ${response.code} - $errorBody")
                     }
                     
                     val body = response.body ?: throw IOException("Empty response")
@@ -553,18 +586,27 @@ object ApiClient {
     /**
      * The turn we hand back when the model asked for tools: the calls it made, verbatim, so the
      * next round can see what it already asked for.
+     *
+     * The "tool_calls" value is a real JSON array (objects with id/type/function), never a
+     * quoted string: OpenAI-compatible servers parse the message body strictly, and a
+     * stringified array is rejected with "Missing tool call type" - which killed every second
+     * tool round and left the exchange answering nothing but the waiting cue.
      */
-    private fun assistantToolCallTurn(reply: ChatResponse): Map<String, String> {
+    // Internal, not private: the tool-round body is the one wire format that
+    // broke against strict servers, so the unit suite builds it and parses it.
+    internal fun assistantToolCallTurn(reply: ChatResponse): Map<String, String> {
         val calls = mutableListOf<String>()
         for (call in reply.toolCalls) {
             calls.add(
                 "{\"id\": \"${call.resolvedId}\", \"type\": \"function\", \"function\": {\"name\": \"${call.name}\", \"arguments\": ${escapeJsonString(call.arguments)}}}"
             )
         }
+        // The value is spliced in verbatim by buildMessagesJson, so the array
+        // itself is what lands in the map - quoting happens only on content.
         return mapOf(
             "role" to "assistant",
             "content" to reply.content,
-            "tool_calls" to "[${calls.joinToString(", ")}]"
+            "tool_calls" to "[${calls.joinToString(",")}]"
         )
     }
 
@@ -600,9 +642,15 @@ object ApiClient {
      * what a tool that takes no arguments needs.
      */
     private fun buildToolsJson(tools: List<ToolSchema>): String {
-        return tools.joinToString(",") { tool ->
+        // The whole list is one JSON array: the "tools" field reads an array
+        // of schemas, and objects merely joined by commas are a parse error
+        // the moment there is more than one ("unexpected '{'; expected
+        // string literal" - the server reads the second object as an object
+        // key). One tool alone parses by accident, which is exactly why the
+        // bug hid until a second tool was enabled.
+        return "[" + tools.joinToString(",") { tool ->
             """{"type": "function", "function": {"name": ${escapeJsonString(tool.name)}, "description": ${escapeJsonString(tool.description)}, "parameters": ${tool.parametersJson.ifBlank { """{"type": "object", "properties": {}}""" }}}}"""
-        }
+        } + "]"
     }
 
     /**

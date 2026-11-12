@@ -29,6 +29,7 @@ import androidx.navigation.compose.composable
 import ai.flossyapp.R
 import ai.flossyapp.data.settings.SettingsRepository
 import ai.flossyapp.ui.chat.ChatScreen
+import ai.flossyapp.ui.common.VoiceCallEngine
 import ai.flossyapp.ui.settings.SettingsScreen
 import ai.flossyapp.ui.theme.FLOSSyAssistantTheme
 import ai.flossyapp.ui.wake.WakeChatViewModel
@@ -59,6 +60,14 @@ class MainActivity : ComponentActivity() {
         
         // Holds the last voice command for MainNavigation to pick up
         var _lastVoiceCommand: MutableStateFlow<String?> = MutableStateFlow(null)
+
+        // The splash is a launch nicety, not a loading gate: it plays once per
+        // process and never again. An orientation change recreates the
+        // activity, and a splash that replayed would hide the navigation
+        // composition for a second - dropping the nav back stack and every
+        // rememberSaveable value in it, which is the "app resets on rotate"
+        // bug. A process-wide flag survives recreation by construction.
+        private var splashShownThisProcess = false
     }
     
     // Use Compose State so UI recomposes when permissions change
@@ -256,9 +265,22 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // The app is on screen as an app proper: the wake service reads this to
+    // stay silent while the app is visible, so the wake word cannot start an
+    // exchange and the popup cannot be drawn over the app the user is using.
+    override fun onStart() {
+        super.onStart()
+        VoiceCallEngine.isAppOnScreen = true
+    }
+
+    override fun onStop() {
+        super.onStop()
+        VoiceCallEngine.isAppOnScreen = false
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        
+
         // Check permissions on creation
         hasPermissions = hasRequiredPermissions()
 
@@ -276,7 +298,13 @@ class MainActivity : ComponentActivity() {
         // opens a voice call with its own capture straight after composition.
         
         setContent {
-            val showSplash = remember { mutableStateOf(true) }
+            // False on every recreation: the splash only plays on the first
+            // composition of the process, so a rotate never unmounts the
+            // navigation (and never makes the user watch the mic again).
+            val showSplash = remember {
+                mutableStateOf(!splashShownThisProcess)
+            }
+            splashShownThisProcess = true
             val settings by settingsRepository.settingsFlow.collectAsState()
             
             LaunchedEffect(Unit) {
