@@ -273,13 +273,15 @@ app/
 │   │   ├── chat/                       # Chat screen components
 │   │   │   ├── ChatScreen.kt           # Main chat interface & VoiceControlsBar
 │   │   │   └── ChatViewModel.kt        # Chat state management
-│   │   ├── wake/                       # Wake service plumbing (renderer only)
-│   │   │   └── WakeChatViewModel.kt    # Forwards the service's state & start/stop intents
+│   │   ├── wake/                       # Wake plumbing + the session card's content
+│   │   │   ├── WakeChatViewModel.kt    # Forwards the service's state & start/stop intents
+│   │   │   └── WakeCardContent.kt      # Compose content of the wake card (bubbles, buttons)
 │   │   ├── settings/                   # Settings screen components
 │   │   │   ├── SettingsScreen.kt       # Configuration UI
 │   │   │   └── SettingsViewModel.kt    # Settings state management
-│   │   ├── common/                     # Audio helpers, VAD, wake-word matcher
+│   │   ├── common/                     # Audio helpers, VAD, shared bubbles, wake-word matcher
 │   │   │   ├── CommonUtilities.kt
+│   │   │   ├── BubbleKit.kt            # The one bubble shell + scroll both chat views render through
 │   │   │   ├── WakeWordDetector.kt
 │   │   │   └── DefaultAssistant.kt     # Assistant-role oracle & picker intents
 │   │   └── theme/                      # Gruvbox Material3 colour schemes
@@ -327,7 +329,10 @@ really bound it; if that line never appears, the selection is the problem, not t
 The card's scale comes from the display, measured directly through the session's
 `WindowManager.maximumWindowMetrics`. If the log line `Measured the display directly` never
 appears, the exchange falls back to the shipped design (tuned for a 1840-px short edge) and
-the card overruns a smaller screen - the fallback, not the rule, is the failure.
+the card overruns a smaller screen - the fallback, not the rule, is the failure. The card's
+content is Compose (`WakeCardContent` through the shared `BubbleKit`), so bubbles wrap
+themselves and the reply scrolls up as it streams; there is no line-width constant to
+overrun.
 
 ### Audio Issues
 - Grant microphone permission in Settings → Permissions
