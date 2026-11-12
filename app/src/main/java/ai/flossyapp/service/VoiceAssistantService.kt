@@ -23,7 +23,7 @@ import androidx.core.app.NotificationCompat.Builder
 import ai.flossyapp.FlossyApplication
 import ai.flossyapp.data.remote.ApiClient
 import ai.flossyapp.data.remote.McpClient
-import ai.flossyapp.ui.common.beginCommunicationCapture
+import ai.flossyapp.ui.common.preferredCaptureDevice
 import ai.flossyapp.ui.common.isNonSpeechTranscript
 import ai.flossyapp.ui.common.playListenEndCue
 import ai.flossyapp.ui.common.playListenStartCue
@@ -169,8 +169,6 @@ class VoiceAssistantService : Service() {
 
     // The restore runnable for a communication capture route opened in
     // startListening(); closed again in stopListening().
-    private var audioRouteRestore: (() -> Unit)? = null
-
     // Watches the input devices while listening, so pulling or connecting a
     // headset mid-utterance re-routes capture instead of leaving the recorder
     // on a device that has gone away. One instance, registered per listen.
@@ -430,15 +428,16 @@ class VoiceAssistantService : Service() {
                     sampleRate, channelConfig, audioFormat, bufferSize * 4
                 )
 
-                // With a headset connected the recorder would otherwise stay on
-                // the phone mic, so the route is opened before the microphone
-                // does. The start cue blocks, so it plays before the mic opens.
-                audioRouteRestore = beginCommunicationCapture(applicationContext)
+                // The recorder is steered at the headset input when one exists;
+                // no communication route is set or cleared - that toggled the
+                // SCO link on every listen, yanking the headset's volume and
+                // stuttering whatever media was playing. The start cue blocks,
+                // so it plays before the mic opens.
                 playListenStartCue()
                 // The device the call starts on decides what "the device went
                 // away" means later: a Bluetooth loss hangs up, anything else
                 // re-establishes.
-                captureDeviceCallback.noteRoutedDevice(audioManager.getCommunicationDevice())
+                captureDeviceCallback.noteRoutedDevice(preferredCaptureDevice(applicationContext))
                 audioManager.registerAudioDeviceCallback(captureDeviceCallback, android.os.Handler(android.os.Looper.getMainLooper()))
 
                 if (audioRecord != null) {
@@ -503,11 +502,8 @@ class VoiceAssistantService : Service() {
         audioTrack = null
         audioManager.unregisterAudioDeviceCallback(captureDeviceCallback)
 
-        // The matched downbeat closes the listening window, and the Bluetooth
-        // route goes with the microphone it served.
+        // The matched downbeat closes the listening window.
         playListenEndCue()
-        audioRouteRestore?.invoke()
-        audioRouteRestore = null
 
         recordingThread?.join(5000)
         recordingThread = null
@@ -533,7 +529,7 @@ class VoiceAssistantService : Service() {
         // The new recorder may land on a different device than the old one;
         // remember which, so the next removal is judged against the device
         // capture actually rides now.
-        val routedNow = audioManager.getCommunicationDevice()
+        val routedNow = preferredCaptureDevice(applicationContext)
         captureDeviceCallback.noteRoutedDevice(routedNow)
         val bufferSize = AudioRecord.getMinBufferSize(
             sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
@@ -541,8 +537,6 @@ class VoiceAssistantService : Service() {
         if (bufferSize <= 0) return
 
         try {
-            audioRouteRestore?.invoke()
-            audioRouteRestore = beginCommunicationCapture(applicationContext)
             val replacement = AudioRecord(
                 MediaRecorder.AudioSource.VOICE_COMMUNICATION,
                 sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufferSize * 4
@@ -550,6 +544,11 @@ class VoiceAssistantService : Service() {
             if (replacement.state != AudioRecord.STATE_INITIALIZED) {
                 replacement.release()
                 return
+            }
+            // Steer the replacement recorder at the headset input like the
+            // original was, without touching any global routing or volume.
+            preferredCaptureDevice(applicationContext)?.let { device ->
+                runCatching { replacement.setPreferredDevice(device) }
             }
             replacement.startRecording()
             val previous = audioRecord

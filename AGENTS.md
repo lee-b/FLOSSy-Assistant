@@ -75,6 +75,7 @@ Device launch/install commands are in `AGENTS.local.md`.
 - Never remove the foreground-service notifications - required by API 35+ and declared in the manifest
 - Never commit API keys or base URLs that carry credentials
 - Never use `kotlinx.serialization` for preset JSON - presets are hand-built in `SettingsRepository`
+- Never call `AudioManager.setCommunicationDevice`/`clearCommunicationDevice` - reading the device (`preferredCaptureDevice`) and steering the recorder with `AudioRecord.setPreferredDevice` is all routing the app does; setting the global route toggles the SCO link, which changes the headset's volume and stutters media playback
 
 ## Testing Guidelines
 - Unit tests in `app/src/test/java/`, instrumentation tests in `app/src/androidTest/java/`

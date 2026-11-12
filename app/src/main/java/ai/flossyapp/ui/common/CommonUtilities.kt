@@ -48,6 +48,9 @@ fun recordAudioForSTT(
     val minBufferSize = android.media.AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
     if (minBufferSize <= 0) return null
 
+    // The headset input to steer this recorder at, if any exists.
+    val captureDevice = preferredCaptureDevice(context)
+
     val audioRecord = android.media.AudioRecord(
         MediaRecorder.AudioSource.VOICE_COMMUNICATION,
         sampleRate, channelConfig, audioFormat, minBufferSize * 4
@@ -57,15 +60,17 @@ fun recordAudioForSTT(
         audioRecord.release()
         return null
     }
+    // Steer this recorder alone at the headset input - per-recorder routing
+    // with no global side effects (no volume curve, no SCO toggling).
+    captureDevice?.let { device ->
+        runCatching { audioRecord.setPreferredDevice(device) }
+    }
 
     val buffer = ShortArray(minBufferSize / 2)
     val output = ByteArrayOutputStream()
     var recordingTimeMs = 0L
     val startTime = System.currentTimeMillis()
 
-    // Capture may have to ride the Bluetooth headset; the route is closed
-    // whichever way the recording ends.
-    val restoreRoute = beginCommunicationCapture(context)
     try {
         try {
             audioRecord.startRecording()
@@ -85,7 +90,6 @@ fun recordAudioForSTT(
             return null
         }
     } finally {
-        restoreRoute?.invoke()
     }
 
     try { audioRecord.stop() } catch (_: Exception) {}
@@ -156,7 +160,6 @@ class StreamingCallCapture(
     }
 
     private var record: android.media.AudioRecord? = null
-    private var restoreRoute: (() -> Unit)? = null
     private var thread: Thread? = null
 
     /**
@@ -170,18 +173,13 @@ class StreamingCallCapture(
     @Volatile
     var chunkListener: ((FloatArray) -> Unit)? = null
 
-    /** Opens the route and starts streaming. True when capture is live. */
+    /** Opens the recorder and starts streaming. True when capture is live. */
     fun start(): Boolean {
-        val restore = beginCommunicationCapture(context)
-        restoreRoute = restore
         val minBuffer = android.media.AudioRecord.getMinBufferSize(
             SAMPLE_RATE, android.media.AudioFormat.CHANNEL_IN_MONO,
             android.media.AudioFormat.ENCODING_PCM_16BIT
         )
-        if (minBuffer <= 0) {
-            restore?.invoke()
-            return false
-        }
+        if (minBuffer <= 0) return false
         val rec = try {
             android.media.AudioRecord(
                 android.media.MediaRecorder.AudioSource.VOICE_COMMUNICATION,
@@ -192,13 +190,20 @@ class StreamingCallCapture(
             )
         } catch (e: Exception) {
             android.util.Log.e("VAD", "Streaming capture failed to open: ${e.message}")
-            restore?.invoke()
             return false
         }
         if (rec.state != android.media.AudioRecord.STATE_INITIALIZED) {
             rec.release()
-            restore?.invoke()
             return false
+        }
+        // Steer this recorder alone at the headset input; the framework's
+        // default input is used as-is when there is nothing to steer at. No
+        // communication route is set or cleared anywhere: setting one toggles
+        // the SCO link, which yanks the headset's volume and knocks out
+        // whatever media is playing.
+        preferredCaptureDevice(context)?.let { device ->
+            runCatching { rec.setPreferredDevice(device) }
+                .onFailure { android.util.Log.w("VAD", "Could not steer capture device: ${it.message}") }
         }
         record = rec
         rec.startRecording()
@@ -276,7 +281,6 @@ class StreamingCallCapture(
         } finally {
             try { rec.stop() } catch (_: Exception) {}
             try { rec.release() } catch (_: Exception) {}
-            restoreRoute?.invoke()
             android.util.Log.d("VAD", "Streaming capture ended")
         }
     }
@@ -365,6 +369,9 @@ fun recordAudioWithVAD(
         return null
     }
 
+    // The headset input to steer this recorder at, if any exists.
+    val captureDevice = preferredCaptureDevice(context)
+
     val audioRecord = android.media.AudioRecord(
         MediaRecorder.AudioSource.VOICE_COMMUNICATION,
         sampleRate, channelConfig, audioFormat, minBufferSize * 4
@@ -374,6 +381,11 @@ fun recordAudioWithVAD(
         android.util.Log.e("VAD", "AudioRecord initialization failed")
         audioRecord.release()
         return null
+    }
+    // Steer this recorder alone at the headset input - per-recorder routing
+    // with no global side effects (no volume curve, no SCO toggling).
+    captureDevice?.let { device ->
+        runCatching { audioRecord.setPreferredDevice(device) }
     }
 
     val audioBuffers = mutableListOf<Short>()
@@ -408,12 +420,6 @@ fun recordAudioWithVAD(
     val recordingStart = System.currentTimeMillis()
 
     android.util.Log.d("VAD", "Starting recording with energy threshold $minEnergy...")
-
-    // Capture may have to ride a Bluetooth headset; the route is closed when
-    // the recorder is released. No cues here: they used to mark every capture,
-    // which put a plonk between listening and responding on every turn - the
-    // callers that open and close a call play the matched pair themselves.
-    val restoreRoute = beginCommunicationCapture(context)
     try {
         audioRecord.startRecording()
 
@@ -507,7 +513,6 @@ fun recordAudioWithVAD(
         try { audioRecord.stop() } catch (_: Exception) {}
     } finally {
         try { audioRecord.release() } catch (_: Exception) {}
-        restoreRoute?.invoke()
     }
     android.util.Log.d("VAD", "Recording completed, ${audioBuffers.size} samples (${audioBuffers.size / sampleRate.toFloat()}s)")
 
@@ -1301,57 +1306,37 @@ private suspend fun playPlopCue(fromHz: Double, toHz: Double): Boolean {
  * Returns a restore runnable callers run in a finally block; it undoes
  * exactly what was set here.
  */
-fun beginCommunicationCapture(context: Context): (() -> Unit)? {
-    val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return null
-
+/**
+ * Finds the input device the recorder should ride, and nothing else.
+ *
+ * This used to *set* the global communication route
+ * ([AudioManager.setCommunicationDevice]) before every capture and clear it
+ * after, which is the root of two user-visible harms: every set/clear cycle
+ * toggles the Bluetooth SCO link, and SCO activation yanks the headset onto
+ * the call volume curve - the volume changes the user never asked for - and
+ * tears down A2DP, which stutters a podcast mid-playback. The route is also
+ * simply not ours to touch: other apps are playing through the very link we
+ * kept flipping.
+ *
+ * Now the device is only *read*: the same preference order (headset, then
+ * built-in mic) is returned and the caller aims its own recorder at it with
+ * [AudioRecord.setPreferredDevice], which steers one capture without any
+ * global routing, volume or SCO side effects.
+ *
+ * @return the preferred input device, or null when there is nothing to steer
+ *   at - the recorder then just uses the framework's default input.
+ */
+fun preferredCaptureDevice(context: Context): AudioDeviceInfo? {
+    val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        ?: return null
     val candidates = audioManager.getAvailableCommunicationDevices()
     // Prefer the headset the user is actually wearing; fall back to the
     // built-in mic only when there is nothing else.
-    val preferred = candidates.firstOrNull {
+    return candidates.firstOrNull {
         it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
             it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
             it.type == AudioDeviceInfo.TYPE_USB_HEADSET
-    } ?: candidates.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC } ?: return null
-
-    // Re-routing to the same device object the framework already reports is a
-    // no-op and costs nothing; re-routing away from the framework's phantom
-    // A2DP choice onto a real headset input is the whole point.
-    try {
-        audioManager.setCommunicationDevice(preferred)
-        // Routing is asynchronous and on Bluetooth it is not instant: the SCO
-        // link itself has to be established, which can take a second or two
-        // from a cold start. A fixed sleep races that link - the recorder would
-        // open on the phone mic, miss the first words, and only later turn on
-        // the headset. So poll until the route is actually reported active,
-        // with a generous cap; falling through just means the recorder starts
-        // a moment before the route lands rather than never.
-        val startedAt = System.currentTimeMillis()
-        val deadline = startedAt + 3000
-        var routed = false
-        while (System.currentTimeMillis() < deadline) {
-            val active = try { audioManager.getCommunicationDevice() } catch (e: Exception) { null }
-            if (active != null && active.type == preferred.type) {
-                routed = true
-                break
-            }
-            Thread.sleep(50)
-        }
-        android.util.Log.d(
-            "VAD",
-            "Communication route set: type=${preferred.type} routed=$routed " +
-                "waited=${System.currentTimeMillis() - startedAt}ms"
-        )
-    } catch (e: Exception) {
-        android.util.Log.w("VAD", "Could not set communication route: ${e.message}")
-        return null
-    }
-    return {
-        try {
-            audioManager.clearCommunicationDevice()
-        } catch (e: Exception) {
-            android.util.Log.w("VAD", "Could not clear communication route: ${e.message}")
-        }
-    }
+    } ?: candidates.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
 }
 
 

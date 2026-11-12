@@ -42,10 +42,11 @@ mode genuinely hands-free and resilient:
   a display-only note in the chat says the server or connection is too slow
 - **Listening is audible** - a matched pair of synthesized plop cues plays as the microphone opens
   and closes, in voice mode and hands-free alike
-- **Bluetooth and wired headsets work** - microphone capture routes through Android's
-  communication routing, so the STT hears the device the user is actually holding (previously a
-  Bluetooth headset was ignored and the phone mic recorded instead), and a headset connected or
-  pulled mid-utterance re-routes capture on the fly
+- **Bluetooth and wired headsets work** - each recorder is steered at the headset input with
+  `AudioRecord.setPreferredDevice` (device read, never set), so the STT hears the device the user
+  is actually holding while no global communication route is touched - no SCO toggling, no volume
+  curve changes, no interruption to media playback - and a headset connected or pulled
+  mid-utterance re-routes capture on the fly
 - **Voice on launch** - opening the app starts the voice pipeline listening straight away,
   behind a new "Voice on Launch" switch
 - **The big microphone is real** - the large mic on the empty-state screen starts recording like
