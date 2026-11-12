@@ -157,10 +157,19 @@ class VoiceCallEngine private constructor(context: Context) {
     /**
      * Start (or re-enter) wake mode: the service listens for the phrase and
      * collects utterances through [nextUtterance].
+     *
+     * Refuses when the chat screen is in a voice call: a wake listener and a
+     * call are different states, the microphone belongs to the call, and
+     * stealing it here would both deafen the call and let the wake matcher
+     * hear the exchange it must not hear. The caller waits and tries again.
+     *
+     * @return whether wake mode now owns the capture.
      */
-    fun startWakeMode() {
+    fun startWakeMode(): Boolean {
+        if (mode == Mode.APP) return false
         mode = Mode.WAKE
         ensureCapture()
+        return true
     }
 
     /**

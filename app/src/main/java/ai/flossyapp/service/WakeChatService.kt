@@ -721,6 +721,16 @@ class WakeChatService : VoiceInteractionService() {
 
     private suspend fun wakeLoop() {
         while (listening) {
+            // Wake detection and a voice call are different states: while the
+            // chat screen is in a call the microphone belongs to it, so the
+            // engine refuses wake mode and this loop simply idles until the
+            // call is over. The capture is (re-)opened here every iteration,
+            // so a capture that died - an app-mode session that stopped the
+            // shared one, say - comes back without touching the loop.
+            if (!VoiceCallEngine.instance(appContext).startWakeMode()) {
+                delay(500)
+                continue
+            }
             var currentSettings = settingsRepository.settingsFlow.value
             // A manual trigger from Settings runs the exchange without the wake
             // match, so the pipeline can be exercised on demand.

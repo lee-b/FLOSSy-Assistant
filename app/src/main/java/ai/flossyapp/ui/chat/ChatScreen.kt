@@ -95,6 +95,9 @@ fun ChatScreen(
     // Raised to cut a reply short while it is still being spoken - text-chat
     // TTS only, since a voice call's playback is aborted through the engine.
     val ttsAbortSignal = java.util.concurrent.atomic.AtomicBoolean(false)
+    // Set when the mic button pauses the wake service for a call, so the
+    // hang-up path knows to hand the microphone back to it.
+    var pausedWakeService by remember { mutableStateOf(false) }
 
     // Every coroutine that carries a piece of a voice call - the spoken cues
     // and the text-chat TTS. The exchange pipeline itself lives in the shared
@@ -275,9 +278,12 @@ fun ChatScreen(
             }
         }
         // The wake-chat service would hear the same words the screen is
-        // answering; with the engine unified there is one capture, so the
-        // service is stopped rather than allowed to open its own recorder.
+        // answering; wake detection and a voice call are different states and
+        // the microphone belongs to the call, so the service is stopped for
+        // the call's duration - and remembered, so hang-up hands the mic
+        // back to it.
         if (ai.flossyapp.service.WakeChatService.isRunning) {
+            pausedWakeService = true
             runCatching {
                 context.applicationContext.startService(
                     ai.flossyapp.service.WakeChatService.buildIntent(
@@ -307,9 +313,28 @@ fun ChatScreen(
         // and the spoken output all fall away together.
         viewModel.endVoiceCall()
         ttsAbortSignal.set(true)
-        // Hand the microphone back: the engine closes the shared capture,
-        // cancels its exchange jobs and aborts any playback still running.
-        ai.flossyapp.ui.common.VoiceCallEngine.instance(context.applicationContext).stop()
+        // Hand the microphone back - but only the mic this call owns: the
+        // engine is torn down when the call is in APP mode, while a WAKE-mode
+        // capture belongs to the wake service and a chat hang-up must never
+        // kill it (that is what deafened the wake word whenever the chat view
+        // was opened and closed mid-listen).
+        val engine = ai.flossyapp.ui.common.VoiceCallEngine.instance(context.applicationContext)
+        if (engine.mode == ai.flossyapp.ui.common.VoiceCallEngine.Mode.APP) {
+            engine.stop()
+        }
+        // The wake service was paused for this call: give the microphone back
+        // to it now that the call is over.
+        if (pausedWakeService) {
+            pausedWakeService = false
+            runCatching {
+                context.applicationContext.startService(
+                    ai.flossyapp.service.WakeChatService.buildIntent(
+                        context.applicationContext,
+                        ai.flossyapp.service.WakeChatService.ACTION_START
+                    )
+                )
+            }
+        }
         // Cancel every coroutine still carrying the call on the screen side -
         // the spoken cues, any text-chat TTS - so nothing can speak after the
         // user hung up.
