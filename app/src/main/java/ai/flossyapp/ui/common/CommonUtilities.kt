@@ -155,6 +155,10 @@ class StreamingCallCapture(
         // How long one chunk of silence ends an utterance, like the per-turn
         // recorder's pause.
         private const val UTTERANCE_SILENCE_MS = 1000L
+        // Bounded rolling window for an utterance in progress (see run()):
+        // trim the oldest audio once the live buffer passes the ceiling.
+        private const val MAX_UTTERANCE_SAMPLES = SAMPLE_RATE * 30
+        private const val KEEP_UTTERANCE_SAMPLES = SAMPLE_RATE * 20
         // The utterance boundaries are relative, cut by voicedSpan; the gate
         // itself is adaptive (see run()).
     }
@@ -259,6 +263,23 @@ class StreamingCallCapture(
 
                 for (i in 0 until read) utterance.add(buffer[i])
                 utteranceProbs.add(prob)
+                // The buffer holds every chunk since the gate opened, so the
+                // cut can roll back before the onset - but idle wake listening
+                // can go hours without an utterance completing, and an
+                // unbounded list of 16 kHz samples is ~32KB/s: it OOMs the
+                // whole process in under an hour (observed: FATAL
+                // OutOfMemoryError in this loop after ~30 idle minutes, which
+                // killed the wake service mid-exchange). Trimmed from the old
+                // end at chunk granularity, so samples and probabilities stay
+                // aligned; a 30s ceiling is far longer than any request and
+                // still leaves the 20s tail the pre-roll and cut need.
+                if (utterance.size > MAX_UTTERANCE_SAMPLES) {
+                    val dropChunks = (utterance.size - KEEP_UTTERANCE_SAMPLES) / SileroVad.CHUNK
+                    if (dropChunks > 0) {
+                        utterance.subList(0, dropChunks * SileroVad.CHUNK).clear()
+                        utteranceProbs.subList(0, dropChunks).clear()
+                    }
+                }
                 if (prob >= SileroVad.START_PROB) {
                     silenceChunks = 0
                     inUtterance = true
