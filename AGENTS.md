@@ -1,8 +1,8 @@
-# LocalAssistant - AI Agent Guide
+# FLOSSyAssistant - AI Agent Guide
 
 ## Project Overview
 
-LocalAssistant is a local-first Android voice assistant: it captures audio on-device and calls
+FLOSSyAssistant is a local-first Android voice assistant: it captures audio on-device and calls
 user-configured local endpoints for LLM, STT and TTS. Nothing is sent to a cloud service and no
 endpoint is hardcoded.
 
@@ -22,11 +22,11 @@ never commit it and never copy its specifics into this file.
 - Kotlin 1.9+, JVM target 17; Jetpack Compose Material3 + Navigation Compose; MVVM (`AndroidViewModel` + `StateFlow`)
 - Room (single table `chat_messages`) · SharedPreferences for settings, not DataStore · kotlinx.serialization on `ChatMessage`, org.json for API bodies
 - OkHttp + SSE streaming · `AudioRecord` for capture, `AudioTrack` for playback (no `MediaRecorder`)
-- compileSdk/minSdk/targetSdk = 35 (Android 12); packages under `com.localassistant.app.*`
+- compileSdk/minSdk/targetSdk = 35 (Android 12); packages under `ai.flossyapp.*`
 
 ## Architecture
 - `domain/model/` - `ChatMessage`, `MessageRole`, `AppSettings` (every config field)
-- `data/local/` - `LocalAssistantDatabase`, `ChatMessageDao`
+- `data/local/` - `FlossyDatabase`, `ChatMessageDao`
 - `data/remote/` - `ApiClient`: `chatCompletion` (SSE), `transcribeAudio`, `synthesizeSpeech`, `fetchModels`, `fetchVoices`
 - `data/settings/` - `SettingsRepository` (SharedPreferences; presets are hand-built JSON)
 - `service/` - `VoiceAssistantService` (in-app pipeline) · `WakeChatService` (hands-free pipeline; **is** an `android.service.voice.VoiceInteractionService`) · `WakeChatSessionService` (its drawing half) · `WakeChatRecognitionService` (hollow `RecognitionService` stub the manifest resource requires)
@@ -92,7 +92,7 @@ never paste them back into this guide.
   enrollment looks like in them, and the traps. **Read this before touching any part of the wake
   path** - the stages are calibrated to each other, so a change in one is only correct if it is
   mirrored in the others.
-- `.qwen/skills/localassistant-deep-dive/SKILL.md` - the device-verified gotcha log: the wake matcher,
+- `.qwen/skills/flossyassistant-deep-dive/SKILL.md` - the device-verified gotcha log: the wake matcher,
   the `VoiceInteractionService`/`VoiceInteractionSessionService` platform path, session window sizing,
   TTS and SSE pitfalls, and this toolchain's API limits. Auto-loaded when Kotlin files are touched.
 - `AGENTS.local.md` - machine endpoints, adb device and deploy commands. Git-ignored, per-machine.

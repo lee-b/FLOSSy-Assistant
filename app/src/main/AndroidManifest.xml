@@ -44,13 +44,13 @@
     <!-- <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" /> -->
 
     <application
-        android:name="com.localassistant.app.LocalAssistantApplication"
+        android:name=".FlossyApplication"
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
-        android:theme="@style/Theme.LocalAssistant"
+        android:theme="@style/Theme.FlossyAssistant"
         android:usesCleartextTraffic="true"
         android:networkSecurityConfig="@xml/network_security_config">
 
@@ -59,7 +59,7 @@
             This is the primary UI for chat history and settings.
         -->
         <activity
-            android:name="com.localassistant.app.ui.MainActivity"
+            android:name=".ui.MainActivity"
             android:exported="true"
             android:windowSoftInputMode="adjustPan">
             <intent-filter>
@@ -80,7 +80,7 @@
             Runs continuously in the background with a persistent notification.
         -->
         <service
-            android:name="com.localassistant.app.service.VoiceAssistantService"
+            android:name=".service.VoiceAssistantService"
             android:foregroundServiceType="microphone"
             android:exported="false" />
 
@@ -114,7 +114,7 @@
             path - the picker's list, onReady(), showSession() - is dead until it does.
         -->
         <service
-            android:name="com.localassistant.app.service.WakeChatService"
+            android:name=".service.WakeChatService"
             android:foregroundServiceType="microphone"
             android:permission="android.permission.BIND_VOICE_INTERACTION"
             android:exported="true">
@@ -143,14 +143,14 @@
             holds only this service - so the field stays null and the very next
             framework call, deliverSession, throws
             "NullPointerException … 'IVoiceInteractionManagerService.deliverNewSession'
-            on a null object reference", which is the "LocalAssistant has stopped"
+            on a null object reference", which is the "FLOSSy Assistant has stopped"
             dialog the user sees on every exchange. The manager service is
             resolvable only in the process that hosts the voice-interaction
             service itself, which is where VoiceInteractionService.onReady()
             resolves it from, so the two halves have to share it.
         -->
         <service
-            android:name="com.localassistant.app.service.WakeChatSessionService"
+            android:name=".service.WakeChatSessionService"
             android:exported="true" />
 
         <!--
@@ -159,7 +159,7 @@
             Restarts the voice assistant service after device reboot.
         -->
         <receiver
-            android:name="com.localassistant.app.receiver.AppBootReceiver"
+            android:name=".receiver.AppBootReceiver"
             android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
@@ -173,7 +173,7 @@
             Restarts listening when network becomes available.
         -->
         <receiver
-            android:name="com.localassistant.app.receiver.NetworkStateReceiver"
+            android:name=".receiver.NetworkStateReceiver"
             android:exported="false">
             <intent-filter>
                 <action android:name="android.net.conn.CONNECTIVITY_CHANGE" />
@@ -187,7 +187,7 @@
             to start/stop the voice assistant service.
         -->
         <receiver
-            android:name="com.localassistant.app.widget.VoiceAssistantWidget"
+            android:name=".widget.VoiceAssistantWidget"
             android:exported="false">
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />

@@ -5,7 +5,7 @@ plugins {
 }
 
 android {
-    namespace = "com.localassistant.app"
+    namespace = "ai.flossyapp"
     
     // compileSdk 35 for Android 15.0 (API 35) compatibility
     compileSdk = 35

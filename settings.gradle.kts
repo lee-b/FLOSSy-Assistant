@@ -22,5 +22,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "Local Assistant"
+rootProject.name = "FLOSSy Assistant"
 include(":app")

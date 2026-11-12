@@ -1,6 +1,6 @@
 # FLOSSy Assistant - On-Device AI Voice Assistant
 
-<img src="docs/images/app-icon.webp" alt="Local Assistant logo" width="128" align="left" />
+<img src="docs/images/app-icon.webp" alt="FLOSSy Assistant logo" width="128" align="left" />
 
 A privacy-first, fully local AI voice assistant for Android that connects to your own running
 services. No cloud dependencies, no telemetry, no data leaves your device.
@@ -175,7 +175,7 @@ curl -X POST http://192.168.1.100:8087/v1/audio/speech \
 
 ### 1. Clone and Build
 ```bash
-cd /path/to/LocalAssistant
+cd /path/to/FLOSSyAssistant
 ./gradlew assembleDebug
 ```
 
@@ -227,7 +227,7 @@ Configure all aspects of the assistant:
 ### Debugging From adb
 Trigger an exchange without going through the menus or saying the phrase:
 ```bash
-adb shell "am start -W -a com.localassistant.TRIGGER_WAKE_CHAT com.localassistant.app/.ui.MainActivity"
+adb shell "am start -W -a ai.flossyapp.TRIGGER_WAKE_CHAT ai.flossyapp/.ui.MainActivity"
 ```
 The service logs its own phase, so `adb logcat` filtered on the class name is the running trace:
 ```bash
@@ -245,15 +245,15 @@ like when a wake word refuses to fire.
 
 ```
 app/
-├── src/main/java/com/localassistant/app/
-│   ├── LocalAssistantApplication.kt    # Application class
+├── src/main/java/ai/flossyapp/
+│   ├── FlossyApplication.kt            # Application class
 │   ├── domain/
 │   │   └── model/                      # Data models
 │   │       ├── ChatMessage.kt          # Message entity
 │   │       └── AppSettings.kt          # Settings data class
 │   ├── data/
 │   │   ├── local/                      # Room database
-│   │   │   ├── LocalAssistantDatabase.kt
+│   │   │   ├── FlossyDatabase.kt
 │   │   │   └── ChatMessageDao.kt
 │   │   ├── remote/                     # API clients
 │   │   │   └── ApiClient.kt            # HTTP client for LLM/STT/TTS

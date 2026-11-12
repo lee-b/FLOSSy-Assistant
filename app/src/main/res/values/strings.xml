@@ -6,7 +6,7 @@
     <!-- Service Notification -->
     <string name="notification_channel_name">Voice Assistant</string>
     <string name="notification_channel_description">Local AI Voice Assistant - Always listening mode</string>
-    <string name="notification_title">Local Assistant</string>
+    <string name="notification_title">FLOSSy Assistant</string>
     <string name="notification_listening">Listening...</string>
     <string name="notification_processing">Processing...</string>
     <string name="notification_speaking">Speaking...</string>
@@ -64,7 +64,7 @@
     <!-- Permissions -->
     <string name="permission_microphone">Microphone access is required for voice recognition</string>
     <string name="permission_notification">Notifications are needed for the always-listening service</string>
-    <string name="permission_rationale">Local Assistant needs microphone access to listen for your wake word and commands. All processing happens locally on your device.</string>
+    <string name="permission_rationale">FLOSSy Assistant needs microphone access to listen for your wake word and commands. All processing happens locally on your device.</string>
 
     <!-- Error Messages -->
     <string name="error_audio_init">Failed to initialize audio recorder</string>
@@ -82,7 +82,7 @@
     <string name="voice_assistant">Voice Assistant</string>
     <string name="voice_assistant_tap_to_activate">Tap to activate</string>
     <string name="voice_assistant_active">Assistant active</string>
-    <string name="widget_app_update">com.localassistant.app.WIDGET_UPDATE</string>
+    <string name="widget_app_update">ai.flossyapp.WIDGET_UPDATE</string>
 
     <!-- Chat Screen UI Strings -->
     <string name="chat_settings_button">\u2699\ufe0f Settings</string>

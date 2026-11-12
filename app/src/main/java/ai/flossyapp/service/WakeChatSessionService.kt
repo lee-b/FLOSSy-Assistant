@@ -1,0 +1,1187 @@
+package ai.flossyapp.service
+
+import android.app.Activity
+import android.graphics.drawable.GradientDrawable
+import android.os.Bundle
+import android.service.voice.VoiceInteractionSession
+import android.service.voice.VoiceInteractionSessionService
+import android.util.Log
+import android.view.Gravity
+import android.view.View
+import android.widget.LinearLayout
+import android.widget.TextView
+import ai.flossyapp.ui.theme.TRANSPARENT
+import ai.flossyapp.ui.theme.GRUVBOX_ON_SURFACE
+import ai.flossyapp.ui.theme.GRUVBOX_ON_SURFACE_MUTED
+import ai.flossyapp.ui.theme.GRUVBOX_PRIMARY
+import ai.flossyapp.ui.theme.GRUVBOX_ERROR
+import ai.flossyapp.ui.theme.WAKE_CARD_SURFACE
+import ai.flossyapp.ui.theme.WAKE_CARD_ELEVATION
+import ai.flossyapp.ui.theme.WAKE_USER_BUBBLE
+import ai.flossyapp.ui.theme.WAKE_REPLY_BUBBLE
+import ai.flossyapp.ui.theme.WAKE_PHASE_LISTENING
+import ai.flossyapp.ui.theme.WAKE_PHASE_THINKING
+import ai.flossyapp.ui.theme.WAKE_PHASE_ANSWERING
+import ai.flossyapp.ui.theme.WAKE_DIVIDER
+
+/**
+ * The key the wake service uses to hand the user's request to a session.
+ *
+ * The two halves of the pipeline never share memory, so the exchange travels
+ * under these keys in the bundle the wake service passes to
+ * [VoiceInteractionService.showSession][showSession].
+ */
+const val SESSION_REQUEST_KEY = "request"
+
+/**
+ * The key the wake service uses to hand the spoken reply to a session.
+ */
+const val SESSION_REPLY_KEY = "reply"
+
+/**
+ * The key the wake service uses to say which half of the exchange the user is in.
+ * The window is raised the moment the wake phrase is matched, before any words
+ * exist, so a session has to be able to render an exchange that has no text yet.
+ */
+const val SESSION_STATE_KEY = "state"
+
+/**
+ * The key the wake service uses to say how far through the card's climb or sink
+ * this show is, as text from "0" (at the bottom edge, no ink) to "1" (settled).
+ *
+ * There is no animation API to reach for: `View.startAnimation` and `View.setAnimation`
+ * exist but their argument type is `android.animation.Animation`, which this toolchain
+ * can neither name nor construct - `android.animation.Animation`, every
+ * `android.animatable.*` spelling and `android.app.Activity.loadAnimation` are
+ * unresolved, and the only members of `android.animation` that do resolve
+ * ([android.animation.Animator] and [android.animation.Keyframe]) are abstract
+ * classes with no constructor. Motion is therefore a sequence of shows, and this
+ * key is what turns that sequence into an animation rather than a handful of jumps:
+ * the wake service asks for the window many times in a row and hands each show a
+ * position along the curve, so the card translates up from the bottom edge and fades
+ * in, and the same ladder run backwards under [SESSION_STATE_CLOSE] sinks it.
+ *
+ * The wake service owns the timing and this file only ever reads a position, so the
+ * two halves cannot drift apart over a frame count they each hard-code. The position
+ * travels as text because every other key here is text and a session parses what it
+ * is handed.
+ */
+const val SESSION_ANIM_KEY = "anim"
+
+/**
+ * The window is being raised and the card is still climbing from the bottom edge.
+ *
+ * The rise is a sequence of shows rather than an animation - see [SESSION_ANIM_KEY]
+ * for why there is no animation API here - so the wake service asks for the
+ * window several times in a row before the exchange itself has anything to show.
+ */
+const val SESSION_STATE_RISE = "rise"
+
+/** The phrase was heard; the app is waiting for the request. */
+const val SESSION_STATE_LISTENING = "listening"
+
+/** The request is known and the answer is being produced. */
+const val SESSION_STATE_REQUEST = "request"
+
+/** The request and the reply are both known. */
+const val SESSION_STATE_REPLY = "reply"
+
+/**
+ * The reply is arriving from the LLM as it is written, so the answer bubble
+ * grows with the text that has arrived so far.
+ */
+const val SESSION_STATE_STREAMING = "streaming"
+
+/** The reply is being spoken by the TTS endpoint. */
+const val SESSION_STATE_SPEAKING = "speaking"
+
+/**
+ * The exchange has been closed, so the session is asked to show nothing and to
+ * tear its window down.
+ */
+const val SESSION_STATE_CLOSE = "close"
+
+/*
+ * The card's colours come from the shared palette module (see the imports above),
+ * which is the one set of Gruvbox tokens both halves of the app name.
+ *
+ * A session is drawn by the system, so it cannot read a Compose MaterialTheme -
+ * that is why the palette lives as plain ARGB integers rather than as the colour
+ * roles [Theme] builds, and why this file can depend on it without carrying any
+ * Compose into a process that must not have any.
+ *
+ * The card surface is translucent rather than solid: the window is transparent
+ * and the platform paints nothing behind the card, so the screen the device is
+ * showing reads through it and the exchange stays a floating chat card instead
+ * of a panel over the display.
+ */
+
+/**
+ * The short edge of the display the design values below were measured on.
+ *
+ * A session cannot ask for a density: `getDisplayMetrics`,
+ * `android.graphics.DisplayMetrics`, `android.util.Metrics`,
+ * `android.os.DisplayManager`, `android.graphics.types.*`,
+ * `android.content.Configuration`/`Resolution` and `android.os.FileUri` are all
+ * unresolved here, and the [android.view.Window] the session is handed answers
+ * `setLayout` but exposes none of its own geometry (`width`, `height`, `left`,
+ * `top`, `right`, `bottom`, `frame`, `getParameters` are all unresolved). The one
+ * display measurement that does work is indirect: leave the window as the
+ * platform builds it - a `fillxfill` surface over the whole display - and read
+ * back the card, which the window stretches to fill. That measured short edge
+ * divided by this baseline is [scale], and it is the density-independent basis
+ * available here: a physical edge, not a pixel count assumed to mean the same
+ * thing on every screen.
+ */
+private const val BASE_SHORT_EDGE = 1840
+
+/**
+ * How far the design may shrink or grow relative to that reference display.
+ *
+ * Taken literally, a small phone would get a card whose text is unreadable across
+ * a room and a large display would get a card taller than an exchange needs, so
+ * the scale is clamped: the card stays legible and the proportions stay sane at
+ * both ends. The clamp is what the fallback relies on, too - an unmeasured
+ * display leaves the scale at 1, which is the shipped design.
+ */
+private const val MIN_SCALE = 0.6f
+private const val MAX_SCALE = 1.4f
+
+/**
+ * How big the card is.
+
+ *
+ * A session cannot read the display: `android.graphics.DisplayMetrics`,
+ * `getDisplayMetrics` and `android.widget.internal` (a `Filler` spacer) are all
+ * unreachable, `View.setFillDimensions` does not exist, and a forced minimum
+ * (`setMinimumWidth`/`setMinimumHeight`) is not honoured by the window's measure
+ * pass - forcing one left the card in the window's top-left corner, which is what
+ * the user reported. The width therefore comes from padding, which is the sizing
+ * API the measure pass does honour: a `ruler` child of the card carries
+ * [CARD_WIDTH] as left-plus-right padding and nothing else, so it measures to
+ * exactly that width, contributes no height, and pins the card to it whatever
+ * the text inside it happens to be.
+ *
+ * The numbers below are a **design**: they are the values measured on the
+ * reference display, whose short edge is [BASE_SHORT_EDGE] px. The session
+ * measures the display it is actually running on (see [measureDisplay]) and
+ * multiplies the whole set by one [scale], so the card keeps its proportions on
+ * a phone as on the tab it was tuned on - a card built from these numbers
+ * literally is what made the sides of the card get cut off on smaller displays.
+ *
+ * The scale comes from the **short** edge, which is also what makes the card the
+ * same size in landscape and portrait: a width that fits across the short edge
+ * still fits when the device turns, where a width taken from the long edge would
+ * be wider than the screen there and have its sides cut off.
+ */
+private const val CARD_WIDTH = 1560
+private const val USER_TEXT_SIZE = 20f
+private const val REPLY_TEXT_SIZE = 22f
+private const val STATUS_SIZE = 17f
+private const val CARD_SIDE_PADDING = 44
+private const val CARD_TOP_PADDING = 32
+private const val CARD_BOTTOM_PADDING = 32
+private const val BUBBLE_PADDING = 32
+
+/**
+ * How tall a line of text and the status line actually are, which is what the
+ * card's height is built from.
+ *
+ * A legacy [android.widget.TextView] reports no intrinsic size, so the session
+ * cannot ask the views how tall the text they hold is - the only heights it
+ * knows are the ones it gives them. Measured on the tab, the view draws at about
+ * **twice** the pixel size it is handed: at a 44 px setting the glyphs came out
+ * ~88 px tall, a character advanced ~43 px, and the line box measured 125 px.
+ * That is why the sizes above are half what the card should read as - a 22 px
+ * setting is a ~44 px card font - and these are the resulting line boxes, about
+ * 2.8 times the setting rather than the 1.2 times Roboto's own ascent, descent
+ * and leading suggest, because the view adds its internal padding to the font
+ * box. Underestimate these and the last line of a reply is cut off at the bottom
+ * edge of the card, which is exactly what the earlier build showed.
+ */
+private const val LINE_HEIGHT = 62
+private const val STATUS_HEIGHT = 48
+
+/**
+ * The height the card rests at, whatever is inside it.
+ *
+ * Without this the card is exactly as tall as its content, which is nothing at
+ * the start of an exchange: the card measured 0, then 68, then 0 across the rise
+ * shows, so the panel jumped instead of climbing, and a two-word request sat in a
+ * sliver far too short to read as a chat card. The window is cut to at least this
+ * much card, so the card is [CARD_HEIGHT] until the text genuinely needs more,
+ * and only then does it grow.
+ */
+private const val CARD_HEIGHT = 620
+
+/**
+ * The tallest the card may become when an answer genuinely needs it.
+ *
+ * A long reply streams into the card line by line, and without a ceiling a
+ * rambling answer turns the card back into a panel over the whole display. This
+ * is set to the height [neededHeight] asks for at the fullest exchange the card
+ * is allowed to show, so the last line of a reply is never cut off by the ceiling
+ * itself - only by [REPLY_MAX_LINES].
+ */
+private const val MAX_CARD_HEIGHT = 960
+
+/**
+ * How much of the window the platform keeps for itself around the card.
+ *
+ * Measured on the tab: whatever height the window is cut to, the card inside it
+ * measures exactly that less this. The card is stretched to fill the window, so
+ * this is the only room the card cannot claim, and it is why the window - not the
+ * card - decides how tall the card is.
+ */
+private const val WINDOW_OVERHEAD = 96
+
+/**
+ * How far the card floats above the bottom edge of the display.
+ *
+ * The window is pinned to the bottom edge, so the room under the card is not the
+ * window's - it is the stage's own. A bare [android.view.View] carrying padding
+ * measures **0** height, which is why the earlier build sat flush against the
+ * edge; a `LinearLayout` with no children and top padding does measure to that
+ * padding - the same honoured trick the ruler uses for width - so the inset is a
+ * `foot` under the card. It is what keeps the card clear of the gesture bar,
+ * which the earlier build drew straight through the bottom of the card.
+ */
+private const val BOTTOM_MARGIN = 56
+
+/**
+ * How wide the layer of ink under the card is, which is what reads as elevation.
+ *
+ * A session has no shadow API and [GradientDrawable] takes no stroke, so depth is
+ * layered translucency: the card wears a faint, wider layer and the panel sits on
+ * top of it, which reads as a sheet lifted off the screen rather than a flat
+ * cut-out of it.
+ */
+private const val CARD_ELEVATION = 10
+
+/**
+ * The width the card's children may use, which is what a line of text and a
+ * bubble are both measured against.
+ *
+ * A bubble that only spans its own longest line makes the card jump wider every
+ * time a longer sentence arrives, so each bubble carries a ruler of this width
+ * and the card is the same shape for the whole exchange.
+ */
+private const val INNER_WIDTH = CARD_WIDTH - CARD_SIDE_PADDING * 2
+
+/**
+ * The width a bubble's text may use, which is what a line is wrapped to.
+ *
+ * A bubble spans the card's inner width so the card never jumps wider as longer
+ * sentences arrive, and its text is inset by the bubble's own padding - so the
+ * text budget is that width less the padding, not the card width.
+ */
+private const val BUBBLE_TEXT_WIDTH = INNER_WIDTH - BUBBLE_PADDING * 2
+
+/**
+ * The size of the window the system raises for the exchange.
+ *
+ * The window used to be left exactly as the platform builds it, which is a
+ * `fillxfill` surface covering the whole display: the platform paints its own
+ * rounded panel behind whatever a session draws, so the exchange looked like a
+ * large white box over the screen and no amount of styling the card could change
+ * that. Neither half of that is fixed, though: [VoiceInteractionSession.getWindow][window]
+ * hands back the session's [android.app.Dialog], and that Dialog's
+ * [android.view.Window] answers `setLayout` **and** `setBackgroundDrawable`, so
+ * the window can be cut to the card *and* the panel it carries can be cleared -
+ * handing it a transparent shape removes the cream panel entirely, which is what
+ * lets the screen underneath read through the card.
+ *
+ * The height is worked out from the text about to be drawn, never read back off
+ * the card, and [MAX_WINDOW_HEIGHT] is the ceiling that keeps a long answer from
+ * turning the card back into a panel over the display.
+ */
+private const val CARD_OUTER_WIDTH = CARD_WIDTH + CARD_SIDE_PADDING * 2
+private const val MAX_WINDOW_HEIGHT = MAX_CARD_HEIGHT + WINDOW_OVERHEAD + BOTTOM_MARGIN
+
+/**
+ * How big the drawn status indicator is.
+ *
+ * The glyph that used to lead the status line was a character the typeface had
+ * to carry, so it drew whatever the font drew - a thin ring that read as part of
+ * the words rather than as the state of the exchange. The indicator is now a
+ * childless `LinearLayout` wearing a rounded shape in the phase's colour: a
+ * background fills the whole widget, so the chip's padding **is** its size, which
+ * is the same honoured trick the ruler and the foot use for measuring.
+ */
+private const val CHIP_SIZE = 26
+
+/**
+ * How thick the rule between the two bubbles is.
+ *
+ * The bubbles are the same rounded sheet on the same card, so across a room they
+ * read as one block of ink; a faint rule between them is what separates the turn
+ * the user spoke from the answer, without a stroke API or a second panel.
+ */
+private const val DIVIDER_HEIGHT = 6
+
+/**
+ * How thick the underline beneath a still-arriving answer is.
+ *
+ * While the reply is streaming, the answer block looks the same whether the last
+ * chunk landed a heartbeat ago or the model has gone quiet, so the card gives no
+ * hint that the sentence is unfinished. A bar under the answer that toggles
+ * between shows reads as a cursor: a session is drawn as a sequence of shows and
+ * has no animation API, so the blink is a counter advanced in [onPrepareShow] and
+ * read in [paint]. The bar is always padded - ink or no ink - so toggling it
+ * never jumps the card.
+ */
+private const val CARET_HEIGHT = 8
+
+/**
+ * How rounded the card and the bubbles inside it are.
+ *
+ * A flat `setBackgroundColor(Int)` paints a sharp rectangle, which is what the
+ * user saw as "the message boxes are sharp squares". The rounded route that
+ * resolves here is [GradientDrawable]: it constructs with no arguments, takes
+ * [GradientDrawable.setColor][setColor] and a **Float**
+ * [GradientDrawable.setCornerRadius][setCornerRadius] (the Int spelling is
+ * rejected with "Argument type mismatch: actual type is 'Int', but 'Float' was
+ * expected"), and a `View` accepts it through `setBackgroundDrawable`/`background`
+ * - the same setters that are unresolved on a [VoiceInteractionSession] itself
+ * work on the widgets inside it, which is why the card can be rounded while the
+ * platform's own panel behind it cannot be touched.
+ */
+private const val CARD_RADIUS = 28f
+private const val USER_RADIUS = 16f
+private const val REPLY_RADIUS = 26f
+
+/**
+ * The one gap between blocks of the card: status to user bubble, bubble to rule,
+ * rule to answer bubble.
+ *
+ * Every block is separated by the same room, which is what gives the card a
+ * vertical rhythm rather than a stack of boxes that each carry their own. It is
+ * padding on the block above rather than a spacer child, because the card builds
+ * its children once and the structure cannot grow between shows.
+ */
+private const val BUBBLE_GAP = 24
+
+/**
+ * The gap between the status chip and the label beside it.
+ *
+ * A row lays its children flush against each other, so the breathing room the
+ * card's own padding would give is nothing here. The gap is left padding on the
+ * label rather than right padding on the chip, because a background fills a
+ * chip's whole widget - padding on the chip would widen the ink, not the gap.
+ */
+private const val STATUS_DOT_GAP = 18
+
+/**
+ * The main-axis orientation every container in the card is forced to.
+ *
+ * The one-argument [android.widget.LinearLayout] constructor does **not** stack
+ * children here: measured on the tab, every child of the panel reported the
+ * same height - the panel's inner height - and the card's two children each
+ * measured the full card height, which is cross-axis stretching, i.e. a
+ * horizontal layout. The card therefore painted as one flat band with the
+ * bubbles side by side and clipped, and no amount of padding or gravity changed
+ * it. AOSP names the orientations as the statics `HORIZONTAL = 0` and
+ * `VERTICAL = 1`; Kotlin cannot reach a static member of a Java class
+ * (`android.widget.LinearLayout.VERTICAL` is rejected, as is the
+ * `android.widget.LinearLayoutHorizontal` spelling), so the value is named here
+ * and applied with [android.widget.LinearLayout.setOrientation][setOrientation].
+ */
+private const val VERTICAL = 1
+
+/**
+ * How much text the card can show.
+ *
+ * A legacy `TextView` never wraps, so a reply is split into lines here and each
+ * line gets one of a fixed pool of TextViews - the pool is fixed because the
+ * session builds its content view once and reuses it for every later show, so
+ * the structure cannot grow with the text.
+ *
+ * [LINE_CHARS] is chosen so a full line fits [BUBBLE_TEXT_WIDTH]: at [REPLY_TEXT_SIZE] a
+ * character is roughly 22 px wide, so 64 characters fill a bubble without
+ * overflowing it. The counts are deliberately small - a request is a spoken
+ * sentence and an answer is read aloud - because the card must stay a card:
+ * [USER_MAX_LINES] plus [REPLY_MAX_LINES] lines is the tallest it is ever allowed
+ * to be, and [MAX_WINDOW_HEIGHT] is the ceiling the window is cut to.
+ */
+private const val USER_MAX_LINES = 2
+private const val REPLY_MAX_LINES = 8
+private const val LINE_CHARS = 64
+
+/**
+ * The session half of the wake pipeline.
+ *
+ * A [VoiceInteractionService] can keep FLOSSyAssistant listening while the app is
+ * minimized, but everything it can show the user in that state travels in a
+ * notification - the app's own Compose overlay only paints inside the app's
+ * surface, so it is invisible on the home screen or over another app.
+ *
+ * A [VoiceInteractionSession] is the opposite half: the system draws it as a
+ * window of type TYPE_VOICE_INTERACTION over whatever is on screen, which is the
+ * only way the wake chat can be seen outside the app. The two halves never
+ * share memory - the session runs in its own process - so the exchange travels
+ * in the [Bundle] the wake service passes to
+ * [VoiceInteractionService.showSession][showSession].
+ *
+ * The content view is built from the legacy Java UI classes ([LinearLayout],
+ * [TextView]) because that is what a session window accepts:
+ * [VoiceInteractionSession.onCreateContentView][onCreateContentView] returns an
+ * [android.view.View], not a Compose surface. The card is styled to match the
+ * card the app draws itself, and it is the only rendering of the wake chat - the
+ * app-level overlay was removed so both halves show the same thing.
+ */
+class WakeChatSessionService : VoiceInteractionSessionService() {
+
+    /**
+     * Create the session that will show the exchange.
+     *
+     * The session is built around this service as its context, and that is the
+     * only context that can work here. [VoiceInteractionSession] starts by asking
+     * the context for a window context of type TYPE_VOICE_INTERACTION
+     * (createWindowContextIfNeeded), and it does that only when the context is
+     * NOT a UI context: an android.app.Activity is annotated @UiContext, so
+     * handing one over skips that step entirely and the session's window is
+     * attached to a surface that belongs to nothing, which is why the exchange
+     * never appears over the home screen or another app. A Service is a
+     * ContextWrapper - hence a Context - whose base is null, so it reports
+     * isUiContext() false and can answer getSystemService(DisplayManager),
+     * which is exactly what the window context needs. AOSP hands this same
+     * object to HandlerCaller in onCreate() for the same reason.
+     */
+    override fun onNewSession(args: android.os.Bundle): VoiceInteractionSession {
+        Log.i("WakeChatSessionService", "The system asked for a session: $args")
+        return WakeChatSession(this)
+    }
+}
+
+/**
+ * A voice interaction session that shows the wake exchange the system asked for.
+ *
+ * The context is the session service itself, never an [android.app.Activity]:
+ * Activity is annotated @UiContext, which makes
+ * [VoiceInteractionSession.createWindowContextIfNeeded][VoiceInteractionSession]
+ * keep the context as it is and attach the session window to a surface that
+ * belongs to nothing. A Service is a ContextWrapper with no base, so it reports
+ * isUiContext() false and the session gets a real TYPE_VOICE_INTERACTION window
+ * context from the DisplayManager, which is the surface drawn over every app.
+ *
+ * The views are built once, in [onCreateContentView], and every later show only
+ * mutates them through [paint], because the framework creates the content view
+ * the first time it shows a session and hands that same view to its window
+ * afterwards - building fresh views per show would leave the reply never drawn.
+ */
+private class WakeChatSession(private val context: android.app.Service) : VoiceInteractionSession(context) {
+
+    private var state = ""
+    private var request = ""
+    private var reply = ""
+
+    /**
+     * How far through the climb or sink the next show is, from "0" at the bottom
+     * edge to "1" settled at rest.
+     *
+     * The session is created per exchange, so this counts from the first show of
+     * an exchange and never needs resetting. One position drives both the height
+     * and the ink, which is what ties the slide and the fade into one motion.
+     */
+    private var riseProgress = 0f
+
+    /**
+     * Which blink of the caret the next show is, so a still-arriving answer can
+     * toggle its underline - see [CARET_HEIGHT] for why a blink is a counter.
+     *
+     * The session is created per exchange, so this counts from the first show of
+     * an exchange and never needs resetting.
+     */
+    private var caretFrame = 0
+
+    /**
+     * The short edge of the display, in px, as measured from the window the
+     * platform lays out for the first show; zero until measured.
+     *
+     * See [measureDisplay] for how the session gets it at all, and see [scale]
+     * for what it is used for. Zero is the fallback: an exchange that never
+     * measures draws at the shipped design.
+     */
+    private var measuredShortEdge = 0
+
+    /**
+     * How much bigger the card is than its design, which is what every metric
+     * in this file is multiplied by.
+     *
+     * One factor rather than a per-metric override is the point: the card is a
+     * design, and scaling all of it together is what keeps the text inside the
+     * bubbles, the bubbles inside the card and the card inside the display in the
+     * same relationship on every screen.
+     */
+    private var scale = 1f
+
+    /**
+     * Whether the next show is still the one that measures the display.
+     *
+     * Only the first show of an exchange can do the measuring, and it gets one
+     * attempt: if the card reads back nothing then, the exchange draws at the
+     * shipped design rather than measuring again on a window that is already cut.
+     */
+    private var measuring = true
+
+    /**
+     * What the next show must draw, wrapped once so the window and the paint
+     * agree on how many lines there are.
+     */
+    private var userShown: List<String> = listOf()
+    private var replyShown: List<String> = listOf()
+
+    /**
+     * The views the window shows, built once here and only ever mutated after.
+     *
+     * An empty `TextView` measures nothing and a transparent background paints
+     * nothing, so a state that shows no turn contributes no height and no ink.
+     *
+     * The stage holds only the card: the window is pinned to the bottom edge and
+     * stretches the card to fill itself, so the card's height is the window's
+     * doing - see [sizeWindow] - and nothing has to be stacked under it.
+     */
+    private val stage = LinearLayout(context)
+    private val card = LinearLayout(context)
+
+    /**
+     * The empty strip under the card that keeps it off the bottom edge.
+     *
+     * It measures to its own top padding and paints nothing, which is the same
+     * honoured trick the ruler uses for width - see [BOTTOM_MARGIN].
+     */
+    private val foot = LinearLayout(context)
+    private val panel = LinearLayout(context)
+    private val statusLine = TextView(context)
+
+    /**
+     * The drawn indicator that leads the status line - see [CHIP_SIZE] for why a
+     * glyph could not be used.
+     */
+    private val phaseChip = LinearLayout(context)
+    private val userBubble = LinearLayout(context)
+    private val userLines = (0 until USER_MAX_LINES).map { _ -> TextView(context) }
+    private val replyBubble = LinearLayout(context)
+    private val replyLines = (0 until REPLY_MAX_LINES).map { _ -> TextView(context) }
+
+    /**
+     * The underline that blinks under a reply that is still arriving.
+     *
+     * It is a childless `LinearLayout`, the same measuring trick the ruler and
+     * the foot use - see [CARET_HEIGHT] for why the ink is a bar and how the
+     * blink is driven.
+     */
+    private val caret = LinearLayout(context)
+
+    /**
+     * The children that pin the card to a fixed size, the rows the bubbles sit
+     * in, and the shapes that round them.
+     *
+     * The ruler is an empty child carrying the card's width as left-plus-right
+     * padding: it measures to that width and to no height, so the card stays the
+     * same shape for the whole exchange instead of jumping wider whenever a
+     * longer sentence arrives.
+     *
+     * Each bubble sits inside its own row rather than directly in the panel. The
+     * panel is a vertical container, so it stretches its children across the full
+     * inner width - measured on the tab, the user bubble came out at 1560 px
+     * regardless of how much text it held, which read as a band across the card
+     * rather than a bubble. A row is the default horizontal container, and there
+     * the bubble keeps its **own** measured width along the main axis, so it hugs
+     * its longest line; the row itself is still stretched by the panel, which is
+     * what leaves room for gravity to push the reply to the right edge.
+     *
+     * The shapes are built once because the views are built once; [paint] only
+     * ever swaps which shape a widget carries.
+     */
+    private val ruler = LinearLayout(context)
+    private val statusRow = LinearLayout(context)
+    private val userRow = LinearLayout(context)
+    private val divider = LinearLayout(context)
+    private val replyRow = LinearLayout(context)
+    private var cardShape = rounded(WAKE_CARD_SURFACE, CARD_RADIUS)
+    private var elevationShape = rounded(WAKE_CARD_ELEVATION, CARD_RADIUS + CARD_ELEVATION)
+    private val clearShape = rounded(TRANSPARENT, CARD_RADIUS)
+    private var userShape = rounded(WAKE_USER_BUBBLE, USER_RADIUS)
+    private var replyShape = rounded(WAKE_REPLY_BUBBLE, REPLY_RADIUS)
+    private var dividerShape = rounded(WAKE_DIVIDER, 0f)
+    private var caretShape = rounded(GRUVBOX_PRIMARY, CARET_HEIGHT / 2f)
+    private var chipListening = rounded(WAKE_PHASE_LISTENING, CHIP_SIZE / 2f)
+    private var chipThinking = rounded(WAKE_PHASE_THINKING, CHIP_SIZE / 2f)
+    private var chipAnswering = rounded(WAKE_PHASE_ANSWERING, CHIP_SIZE / 2f)
+    private var chipFault = rounded(GRUVBOX_ERROR, CHIP_SIZE / 2f)
+
+    /**
+     * Records what the platform is about to show.
+     *
+     * AOSP calls this before it asks for the content view, so the text has to be
+     * taken here rather than read where the views are built. A rise frame only
+     * advances the climb; every other state settles the card at its resting
+     * height, so an exchange that is interrupted mid-climb still ends in the
+     * same place. The blink counter advances on every show, whatever the state,
+     * so the caret's phase keeps running even when nothing draws it.
+     */
+    override fun onPrepareShow(args: android.os.Bundle, showFlags: Int) {
+        state = args.getString(SESSION_STATE_KEY) ?: ""
+        request = args.getString(SESSION_REQUEST_KEY) ?: ""
+        reply = args.getString(SESSION_REPLY_KEY) ?: ""
+        riseProgress = settledProgress(args.getString(SESSION_ANIM_KEY))
+        caretFrame++
+        rescale()
+        userShown = wrap(request, USER_MAX_LINES)
+        replyShown = wrap(reply, REPLY_MAX_LINES)
+        if (measuring && state == SESSION_STATE_RISE) measureDisplay() else sizeWindow()
+        metrics()
+        if (measuring) clearCard() else paint()
+    }
+
+    /**
+     * Cuts the window the system raises for the exchange down to the card.
+     *
+     * The platform builds the session window as a `fillxfill` surface and lays it
+     * out to fill the display, then paints its own rounded panel across the whole
+     * of it - that panel is why the exchange used to cover the screen as a large
+     * white box that no amount of card styling could shrink. The window is
+     * reachable from here, though: [window] is the session's [android.app.Dialog]
+     * and that Dialog's [android.view.Window] answers `setLayout`, so the window
+     * can be sized to the card and pinned to the bottom edge. The panel then
+     * measures to the card, and everything outside it is the app underneath -
+     * which is what makes the exchange a small card floating over everything
+     * rather than a panel over the whole display.
+     *
+     * AOSP only lays the window out to fill the screen while it is *not* visible
+     * (`doShow` calls `ensureWindowAdded` inside `if (!mWindowVisible)`), and it
+     * calls [onPrepareShow] before that, so sizing here wins on the first show
+     * and is never fought back on the ones that follow.
+     *
+     * The height is worked out from the text that is about to be drawn rather
+     * than read back off the card, because the window's fixed height stretches
+     * the card back to fill it: deriving the one from the measured other is a
+     * feedback loop, and it is what made the card grow by 54 px on every show
+     * forever. [neededHeight] is the truth, [CARD_HEIGHT] is the floor it rests
+     * at, and [MAX_WINDOW_HEIGHT] is the ceiling a long answer may not pass.
+     */
+    private fun sizeWindow() {
+        val surface = windowSurface() ?: return
+        val needed =
+            if (state == SESSION_STATE_CLOSE && riseProgress <= 0f) 0
+            else neededHeight(userShown.size, replyShown.size)
+        val risen = riseHeight()
+        val wanted = if (needed > risen) needed else risen
+        val limit = px(MAX_CARD_HEIGHT)
+        val tall = if (wanted > limit) limit else wanted
+        val ring = px(CARD_ELEVATION) * 2
+        val cut = tall + WINDOW_OVERHEAD + ring + px(BOTTOM_MARGIN)
+        val ceiling = px(MAX_WINDOW_HEIGHT) + ring
+        val height = if (cut > ceiling) ceiling else cut
+        surface.setLayout(px(CARD_OUTER_WIDTH) + ring, height)
+        surface.setGravity(Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
+        surface.setBackgroundDrawable(clearShape)
+        Log.i(
+            "WakeChatSessionService",
+            "Cut the window to ${px(CARD_OUTER_WIDTH) + ring} by ${height} for a ${tall}-tall card at $riseProgress (scale $scale)"
+        )
+    }
+
+    /**
+     * The window the system raised for the exchange, or null until it exists.
+     *
+     * [window] is the session's [android.app.Dialog] and that Dialog answers
+     * [android.view.Window], which is the only object here that takes
+     * `setLayout` - the session itself does not answer it.
+     */
+    private fun windowSurface(): android.view.Window? {
+        val dialog = window
+        if (dialog == null) {
+            Log.i("WakeChatSessionService", "No window yet, so nothing to cut")
+            return null
+        }
+        val surface = dialog.window
+        if (surface == null) {
+            Log.i("WakeChatSessionService", "The dialog carries no window to cut")
+            return null
+        }
+        return surface
+    }
+
+    /**
+     * Leaves the first show's window exactly as the platform builds it, so the
+     * card can be read back as the display.
+     *
+     * A session cannot ask for a display or a density (see [BASE_SHORT_EDGE]), so
+     * the measurement is indirect: AOSP lays the session window out to fill the
+     * display while it is *not* yet visible, and the card is stretched to fill
+     * that window - the same relationship [sizeWindow] relies on for height. A
+     * show that never calls `setLayout` therefore puts a card the size of the
+     * display on screen, and [onShow] reads the short edge off it.
+     *
+     * Nothing is painted for this show (see [clearCard]), so the card that fills
+     * the display is invisible; the panel the platform paints behind it is still
+     * cleared, so the frame shows the screen underneath rather than a box over it.
+     */
+    private fun measureDisplay() {
+        val surface = windowSurface() ?: return
+        surface.setBackgroundDrawable(clearShape)
+        Log.i(
+            "WakeChatSessionService",
+            "Measurement show: leaving the window as the platform built it so the card can be read as the display"
+        )
+    }
+
+    /**
+     * The current scale, applied to a design length.
+     *
+     * Every metric in this file is a design value at [BASE_SHORT_EDGE]; this is
+     * the one conversion between that design and the display measured here.
+     */
+    private fun px(base: Int): Int = (base * scale).toInt()
+
+    /**
+     * The current scale, applied to a design text size or corner radius.
+     */
+    private fun pt(base: Float): Float = base * scale
+
+    /**
+     * Re-derives the scale from the measured display, and rebuilds the shapes at
+     * the scaled radii.
+     *
+     * Called on every show rather than once, because the measurement lands
+     * between shows: the first show measures and the one after it is the first
+     * that can draw at the real size. Re-deriving is cheap and idempotent, and an
+     * exchange that never measured leaves the shipped design alone.
+     */
+    private fun rescale() {
+        if (measuredShortEdge <= 0) return
+        val raw = measuredShortEdge.toFloat() / BASE_SHORT_EDGE
+        val target = if (raw < MIN_SCALE) MIN_SCALE else if (raw > MAX_SCALE) MAX_SCALE else raw
+        if (target == scale) return
+        scale = target
+        cardShape = rounded(WAKE_CARD_SURFACE, pt(CARD_RADIUS))
+        elevationShape = rounded(WAKE_CARD_ELEVATION, pt(CARD_RADIUS + CARD_ELEVATION))
+        userShape = rounded(WAKE_USER_BUBBLE, pt(USER_RADIUS))
+        replyShape = rounded(WAKE_REPLY_BUBBLE, pt(REPLY_RADIUS))
+        dividerShape = rounded(WAKE_DIVIDER, 0f)
+        caretShape = rounded(GRUVBOX_PRIMARY, pt(CARET_HEIGHT / 2f))
+        chipListening = rounded(WAKE_PHASE_LISTENING, pt(CHIP_SIZE / 2f))
+        chipThinking = rounded(WAKE_PHASE_THINKING, pt(CHIP_SIZE / 2f))
+        chipAnswering = rounded(WAKE_PHASE_ANSWERING, pt(CHIP_SIZE / 2f))
+        chipFault = rounded(GRUVBOX_ERROR, pt(CHIP_SIZE / 2f))
+        Log.i(
+            "WakeChatSessionService",
+            "Scaled the card to $scale for a $measuredShortEdge-px short edge of the display"
+        )
+    }
+
+    /**
+     * Applies the current scale to every metric the card draws with.
+     *
+     * Applied on every show rather than wired once, because the scale is not
+     * known until the display has been measured and the first show is the
+     * measurement. [onCreateContentView] wires the structure once; these setters
+     * are the numeric half of that wiring, and re-applying them is what lets the
+     * show after the measurement draw at the real size.
+     */
+    private fun metrics() {
+        panel.setPadding(px(CARD_SIDE_PADDING), px(CARD_TOP_PADDING), px(CARD_SIDE_PADDING), px(CARD_BOTTOM_PADDING))
+        ruler.setPadding(px(CARD_WIDTH) / 2, 0, px(CARD_WIDTH) / 2, 0)
+        foot.setPadding(0, px(BOTTOM_MARGIN), 0, 0)
+        card.setPadding(px(CARD_ELEVATION), px(CARD_ELEVATION), px(CARD_ELEVATION), px(CARD_ELEVATION))
+        statusRow.setPadding(0, 0, 0, px(BUBBLE_GAP))
+        phaseChip.setPadding(px(CHIP_SIZE / 2), px(CHIP_SIZE / 2), px(CHIP_SIZE / 2), px(CHIP_SIZE / 2))
+        statusLine.setPadding(px(STATUS_DOT_GAP), 0, 0, 0)
+        statusLine.textSize = pt(STATUS_SIZE)
+        divider.setPadding(0, px(DIVIDER_HEIGHT / 2), 0, px(DIVIDER_HEIGHT / 2))
+        userLines.forEach { line -> line.textSize = pt(USER_TEXT_SIZE) }
+        replyLines.forEach { line -> line.textSize = pt(REPLY_TEXT_SIZE) }
+    }
+
+    /**
+     * Draws nothing at all - what the measurement show paints.
+     *
+     * The measurement show's card is as large as the display, so any ink at all
+     * would cover the screen for a frame. An empty `TextView` measures nothing and
+     * a transparent background paints nothing, which is how the show contributes
+     * no ink while still measuring the way the real card does.
+     */
+    private fun clearCard() {
+        statusLine.text = ""
+        userLines.forEach { line -> line.text = "" }
+        replyLines.forEach { line -> line.text = "" }
+        card.background = clearShape
+        panel.background = clearShape
+        phaseChip.background = clearShape
+        divider.background = clearShape
+        caret.background = clearShape
+        statusLine.setTextColor(TRANSPARENT)
+        userBubble.background = clearShape
+        replyBubble.background = clearShape
+        userBubble.setPadding(0, 0, 0, 0)
+        replyBubble.setPadding(0, 0, 0, 0)
+    }
+
+    /**
+     * Wires the card once and returns the stage the window shows.
+     *
+     * The structure is wired here and never again; only [paint] changes what is
+     * drawn. Painting again after wiring is what makes the first exchange show
+     * the text that [onPrepareShow] already recorded, and it is harmless on
+     * every later show because painting is idempotent.
+     *
+     * The stage is deliberately left unpainted: it is as large as the card, so
+     * a background here would paint the window's margin too and turn the card
+     * into a block that reaches the bottom edge. Only the card and the bubbles
+     * inside it are painted.
+     */
+    override fun onCreateContentView(): View {
+        Log.i(
+            "WakeChatSessionService",
+            "Wiring the card for state=$state, a ${request.length}-character request and a ${reply.length}-character reply"
+        )
+        stage.setGravity(Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
+        stage.setOrientation(VERTICAL)
+        stage.addView(card)
+        stage.addView(foot)
+        card.setGravity(Gravity.TOP or Gravity.CENTER_HORIZONTAL)
+        card.setOrientation(VERTICAL)
+        card.addView(panel)
+        panel.setGravity(Gravity.TOP or Gravity.CENTER_HORIZONTAL)
+        panel.setOrientation(VERTICAL)
+        panel.addView(ruler)
+        panel.addView(statusRow)
+        statusRow.setGravity(Gravity.LEFT)
+        statusRow.addView(phaseChip)
+        statusRow.addView(statusLine)
+        panel.addView(userRow)
+        userRow.setGravity(Gravity.TOP or Gravity.LEFT)
+        userRow.addView(userBubble)
+        userBubble.setOrientation(VERTICAL)
+        userLines.forEach { line ->
+            userBubble.addView(line)
+            line.setGravity(Gravity.LEFT)
+            line.setTextColor(GRUVBOX_ON_SURFACE)
+        }
+        panel.addView(divider)
+        panel.addView(replyRow)
+        replyRow.setGravity(Gravity.TOP or Gravity.RIGHT)
+        replyRow.addView(replyBubble)
+        replyBubble.setOrientation(VERTICAL)
+        replyLines.forEach { line ->
+            replyBubble.addView(line)
+            line.setGravity(Gravity.RIGHT)
+            line.setTextColor(GRUVBOX_PRIMARY)
+        }
+        replyBubble.addView(caret)
+        metrics()
+        if (measuring) clearCard() else paint()
+        return stage
+    }
+
+    /**
+     * Draws what [state] asks for, leaving everything else empty.
+     *
+     * An empty `TextView` measures nothing and a transparent background paints
+     * nothing, so a state that shows no turn contributes no height and no ink -
+     * which is how a closed exchange looks like nothing at all.
+     *
+     * The status line is the one thing painted in every open state, so the card
+     * always says what it is doing even before a word has been heard.
+     */
+    private fun paint() {
+        statusLine.text = ""
+        userLines.forEach { line -> line.text = "" }
+        replyLines.forEach { line -> line.text = "" }
+        // The ink carries the animation's share of its strength, so a card that is
+        // climbing arrives fading rather than appearing at full strength in mid-air
+        // - see [tint] for why colour is applied on every show.
+        tint()
+        val closed = state == SESSION_STATE_CLOSE && riseProgress <= 0f
+        val bothTurns = request.isNotBlank() && reply.isNotBlank()
+        card.background = if (closed) clearShape else elevationShape
+        panel.background = if (closed) clearShape else cardShape
+        divider.background = if (closed || !bothTurns) clearShape else dividerShape
+        phaseChip.background = if (closed) clearShape else phaseShape()
+        statusLine.text = if (closed) "" else statusLabel()
+        statusLine.setTextColor(if (closed) TRANSPARENT else ink(GRUVBOX_ON_SURFACE_MUTED))
+        userBubble.background = if (request.isBlank()) clearShape else userShape
+        replyBubble.background = if (reply.isBlank()) clearShape else replyShape
+        val userPad = if (request.isBlank()) 0 else px(BUBBLE_PADDING)
+        userBubble.setPadding(userPad, userPad, userPad, userPad + if (request.isBlank()) 0 else px(BUBBLE_GAP))
+        val replyPad = if (reply.isBlank()) 0 else px(BUBBLE_PADDING)
+        replyBubble.setPadding(replyPad, replyPad, replyPad, replyPad)
+        val caretPad = if (reply.isBlank()) 0 else px(CARET_HEIGHT / 2)
+        caret.setPadding(0, caretPad, 0, caretPad)
+        caret.background =
+            if (state == SESSION_STATE_STREAMING && caretFrame % 2 == 0) caretShape else clearShape
+        userShown.forEachIndexed { index, line ->
+            if (index < userLines.size) userLines[index].text = line
+        }
+        replyShown.forEachIndexed { index, line ->
+            if (index < replyLines.size) replyLines[index].text = line
+        }
+    }
+
+    /**
+     * Re-tints every shape and text run the card owns to the current progress.
+     *
+     * Colour is applied on every show rather than at the shapes' construction so
+     * [rescale] stays the owner of geometry alone: the shapes are rebuilt only when
+     * the card rescales, while their ink changes on every frame of a climb, and
+     * mutating an existing [GradientDrawable]'s colour costs far less than building
+     * a new one per frame. Setting every shape on every show, settled or not, is what
+     * returns a shape that a climb faded back to full strength - a colour left behind
+     * by the frame before would otherwise stay translucent for the whole exchange.
+     */
+    private fun tint() {
+        cardShape.setColor(ink(WAKE_CARD_SURFACE))
+        elevationShape.setColor(ink(WAKE_CARD_ELEVATION))
+        userShape.setColor(ink(WAKE_USER_BUBBLE))
+        replyShape.setColor(ink(WAKE_REPLY_BUBBLE))
+        dividerShape.setColor(ink(WAKE_DIVIDER))
+        caretShape.setColor(ink(GRUVBOX_PRIMARY))
+        chipListening.setColor(ink(WAKE_PHASE_LISTENING))
+        chipThinking.setColor(ink(WAKE_PHASE_THINKING))
+        chipAnswering.setColor(ink(WAKE_PHASE_ANSWERING))
+        chipFault.setColor(ink(GRUVBOX_ERROR))
+        userLines.forEach { line -> line.setTextColor(ink(GRUVBOX_ON_SURFACE)) }
+        replyLines.forEach { line -> line.setTextColor(ink(GRUVBOX_PRIMARY)) }
+    }
+
+    /**
+     * A palette token carrying the current progress's share of its ink.
+     *
+     * The alpha byte is the only fade a session has: a widget takes one background
+     * and a [GradientDrawable] has no opacity of its own, so the translucency already
+     * baked into [WAKE_CARD_SURFACE] is scaled rather than replaced - the card keeps
+     * letting the screen read through it at full strength, it just arrives translucent.
+     */
+    private fun ink(argb: Int): Int {
+        if (riseProgress >= 1f) return argb
+        if (riseProgress <= 0f) return TRANSPARENT
+        val alpha = ((argb ushr 24) * riseProgress).toInt()
+        return (argb and 0x00FFFFFF) or (alpha shl 24)
+    }
+
+    /**
+     * How tall the card has to be to hold the lines it is showing, padding
+     * included and nothing clamped away.
+     *
+     * This is the truth [sizeWindow] cuts the window to: the card is stretched to
+     * fill the window, so the only way to give it room for a long answer is to
+     * give the window that room. The heights are added up rather than measured
+     * because a legacy [android.widget.TextView] reports no intrinsic size, so
+     * [LINE_HEIGHT] and [STATUS_HEIGHT] are the only line boxes this can see.
+     */
+    private fun neededHeight(userLineCount: Int, replyLineCount: Int): Int {
+        val status = px(STATUS_HEIGHT) + px(BUBBLE_GAP)
+        val user =
+            if (userLineCount == 0) 0
+            else px(BUBBLE_PADDING) * 2 + userLineCount * px(LINE_HEIGHT) + px(BUBBLE_GAP)
+        val answer =
+            if (replyLineCount == 0) 0
+            else px(BUBBLE_PADDING) * 2 + replyLineCount * px(LINE_HEIGHT) + px(CARET_HEIGHT)
+        // The rule measures to its own padding whatever it paints, so it always
+        // costs the card this much room.
+        return px(CARD_TOP_PADDING) + px(CARD_BOTTOM_PADDING) + status + px(DIVIDER_HEIGHT) + user + answer
+    }
+
+    /**
+     * The small line beside the status chip that says what the exchange is doing.
+     *
+     * A session only ever sees the state the wake service put in the bundle, so
+     * the label is derived here rather than sent: the same show that grows the
+     * answer bubble is the one that says the answer is still arriving. A settled
+     * reply still carries a label, because the card is open and the user should
+     * be able to tell it is open.
+     */
+    private fun statusLabel(): String = when (state) {
+        SESSION_STATE_RISE -> "Ready"
+        SESSION_STATE_LISTENING -> "Listening…"
+        SESSION_STATE_REQUEST -> "Thinking…"
+        SESSION_STATE_STREAMING -> "Answering…"
+        SESSION_STATE_SPEAKING -> "Speaking…"
+        SESSION_STATE_REPLY -> "Here you go"
+        SESSION_STATE_CLOSE -> ""
+        else -> "Something went wrong"
+    }
+
+    /**
+     * The shape the status chip wears, which is the exchange's phase wearing the
+     * colour it is doing in.
+     *
+     * The chip carries a whole shape rather than a colour because a background is
+     * the only paint a widget can take, so one shape exists per phase and is
+     * rebuilt only when the card rescales. Only the chip wears it: the label
+     * beside it stays [GRUVBOX_ON_SURFACE_MUTED], so the phase is legible from
+     * across a room by colour alone while the words stay quiet instead of shouting
+     * the state. A state the wake service does not name is taken as a fault and
+     * wears [GRUVBOX_ERROR].
+     */
+    private fun phaseShape(): GradientDrawable = when (state) {
+        SESSION_STATE_LISTENING -> chipListening
+        SESSION_STATE_REQUEST -> chipThinking
+        SESSION_STATE_STREAMING, SESSION_STATE_SPEAKING, SESSION_STATE_REPLY -> chipAnswering
+        else -> chipFault
+    }
+
+    /**
+     * How tall the card is for the current show, which is how it climbs.
+     *
+     * The card fills the window it is given, so the climb is the window growing
+     * upward from the bottom edge: the first show is a stub against the edge and
+     * the last settles the card at [CARD_HEIGHT]. The climb eases out, so each
+     * show adds a smaller share of what is left and the card leaves the edge
+     * briskly and settles softly, which is what a pop-up reads as.
+     *
+     * The same position run backwards is the sink, which is why a closing
+     * exchange leaves the way it came rather than blinking out: at "0" there is
+     * no card at all, so the last frame of the sink is a hair of ink against the
+     * edge, and the fade means nothing has to jump.
+     */
+    private fun riseHeight(): Int {
+        if (riseProgress <= 0f) return 0
+        return (px(CARD_HEIGHT) * eased(riseProgress)).toInt()
+    }
+
+    /**
+     * The climb's easing: distance travelled as a share of the show's progress,
+     * decelerating so the card leaves the edge briskly and settles softly.
+     *
+     * Arithmetic on one Float is the whole curve, which is what lets the sink reuse
+     * it: reversing the ladder of progress values reverses the curve with it, so the
+     * two directions are symmetric by construction rather than by two curves that
+     * have to be kept in step.
+     */
+    private fun eased(progress: Float): Float = 1f - (1f - progress) * (1f - progress)
+
+    /**
+     * The progress this show was handed, clamped into the range the card draws in.
+     *
+     * Only the climb and the sink carry a position: every other state is an open
+     * exchange at rest, and a show that names no state at all is treated as closed
+     * rather than as a card frozen in mid-air. A missing or unparseable position
+     * settles the exchange rather than hiding it, so a wake service that stops
+     * animating still draws the card it has always drawn.
+     */
+    private fun settledProgress(travel: String?): Float {
+        if (state != SESSION_STATE_RISE && state != SESSION_STATE_CLOSE) return 1f
+        val raw = travel?.toFloatOrNull() ?: 1f
+        if (raw <= 0f) return 0f
+        if (raw >= 1f) return 1f
+        return raw
+    }
+
+    /**
+     * A filled, rounded rectangle - the shape of the card and of a bubble.
+     *
+     * This is the only rounding available to a session: a widget's
+     * `setBackgroundColor(Int)` paints a sharp rectangle, while
+     * [GradientDrawable] is a concrete drawable that constructs with no arguments
+     * and takes a solid [GradientDrawable.setColor][setColor] plus a Float
+     * [GradientDrawable.setCornerRadius][setCornerRadius]. A single colour with
+     * no colour array set fills solid rather than gradient, and a fully
+     * transparent colour paints nothing, which is how a turn that has no text
+     * yet contributes no ink.
+     */
+    private fun rounded(color: Int, radius: Float): GradientDrawable {
+        val shape = GradientDrawable()
+        shape.setColor(color)
+        shape.setCornerRadius(radius)
+        return shape
+    }
+
+    /**
+     * Tears the window down when the exchange has been closed, and reads the
+     * display back off the card the measurement show stretched.
+     *
+     * The close is requested by [WakeChatService] through
+     * [SESSION_STATE_CLOSE], which [paint] already draws as nothing, so the
+     * window is invisible even if finishing it only hides it.
+     *
+     * The read-back happens here because AOSP has laid the window out before it
+     * shows it: after the show that left it as the platform built it, the card
+     * measures to the display less [WINDOW_OVERHEAD], which is the only display
+     * measurement available to a session (see [BASE_SHORT_EDGE]). A card that
+     * reads back nothing leaves the scale at 1, which is the shipped design.
+     */
+    override fun onShow(args: android.os.Bundle?, showFlags: Int) {
+        if (measuring) {
+            measuring = false
+            val short = if (card.width < card.height) card.width else card.height
+            if (short > 0) {
+                measuredShortEdge = short + WINDOW_OVERHEAD
+                Log.i(
+                    "WakeChatSessionService",
+                    "Measured the display off a stretched card: ${card.width}x${card.height}, short edge $measuredShortEdge px"
+                )
+            } else {
+                Log.i(
+                    "WakeChatSessionService",
+                    "The stretched card measured nothing, so the card stays at the shipped design"
+                )
+            }
+        }
+        Log.i(
+            "WakeChatSessionService",
+            "Shown state=$state scale=$scale stageW=${stage.width} stageH=${stage.height} cardW=${card.width} cardH=${card.height} panelW=${panel.width} panelH=${panel.height} rowW=${statusRow.width} chipW=${phaseChip.width} chipH=${phaseChip.height} statusW=${statusLine.width} statusH=${statusLine.height} divH=${divider.height} u0W=${userLines[0].width} u0H=${userLines[0].height} u0T=${userLines[0].text.length} r0T=${replyLines[0].text.length} userBW=${userBubble.width} userBH=${userBubble.height} replyBW=${replyBubble.width} replyBH=${replyBubble.height} userRowW=${userRow.width} replyRowW=${replyRow.width}"
+        )
+        if (state == SESSION_STATE_CLOSE) finish()
+    }
+
+    /**
+     * Splits text into the lines the card can show.
+     *
+     * A legacy `TextView` is one line, so a reply longer than the card has to be
+     * cut here. The cut is searched only inside the next [LINE_CHARS] characters:
+     * searching the whole remainder instead makes the break land far past the
+     * card edge, which is what painted lines wider than the card and spilling
+     * over the bubbles. When the text is still not finished at the last slot, the
+     * ellipsis is taken *inside* the budget rather than appended to it, so a
+     * wrapped line can never be wider than the line the card can hold.
+     */
+    private fun wrap(text: String, maxLines: Int): List<String> {
+        val lines = mutableListOf<String>()
+        val budget = px(LINE_CHARS)
+        var rest = text.trim()
+        while (rest.isNotEmpty() && lines.size < maxLines) {
+            val last = lines.size == maxLines - 1
+            var cut = rest.length
+            if (cut > budget) {
+                val room = if (last) budget - 1 else budget
+                val space = rest.substring(0, room).lastIndexOf(' ')
+                cut = if (space > room / 3) space else room
+            }
+            var line = rest.substring(0, cut).trim()
+            rest = rest.substring(cut).trim()
+            if (last && rest.isNotEmpty()) line += "…"
+            lines.add(line)
+        }
+        return lines
+    }
+
+    /**
+     * Drops the exchange when the session ends.
+     *
+     * The session is created per exchange, so this is the only place its state
+     * is released.
+     */
+    override fun onDestroy() {
+        state = ""
+        request = ""
+        reply = ""
+        riseProgress = 0f
+        measuring = true
+        measuredShortEdge = 0
+        scale = 1f
+    }
+
+    /**
+     * Keeps the window awake while the exchange is open.
+     *
+     * The session is shown over whatever the device is displaying, including a
+     * screen that would otherwise sleep, so the exchange has to hold the screen
+     * open for as long as it is raised.
+     */
+    override fun onCreate() {
+        setKeepAwake(true)
+    }
+}

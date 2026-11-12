@@ -30,9 +30,9 @@
 -->
 <voice-interaction-service
     xmlns:android="http://schemas.android.com/apk/res/android"
-    android:sessionService="${applicationId}.service.WakeChatSessionService"
-    android:recognitionService="${applicationId}.service.WakeChatRecognitionService"
-    android:settingsActivity="${applicationId}.ui.MainActivity"
+    android:sessionService="ai.flossyapp.service.WakeChatSessionService"
+    android:recognitionService="ai.flossyapp.service.WakeChatRecognitionService"
+    android:settingsActivity="ai.flossyapp.ui.MainActivity"
     android:supportsAssist="true"
     android:supportsLaunchVoiceAssistFromKeyguard="true"
     android:supportsLocalInteraction="true" />

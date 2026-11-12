@@ -64,7 +64,7 @@ microphone ──▶ recordAudioWithVAD ──▶ extractWakeFeatures ──▶ 
 ## 3. The enrollment file
 
 - `pathForReferences(context)` → `context.filesDir` + `wake_references.txt`, i.e.
-  `/data/user/0/com.localassistant.app/files/wake_references.txt`. That directory is **invisible to
+  `/data/user/0/ai.flossyapp/files/wake_references.txt`. That directory is **invisible to
   adbd** — the app has to report its own enrollment through logs (see §7).
 - One reference per line: `<something> <float> <float> …`, row-major `[cepstral1..4, delta1..4]` per
   frame. A line whose value count is not a multiple of `MFCC_FEATURES` is rejected on load, so the
@@ -155,7 +155,7 @@ the phrase inside a longer clip reaches 0.18.
 ## 7. Reading the logs — the diagnostic entry point
 
 Tags: `WakeEnroll` (enrollment read/write), `WakeMatch` (the Settings "Test Wake Word" verdict),
-`WakeChatService` (the idle loop), `VAD` (the recorder), `LocalAssistant` (enrollment write failure).
+`WakeChatService` (the idle loop), `VAD` (the recorder), `FLOSSyAssistant` (enrollment write failure).
 
 ```bash
 adb -s <serial> logcat -d -s WakeChatService:V WakeEnroll:V WakeMatch:V
@@ -234,4 +234,4 @@ are never written back to the device.
 
 Run the whole suite: `./gradlew test` (`--tests` is not a supported option here). Gradle truncates
 assertion messages in the console; the full text is in
-`app/build/reports/tests/testDebugUnitTest/com.localassistant.app.test.<ClassName>/<testName>.html`.
+`app/build/reports/tests/testDebugUnitTest/ai.flossyapp.test.<ClassName>/<testName>.html`.
