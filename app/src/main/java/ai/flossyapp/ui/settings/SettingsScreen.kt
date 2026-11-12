@@ -88,6 +88,85 @@ fun SettingNumberField(
     }
 }
 
+/**
+ * Parses a token-count entry typed as either a bare whole number ("32768")
+ * or a K-suffixed shorthand ("32K", "32k", "512K") into a token count. A
+ * bare number is taken literally; the shorthand multiplies by 1024. Anything
+ * that parses to nothing returns null so the caller keeps the old value.
+ */
+fun parseTokenCount(input: String): Int? {
+    val text = input.trim().uppercase()
+    return if (text.endsWith("K")) {
+        text.removeSuffix("K").trim().toIntOrNull()?.times(1024)
+    } else {
+        text.toIntOrNull()
+    }
+}
+
+/**
+ * A token-budget setting presented as an editable combo box: the standard
+ * sizes (4k .. 1M) are one click away, but the field stays typable and
+ * accepts either a K-suffix ("32K") or the raw count ("32768"). The chosen
+ * value is always shown as the full token count so what the server receives
+ * is never ambiguous.
+ */
+@Composable
+fun SettingTokenComboBox(
+    label: String,
+    value: Int,
+    onValueChange: (Int) -> Unit,
+    placeholder: String,
+) {
+    val options = listOf("4K", "8K", "16K", "32K", "64K", "128K", "256K", "512K", "1M")
+    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+        Text(text = label, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(vertical = 4.dp))
+        var expanded by remember { mutableStateOf(false) }
+        Box(modifier = Modifier.fillMaxWidth()) {
+            OutlinedTextField(
+                modifier = Modifier.fillMaxWidth(),
+                value = value.toString(),
+                onValueChange = { entered ->
+                    // Live-parse: "32" becomes 32 tokens while typing, "32K"
+                    // only once the K lands. A prefix that parses ("", "3")
+                    // is committed as-is; a garbage entry keeps the old value.
+                    parseTokenCount(entered)?.let(onValueChange)
+                },
+                placeholder = { Text(placeholder) },
+                maxLines = 1,
+                shape = RoundedCornerShape(8.dp),
+                trailingIcon = {
+                    IconButton(onClick = { expanded = !expanded }) {
+                        Icon(
+                            imageVector = if (expanded) Icons.Default.ArrowDropUp else Icons.Default.ArrowDropDown,
+                            contentDescription = if (expanded) "Collapse list" else "Expand list"
+                        )
+                    }
+                }
+            )
+            DropdownMenu(
+                expanded = expanded,
+                onDismissRequest = { expanded = false },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                options.forEach { option ->
+                    DropdownMenuItem(
+                        text = {
+                            // Resolve the option to the same token count the
+                            // field would hold, and show both forms.
+                            val tokens = parseTokenCount(option) ?: 0
+                            Text("$option  ($tokens tokens)")
+                        },
+                        onClick = {
+                            expanded = false
+                            parseTokenCount(option)?.let(onValueChange)
+                        }
+                    )
+                }
+            }
+        }
+    }
+}
+
 @Composable
 fun SettingSwitch(label: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
     Row(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
@@ -302,17 +381,17 @@ fun SettingsScreen(onNavigateBack: () -> Unit, viewModel: SettingsViewModel = vi
                 SettingTextField("Model Name", settings.llmModelName, { viewModel.updateSetting("llmModelName", it) }, "llama-3.1-8b-instruct")
                 EndpointChoices("Available models", llmModels, settings.llmModelName) { viewModel.updateSetting("llmModelName", it) }
                 SettingTextField("API Key (optional)", settings.llmApiKey, { viewModel.updateSetting("llmApiKey", it) }, "Leave empty if not required")
-                SettingNumberField(
+                SettingTokenComboBox(
                     "Max Tokens",
                     settings.llmMaxTokens,
                     { viewModel.updateSetting("llmMaxTokens", it) },
-                    "Total reply budget, thinking included"
+                    "e.g. 32768 or 32K - total reply budget, thinking included"
                 )
-                SettingNumberField(
+                SettingTokenComboBox(
                     "Reasoning Budget (tokens)",
                     settings.llmReasoningBudgetTokens,
                     { viewModel.updateSetting("llmReasoningBudgetTokens", it) },
-                    "0 leaves the server decide"
+                    "e.g. 1024 or 1K - 0 leaves the server decide"
                 )
                 SettingTextField(
                     "Chat Template Arguments",

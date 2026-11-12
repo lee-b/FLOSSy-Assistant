@@ -30,10 +30,12 @@ data class AppSettings(
     val llmApiKey: String = "",
     // Generation budget. A reasoning model spends its tokens on the chain of
     // thought first, so max_tokens must cover both the reasoning and the answer
-    // or the reply comes back empty.
+    // or the reply comes back empty. Up to 1M tokens (1048576) is accepted;
+    // servers that support less clamp it themselves.
     val llmMaxTokens: Int = 1024,
     // How much of that budget the model may spend thinking. 0 omits the
-    // parameter entirely, which is what a server without reasoning control needs.
+    // parameter entirely, which is what a server without reasoning control
+    // needs. Up to 1M tokens (1048576) is accepted.
     val llmReasoningBudgetTokens: Int = 512,
     // Extra chat-template arguments, separated by commas, e.g.
     // "enable_thinking=false, reasoning_effort=low". Empty sends none.

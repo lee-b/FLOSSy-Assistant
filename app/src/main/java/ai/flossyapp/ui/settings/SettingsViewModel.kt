@@ -96,8 +96,8 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
             }
             "llmModelName" -> _settings.update { it.copy(llmModelName = value as String) }
             "llmApiKey" -> _settings.update { it.copy(llmApiKey = value as String) }
-            "llmMaxTokens" -> _settings.update { it.copy(llmMaxTokens = (value as Int).coerceIn(64, 32768)) }
-            "llmReasoningBudgetTokens" -> _settings.update { it.copy(llmReasoningBudgetTokens = (value as Int).coerceIn(0, 32768)) }
+            "llmMaxTokens" -> _settings.update { it.copy(llmMaxTokens = (value as Int).coerceIn(64, 1_048_576)) }
+            "llmReasoningBudgetTokens" -> _settings.update { it.copy(llmReasoningBudgetTokens = (value as Int).coerceIn(0, 1_048_576)) }
             "llmChatTemplateKwargs" -> _settings.update { it.copy(llmChatTemplateKwargs = value as String) }
 
             "sttBaseUrl" -> {
