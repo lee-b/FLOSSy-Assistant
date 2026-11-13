@@ -16,9 +16,9 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
@@ -35,6 +35,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.TextUnitType
@@ -70,6 +71,15 @@ data class WakeCardSnapshot(
     val pose: CallPose,
     val alpha: Float,
     val fontScale: Float,
+    // The tallest the bubble thread may draw before it scrolls instead. The
+    // session derives it from its own card ceiling less the chrome the card
+    // has already measured around the thread - a measurement, never a guess.
+    val bubbleCeiling: Dp,
+    // The content reports what it actually measures, so the session cuts the
+    // window to the truth: the whole card's height, and the bubble thread's
+    // height (the difference is the chrome, which is Compose-measured too).
+    val onContentMeasured: (Int) -> Unit,
+    val onBubbleMeasured: (Int) -> Unit,
     val onOpenApp: () -> Unit,
     val onEndChat: () -> Unit
 )
@@ -94,8 +104,12 @@ fun WakeCardContent(state: WakeCardState) {
     val snap = state.snapshot ?: return
     FLOSSyAssistantTheme(darkTheme = true) {
         Column(
+            // Wrap height, not fill: the card is as tall as what it draws, and
+            // this measurement is what the session cuts the window to - the
+            // content is the truth, no line metric is estimated anywhere.
             Modifier
-                .fillMaxSize()
+                .fillMaxWidth()
+                .onSizeChanged { snap.onContentMeasured(it.height) }
                 .alpha(snap.alpha)
         ) {
             StatusRow(snap)
@@ -105,7 +119,7 @@ fun WakeCardContent(state: WakeCardState) {
             // the card never looks dead while thinking.
             CallAvatar(pose = snap.pose, size = sdp(112f, snap), modifier = Modifier.align(Alignment.CenterHorizontally))
             Spacer(Modifier.height(sdp(8f, snap)))
-            BubbleThread(snap, Modifier.weight(1f).fillMaxWidth())
+            BubbleThread(snap, Modifier.fillMaxWidth())
             Spacer(Modifier.height(sdp(10f, snap)))
             ButtonRow(snap)
         }
@@ -145,7 +159,15 @@ private fun BubbleThread(snap: WakeCardSnapshot, modifier: Modifier) {
     val listState = rememberLazyListState()
     LazyColumn(
         state = listState,
+        // Wrap height capped at the ceiling: a short exchange hugs its own
+        // content, a long one stops at the ceiling and scrolls instead - the
+        // min(content, ceiling) is the LazyColumn's own sizing under a
+        // bounded max constraint, no height is counted by hand. What the
+        // thread measures is reported back, so the session can cap it at the
+        // card budget less the chrome around it.
         modifier = modifier
+            .heightIn(max = snap.bubbleCeiling)
+            .onSizeChanged { snap.onBubbleMeasured(it.height) }
     ) {
         if (snap.request.isNotBlank()) {
             item { ChatBubble(text = snap.request, isUser = true) }

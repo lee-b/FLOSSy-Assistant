@@ -31,6 +31,7 @@ import ai.flossyapp.domain.model.ToolCallRecord
 import ai.flossyapp.ui.wake.WakeCardSnapshot
 import ai.flossyapp.ui.wake.WakeCardState
 import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
@@ -197,32 +198,9 @@ private const val MAX_SCALE = 1.4f
  * be wider than the screen there and have its sides cut off.
  */
 private const val CARD_WIDTH = 1560
-private const val USER_TEXT_SIZE = 20f
-private const val REPLY_TEXT_SIZE = 22f
-private const val STATUS_SIZE = 17f
 private const val CARD_SIDE_PADDING = 44
 private const val CARD_TOP_PADDING = 32
 private const val CARD_BOTTOM_PADDING = 32
-private const val BUBBLE_PADDING = 32
-
-/**
- * How tall a line of text and the status line actually are, which is what the
- * card's height is built from.
- *
- * A legacy [android.widget.TextView] reports no intrinsic size, so the session
- * cannot ask the views how tall the text they hold is - the only heights it
- * knows are the ones it gives them. Measured on the tab, the view draws at about
- * **twice** the pixel size it is handed: at a 44 px setting the glyphs came out
- * ~88 px tall, a character advanced ~43 px, and the line box measured 125 px.
- * That is why the sizes above are half what the card should read as - a 22 px
- * setting is a ~44 px card font - and these are the resulting line boxes, about
- * 2.8 times the setting rather than the 1.2 times Roboto's own ascent, descent
- * and leading suggest, because the view adds its internal padding to the font
- * box. Underestimate these and the last line of a reply is cut off at the bottom
- * edge of the card, which is exactly what the earlier build showed.
- */
-private const val LINE_HEIGHT = 62
-private const val STATUS_HEIGHT = 48
 
 /**
  * The height the card rests at, whatever is inside it.
@@ -240,10 +218,10 @@ private const val CARD_HEIGHT = 620
  * The tallest the card may become when an answer genuinely needs it.
  *
  * A long reply streams into the card line by line, and without a ceiling a
- * rambling answer turns the card back into a panel over the whole display. This
- * is set to the height [neededHeight] asks for at the fullest exchange the card
- * is allowed to show, so the last line of a reply is never cut off by the ceiling
- * itself - only by [REPLY_MAX_LINES].
+ * rambling answer turns the card back into a panel over the whole display. The
+ * bubble thread is capped at this height (less the chrome measured around it),
+ * so a longer answer scrolls inside the card instead of growing it past the
+ * ceiling - and the last line is never cut off by the ceiling itself.
  */
 private const val MAX_CARD_HEIGHT = 960
 
@@ -281,25 +259,6 @@ private const val BOTTOM_MARGIN = 56
 private const val CARD_ELEVATION = 10
 
 /**
- * The width the card's children may use, which is what a line of text and a
- * bubble are both measured against.
- *
- * A bubble that only spans its own longest line makes the card jump wider every
- * time a longer sentence arrives, so each bubble carries a ruler of this width
- * and the card is the same shape for the whole exchange.
- */
-private const val INNER_WIDTH = CARD_WIDTH - CARD_SIDE_PADDING * 2
-
-/**
- * The width a bubble's text may use, which is what a line is wrapped to.
- *
- * A bubble spans the card's inner width so the card never jumps wider as longer
- * sentences arrive, and its text is inset by the bubble's own padding - so the
- * text budget is that width less the padding, not the card width.
- */
-private const val BUBBLE_TEXT_WIDTH = INNER_WIDTH - BUBBLE_PADDING * 2
-
-/**
  * The size of the window the system raises for the exchange.
  *
  * The window used to be left exactly as the platform builds it, which is a
@@ -313,9 +272,10 @@ private const val BUBBLE_TEXT_WIDTH = INNER_WIDTH - BUBBLE_PADDING * 2
  * handing it a transparent shape removes the cream panel entirely, which is what
  * lets the screen underneath read through the card.
  *
- * The height is worked out from the text about to be drawn, never read back off
- * the card, and [MAX_WINDOW_HEIGHT] is the ceiling that keeps a long answer from
- * turning the card back into a panel over the display.
+ * The height is worked out from what the card's Compose surface actually
+ * measures - the content is the truth, and the window is cut to it - while the
+ * [MAX_CARD_HEIGHT] ceiling keeps a long answer from turning the card back
+ * into a panel over the display.
  */
 private const val CARD_OUTER_WIDTH = CARD_WIDTH + CARD_SIDE_PADDING * 2
 
@@ -351,22 +311,6 @@ private const val DIVIDER_HEIGHT = 6
  * read in [paint]. The bar is always padded - ink or no ink - so toggling it
  * never jumps the card.
  */
-private const val CARET_HEIGHT = 8
-
-/**
- * The two ways out of the popup, drawn as buttons at the card's foot.
- *
- * One opens the full app (the assistant metaphor's "go to the assistant"), the
- * other ends the exchange in the same red the app chat view's End Call wears -
- * both surfaces read as one assistant. The height is the design value at
- * [BASE_SHORT_EDGE]; the radius matches the reply bubble so the buttons read
- * as part of the card rather than as system chrome.
- */
-private const val BUTTON_HEIGHT = 72
-
-// The room the bot face takes between the status and the bubbles, in design
-// units - scaled like every other length by the display factor.
-private const val AVATAR_HEIGHT = 200
 private const val BUTTON_RADIUS = 26f
 
 /**
@@ -386,17 +330,6 @@ private const val BUTTON_RADIUS = 26f
 private const val CARD_RADIUS = 28f
 private const val USER_RADIUS = 16f
 private const val REPLY_RADIUS = 26f
-
-/**
- * The one gap between blocks of the card: status to user bubble, bubble to rule,
- * rule to answer bubble.
- *
- * Every block is separated by the same room, which is what gives the card a
- * vertical rhythm rather than a stack of boxes that each carry their own. It is
- * padding on the block above rather than a spacer child, because the card builds
- * its children once and the structure cannot grow between shows.
- */
-private const val BUBBLE_GAP = 24
 
 /**
  * The gap between the status chip and the label beside it.
@@ -425,36 +358,6 @@ private const val STATUS_DOT_GAP = 18
  */
 private const val VERTICAL = 1
 private const val HORIZONTAL = 0
-
-/**
- * How much text the card can show.
- *
- * A legacy `TextView` never wraps, so a reply is split into lines here and each
- * line gets one of a fixed pool of TextViews - the pool is fixed because the
- * session builds its content view once and reuses it for every later show, so
- * the structure cannot grow with the text.
- *
- * [LINE_CHARS] is chosen so a full line fits [BUBBLE_TEXT_WIDTH]: at [REPLY_TEXT_SIZE] a
- * character is roughly 22 px wide, so 64 characters fill a bubble without
- * overflowing it. The counts are deliberately small - a request is a spoken
- * sentence and an answer is read aloud - because the card must stay a card:
- * [USER_MAX_LINES] plus [REPLY_MAX_LINES] lines is the tallest it is ever allowed
- * to be, and [MAX_WINDOW_HEIGHT] is the ceiling the window is cut to.
- */
-private const val USER_MAX_LINES = 2
-private const val REPLY_MAX_LINES = 8
-
-/**
- * How many characters one bubble line holds, derived rather than tuned: a
- * character advances about as far as the text size is tall (the measured font
- * metrics above), and a line's room is [BUBBLE_TEXT_WIDTH] - so the count is
- * the width divided by the size. It is deliberately **not** multiplied by the
- * display scale, because the font size scales by the same factor: multiplying
- * both is what under-filled the bubbles on a smaller display (and the shipped
- * constant was hard-coded to one reference screen, which is what made the
- * budget a guess everywhere else).
- */
-private const val LINE_CHARS = BUBBLE_TEXT_WIDTH / REPLY_TEXT_SIZE.toInt()
 
 /**
  * The session half of the wake pipeline.
@@ -566,8 +469,31 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
      * What the next show must draw, wrapped once so the window and the paint
      * agree on how many lines there are.
      */
-    private var userShown: List<String> = listOf()
-    private var replyShown: List<String> = listOf()
+    /**
+     * What the card's Compose surface last measured itself to be, in real px.
+     *
+     * This is the truth [sizeWindow] cuts the window to. It is reported by the
+     * content itself - [WakeCardContent] hands its measured height back through
+     * the snapshot - so no line metric is estimated and no text size guessed:
+     * the window is exactly as tall as what the card draws, plus the window's
+     * own overhead and the display's bottom inset. The first show cuts to the
+     * [MAX_CARD_HEIGHT] ceiling (nothing measured yet) and the measurement
+     * callback shrinks it to the truth one layout pass in.
+     */
+    private var contentHeightPx = 0
+
+    /**
+     * What the bubble thread last measured itself to be, in real px.
+     *
+     * The bubble thread is the only part of the card that scrolls, so it is the
+     * only part whose height is capped: the thread takes its own content's
+     * height up to [WakeCardSnapshot.bubbleCeiling] and scrolls past that. The
+     * ceiling is the card's whole budget less the chrome the card measured
+     * around the thread - which this measurement is what reveals, since the
+     * chrome (status row, bot, buttons, paddings) is itself Compose-measured
+     * and never estimated.
+     */
+    private var bubbleHeightPx = 0
 
     /**
      * The views the window shows, built once here and only ever mutated after.
@@ -659,11 +585,9 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
         }.onFailure { android.util.Log.w("WakeChatSession", "Tool calls unread: ${it.message}") }
         riseProgress = settledProgress(args.getString(SESSION_ANIM_KEY))
         rescale()
-        // The bubbles are Compose now, so they wrap themselves; the line counts
-        // here are only the window-height estimate [neededHeight] runs on, kept
-        // because the window is cut before the card is ever laid out.
-        userShown = wrap(request, USER_MAX_LINES)
-        replyShown = wrap(reply, REPLY_MAX_LINES)
+        // The bubbles are Compose now, so they wrap themselves and measure
+        // themselves; the window follows what the content reports, not what a
+        // line counter guesses.
         sizeWindow()
         paint()
     }
@@ -697,8 +621,15 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
     private fun sizeWindow() {
         val surface = windowSurface() ?: return
         val needed =
-            if (state == SESSION_STATE_CLOSE && riseProgress <= 0f) 0
-            else neededHeight(userShown.size, replyShown.size)
+            when {
+                state == SESSION_STATE_CLOSE && riseProgress <= 0f -> 0
+                // Nothing measured yet (the very first show): cut to the
+                // ceiling, the safe upper bound, and let the measurement
+                // callback shrink it to the truth a pass later. Cutting
+                // small first would clip the card's first frame.
+                contentHeightPx == 0 -> px(MAX_CARD_HEIGHT)
+                else -> contentHeightPx
+            }
         val risen = riseHeight()
         val wanted = if (needed > risen) needed else risen
         val limit = px(MAX_CARD_HEIGHT)
@@ -709,14 +640,33 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
         // readBottomInset). The ceiling scales the same way, so a taller bar
         // than the design guessed does not silently clip the card.
         val cut = tall + WINDOW_OVERHEAD + ring + bottomInsetPx
+        Log.i(
+            "WakeChatSessionService",
+            "The window reserves $bottomInsetPx px of bottom inset (fallback would be ${px(BOTTOM_MARGIN)})"
+        )
         val ceiling = px(MAX_CARD_HEIGHT + WINDOW_OVERHEAD) + bottomInsetPx + ring
         val height = if (cut > ceiling) ceiling else cut
         surface.setLayout(px(CARD_OUTER_WIDTH) + ring, height)
         surface.setGravity(Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
         surface.setBackgroundDrawable(clearShape)
+        // The stage is a two-band column: the card above (wrap-content, its
+        // own measured height), the nav-bar strip below (the display's real
+        // inset). Without explicit heights the card's MATCH_PARENT compose
+        // surface propagates and the card swallows the whole window - the
+        // foot measured zero and the card reached the screen's bottom edge
+        // under the navigation bar. The card measures itself now, so its
+        // band is wrap-content and the foot band owns exactly the inset.
+        card.layoutParams = android.widget.LinearLayout.LayoutParams(
+            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+            android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        foot.layoutParams = android.widget.LinearLayout.LayoutParams(
+            android.view.ViewGroup.LayoutParams.MATCH_PARENT, bottomInsetPx
+        )
         Log.i(
             "WakeChatSessionService",
-            "Cut the window to ${px(CARD_OUTER_WIDTH) + ring} by ${height} for a ${tall}-tall card at $riseProgress (scale $scale)"
+            "Cut the window to ${px(CARD_OUTER_WIDTH) + ring} by ${height} for a ${tall}-tall card " +
+                "at $riseProgress (scale $scale) over a $bottomInsetPx-px inset strip"
         )
     }
 
@@ -936,6 +886,30 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
             pose = pose(),
             alpha = riseProgress,
             fontScale = scale,
+            // The bubble thread's ceiling is the card budget less the chrome
+            // the card already measured around it (the chrome is Compose
+            // work, not a design guess: the content hands its measurements
+            // back through these callbacks). Until something is measured the
+            // ceiling is the whole budget, and the first measurement pass
+            // tightens it - the loop converges, it never estimates.
+            // The px here are device pixels; Compose works in dp, so the
+            // ceiling crosses over at the display's own density.
+            bubbleCeiling =
+                ((px(MAX_CARD_HEIGHT) - (contentHeightPx - bubbleHeightPx).coerceAtLeast(0))
+                    .coerceAtLeast(0) / context.resources.displayMetrics.density)
+                    .toFloat().dp,
+            onContentMeasured = { h ->
+                if (h != contentHeightPx) {
+                    contentHeightPx = h
+                    sizeWindow()
+                }
+            },
+            onBubbleMeasured = { h ->
+                if (h != bubbleHeightPx) {
+                    bubbleHeightPx = h
+                    sizeWindow()
+                }
+            },
             onOpenApp = {
                 try {
                     val launch = context.packageManager.getLaunchIntentForPackage(context.packageName)
@@ -981,36 +955,6 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
         if (riseProgress <= 0f) return TRANSPARENT
         val alpha = ((argb ushr 24) * riseProgress).toInt()
         return (argb and 0x00FFFFFF) or (alpha shl 24)
-    }
-
-    /**
-     * How tall the card has to be to hold the lines it is showing, padding
-     * included and nothing clamped away.
-     *
-     * This is the truth [sizeWindow] cuts the window to: the card is stretched to
-     * fill the window, so the only way to give it room for a long answer is to
-     * give the window that room. The heights are added up rather than measured
-     * because a legacy [android.widget.TextView] reports no intrinsic size, so
-     * [LINE_HEIGHT] and [STATUS_HEIGHT] are the only line boxes this can see.
-     */
-    private fun neededHeight(userLineCount: Int, replyLineCount: Int): Int {
-        val status = px(STATUS_HEIGHT) + px(BUBBLE_GAP)
-        val user =
-            if (userLineCount == 0) 0
-            else px(BUBBLE_PADDING) * 2 + userLineCount * px(LINE_HEIGHT) + px(BUBBLE_GAP)
-        val answer =
-            if (replyLineCount == 0) 0
-            else px(BUBBLE_PADDING) * 2 + replyLineCount * px(LINE_HEIGHT) + px(CARET_HEIGHT)
-        // The button row and the bot ride on every open card, bubble or not:
-        // [WakeCardContent] always paints both, so an exchange with no words
-        // yet (the wake word's first show, the assistant gesture's session)
-        // must still be cut tall enough for the two ways out of the popup and
-        // the avatar - omitting them on an empty card clipped the buttons
-        // off-window, and the card arrived without its End chat button. The
-        // rule measures to its own padding whatever it paints.
-        val buttons = px(BUBBLE_GAP) + px(BUTTON_HEIGHT)
-        val avatar = px(BUBBLE_GAP) + px(AVATAR_HEIGHT)
-        return px(CARD_TOP_PADDING) + px(CARD_BOTTOM_PADDING) + status + px(DIVIDER_HEIGHT) + user + answer + buttons + avatar
     }
 
     /**
@@ -1154,48 +1098,6 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
                 "cardW=${card.width} cardH=${card.height} composeW=${composeCard.width} composeH=${composeCard.height}"
         )
         if (state == SESSION_STATE_CLOSE) finish()
-    }
-
-    /**
-     * Splits text into the lines the card can show.
-     *
-     * A legacy `TextView` is one line, so a reply longer than the card has to be
-     * cut here. The cut is searched only inside the next [LINE_CHARS] characters:
-     * searching the whole remainder instead makes the break land far past the
-     * card edge, which is what painted lines wider than the card and spilling
-     * over the bubbles. When the text is still not finished at the last slot, the
-     * ellipsis is taken *inside* the budget rather than appended to it, so a
-     * wrapped line can never be wider than the line the card can hold.
-     */
-    private fun wrap(text: String, maxLines: Int): List<String> {
-        val all = mutableListOf<String>()
-        // Characters per line is scale-invariant - see LINE_CHARS - so the
-        // budget is the design value, never re-scaled here.
-        val budget = LINE_CHARS
-        var rest = text.trim()
-        while (rest.isNotEmpty()) {
-            var cut = rest.length
-            if (cut > budget) {
-                val space = rest.substring(0, budget).lastIndexOf(' ')
-                cut = if (space > budget / 3) space else budget
-            }
-            all.add(rest.substring(0, cut).trim())
-            rest = rest.substring(cut).trim()
-        }
-        // A reply longer than the pool scrolls up like a chat, it does not
-        // stop at the first screenful: the oldest lines are dropped and the
-        // newest ones stay, so the tail the user is waiting for is always the
-        // text on the card. Wrapping only the first pool of lines is what
-        // made a growing answer look frozen - the head never changed while
-        // everything arrived below it, invisible.
-        return if (all.size > maxLines) {
-            val scrolled = all.subList(all.size - maxLines, all.size)
-            // The ellipsis is taken inside the first line's budget, so the
-            // scrolled line can never widen the bubble.
-            var first = scrolled[0]
-            if (first.length > budget - 1) first = first.substring(0, budget - 1).trim()
-            listOf("…$first") + scrolled.subList(1, scrolled.size)
-        } else all
     }
 
     /**
