@@ -318,7 +318,6 @@ private const val BUBBLE_TEXT_WIDTH = INNER_WIDTH - BUBBLE_PADDING * 2
  * turning the card back into a panel over the display.
  */
 private const val CARD_OUTER_WIDTH = CARD_WIDTH + CARD_SIDE_PADDING * 2
-private const val MAX_WINDOW_HEIGHT = MAX_CARD_HEIGHT + WINDOW_OVERHEAD + BOTTOM_MARGIN
 
 /**
  * How big the drawn status indicator is.
@@ -705,8 +704,12 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
         val limit = px(MAX_CARD_HEIGHT)
         val tall = if (wanted > limit) limit else wanted
         val ring = px(CARD_ELEVATION) * 2
-        val cut = tall + WINDOW_OVERHEAD + ring + px(BOTTOM_MARGIN)
-        val ceiling = px(MAX_WINDOW_HEIGHT) + ring
+        // The window is bottom-anchored, so the real navigation inset is what
+        // separates the card from the screen's bottom edge - not a guess (see
+        // readBottomInset). The ceiling scales the same way, so a taller bar
+        // than the design guessed does not silently clip the card.
+        val cut = tall + WINDOW_OVERHEAD + ring + bottomInsetPx
+        val ceiling = px(MAX_CARD_HEIGHT + WINDOW_OVERHEAD) + bottomInsetPx + ring
         val height = if (cut > ceiling) ceiling else cut
         surface.setLayout(px(CARD_OUTER_WIDTH) + ring, height)
         surface.setGravity(Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
@@ -760,6 +763,39 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
      * that can draw at the real size. Re-deriving is cheap and idempotent, and an
      * exchange that never measured leaves the shipped design alone.
      */
+    /**
+     * The bottom inset Android actually wants at the screen edge, in real px.
+     *
+     * The card is anchored at the screen bottom, so whatever the system draws
+     * there - a gesture bar, a three-button bar, nothing at all - claims space
+     * the card's foot may not cover. [BOTTOM_MARGIN] was a design guess at
+     * that claim, and a wrong one on every real device: a gesture bar is
+     * taller than it, a three-button one is over twice it, which pushed the
+     * button row into the nav bar's territory (the card arrived without its
+     * buttons), and a device with no bar at all was over-reserved. The
+     * display's own insets are the truth - read here the same way [rescale]
+     * measures the display, off the WindowManager's maximum metrics, which
+     * carry the whole display's insets with no layout timing involved.
+     */
+    private var bottomInsetPx = 0
+
+    /**
+     * Reads the real bottom navigation inset, with the design guess as the
+     * fallback for a display that reports none of it (the shipped [BOTTOM_MARGIN]
+     * is then the safest reservation a guess can be).
+     */
+    private fun readBottomInset(): Int {
+        val wm = runCatching {
+            context.getSystemService(android.view.WindowManager::class.java)
+        }.getOrNull() ?: return px(BOTTOM_MARGIN)
+        val insets = runCatching { wm.maximumWindowMetrics.windowInsets }.getOrNull()
+            ?: runCatching { wm.currentWindowMetrics.windowInsets }.getOrNull()
+            ?: return px(BOTTOM_MARGIN)
+        val bottom = insets
+            .getInsets(android.view.WindowInsets.Type.navigationBars()).bottom
+        return if (bottom > 0) bottom else px(BOTTOM_MARGIN)
+    }
+
     private fun rescale() {
         // The scale comes from the display, and the display is measured here
         // directly: the indirect route - leaving the first window uncut so a
@@ -793,8 +829,12 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
         if (measuredShortEdge <= 0) return
         val raw = measuredShortEdge.toFloat() / BASE_SHORT_EDGE
         val target = if (raw < MIN_SCALE) MIN_SCALE else if (raw > MAX_SCALE) MAX_SCALE else raw
-        if (target == scale) return
+        if (target == scale && bottomInsetPx > 0) return
         scale = target
+        // The bottom inset is display-owned, not scale-owned (it comes off the
+        // display's own metrics in real px), but it is read with the scale as
+        // its fallback, so it refreshes here - the same every-show cadence.
+        bottomInsetPx = readBottomInset()
         cardShape = rounded(WAKE_CARD_SURFACE, pt(CARD_RADIUS))
         elevationShape = rounded(WAKE_CARD_ELEVATION, pt(CARD_RADIUS + CARD_ELEVATION))
         Log.i(
@@ -856,7 +896,11 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
             android.view.ViewGroup.LayoutParams.MATCH_PARENT
         )
         card.addView(composeCard)
-        foot.setPadding(0, px(BOTTOM_MARGIN), 0, 0)
+        // The foot's clearance is the display's real bottom inset, not a
+        // design guess: this padding is what keeps the button row clear of
+        // the navigation bar, and only the display knows where that bar is
+        // or whether there is one.
+        foot.setPadding(0, bottomInsetPx, 0, 0)
         paint()
         return stage
     }
