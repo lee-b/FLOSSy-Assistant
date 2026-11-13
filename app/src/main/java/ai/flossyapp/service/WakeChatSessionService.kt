@@ -957,19 +957,15 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
         val answer =
             if (replyLineCount == 0) 0
             else px(BUBBLE_PADDING) * 2 + replyLineCount * px(LINE_HEIGHT) + px(CARET_HEIGHT)
-        // The rule measures to its own padding whatever it paints, so it always
-        // costs the card this much room. The button row rides along on every
-        // open card: the two ways out of the popup are part of the card the
-        // same way the bubbles are, so the window is cut tall enough for them.
-        val buttons =
-            if (userLineCount == 0 && replyLineCount == 0) 0
-            else px(BUBBLE_GAP) + px(BUTTON_HEIGHT)
-        // The bot rides between the status and the bubbles, so it costs the
-        // window its own room on every open card - without it the reply's
-        // first lines would be clipped under the avatar.
-        val avatar =
-            if (userLineCount == 0 && replyLineCount == 0) 0
-            else px(BUBBLE_GAP) + px(AVATAR_HEIGHT)
+        // The button row and the bot ride on every open card, bubble or not:
+        // [WakeCardContent] always paints both, so an exchange with no words
+        // yet (the wake word's first show, the assistant gesture's session)
+        // must still be cut tall enough for the two ways out of the popup and
+        // the avatar - omitting them on an empty card clipped the buttons
+        // off-window, and the card arrived without its End chat button. The
+        // rule measures to its own padding whatever it paints.
+        val buttons = px(BUBBLE_GAP) + px(BUTTON_HEIGHT)
+        val avatar = px(BUBBLE_GAP) + px(AVATAR_HEIGHT)
         return px(CARD_TOP_PADDING) + px(CARD_BOTTOM_PADDING) + status + px(DIVIDER_HEIGHT) + user + answer + buttons + avatar
     }
 
