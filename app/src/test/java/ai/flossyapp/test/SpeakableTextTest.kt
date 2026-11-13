@@ -2,6 +2,8 @@ package ai.flossyapp.test
 
 import ai.flossyapp.ui.common.speakableText
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 /**
@@ -52,6 +54,33 @@ class SpeakableTextTest {
         assertEquals("hello", speakableText("hello 你好"))
         assertEquals("great", speakableText("great 🎉😀"))
         assertEquals("one two", speakableText("one two ελληνικά"))
+    }
+
+    @Test
+    fun theFilterNeverTruncatesItOnlyDrops() {
+        // The recurring suspicion that the filter stops at the first
+        // non-speakable character and truncates the rest. `filter` keeps
+        // every matching character in order, so the output must always be a
+        // subsequence of the input - checked here character by character,
+        // and every speakable input character must survive.
+        val text = "A **bold** claim, 100% sure: see https://example.com! \ud83c\udf89"
+        val result = speakableText(text)
+        var at = 0
+        for (c in result) {
+            val found = text.indexOf(c, at)
+            if (found < 0) {
+                fail("result character '$c' is not a subsequence of the input - the filter truncated")
+            }
+            at = found + 1
+        }
+        for (c in text) {
+            val speakable = c.isLetterOrDigit() && c.code < 0x250 ||
+                c.isWhitespace() ||
+                c in ".,'!?;:-()\"\u2019\u201c\u201d"
+            if (speakable) {
+                assertTrue("speakable character '$c' was dropped", result.contains(c))
+            }
+        }
     }
 
     @Test

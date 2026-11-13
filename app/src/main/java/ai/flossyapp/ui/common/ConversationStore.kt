@@ -74,6 +74,10 @@ object ConversationStore {
     // matching open must never push a counter negative).
     private var appSurfaceOpen = false
     private var popupSurfaceOpen = false
+    // The legacy always-listening assistant service is a surface too: while
+    // its foreground notification is live, a hang-up ends the call but not
+    // the conversation.
+    private var assistantSurfaceOpen = false
 
     // Disk persistence. Attached once from the Application; a null context
     // (plain unit tests) disables it. Serialization and disk writes run on
@@ -133,6 +137,16 @@ object ConversationStore {
         if (change) evaluateEnded()
     }
 
+    /** The always-listening assistant service's surface opened or closed. */
+    fun setAssistantSurfaceOpen(open: Boolean) {
+        val change = synchronized(this) {
+            val changed = assistantSurfaceOpen != open
+            assistantSurfaceOpen = open
+            changed
+        }
+        if (change) evaluateEnded()
+    }
+
     /**
      * The model ended the call itself: the conversation is over at once,
      * even with a surface still on screen.
@@ -153,7 +167,7 @@ object ConversationStore {
      */
     private fun evaluateEnded() {
         val mark = synchronized(this) {
-            if (!appSurfaceOpen && !popupSurfaceOpen && !_callActive.value) {
+            if (!appSurfaceOpen && !popupSurfaceOpen && !assistantSurfaceOpen && !_callActive.value) {
                 ended = true
                 true
             } else false

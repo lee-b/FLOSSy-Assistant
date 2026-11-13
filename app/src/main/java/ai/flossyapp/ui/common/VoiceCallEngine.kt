@@ -313,6 +313,15 @@ class VoiceCallEngine private constructor(context: Context?) {
 
 
     /**
+     * True when [host] is the surface the APP mode currently routes the mic
+     * to. The always-listening assistant service checks this before hanging
+     * up on a stop: it may only end a call it owns, never the screen's or
+     * the wake service's.
+     */
+    fun isAppHost(host: ExchangeHost): Boolean =
+        mode == Mode.APP && appHost === host
+
+    /**
      * Start (or re-enter) app mode: the chat screen owns the microphone and
      * every utterance becomes an exchange through [host].
      */
@@ -584,6 +593,13 @@ class VoiceCallEngine private constructor(context: Context?) {
                 return@launch
             }
             try {
+                // An utterance the engine accepted implies a live call in APP
+                // mode: the always-listening service owns the mic across
+                // utterances, so after a true end the next accepted utterance
+                // opens a fresh conversation. The screen and the wake service
+                // open their calls explicitly; for them this is a no-op.
+                if (mode == Mode.APP) beginCall()
+
                 // The gate is closed here, inside the accepted exchange, so
                 // a dropped utterance never closes the microphone behind it.
                 captureGate.set(false)

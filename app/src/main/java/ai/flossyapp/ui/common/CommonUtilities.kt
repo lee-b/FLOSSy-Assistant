@@ -870,6 +870,15 @@ class ReplyAudioPlayer(
         } catch (e: Exception) {
             android.util.Log.w("TTS", "Drain failed: ${e.message}")
         }
+        // Diagnostic for the reported reply truncation: how many frames the
+        // track actually received versus how far its playback head got. A
+        // head short of the written count means the tail was cut at the
+        // mixer, not in the producer - the one case this player cannot fix.
+        val head = t.playbackHeadPosition.toLong()
+        val rateNow = if (rate > 0) rate else 1
+        android.util.Log.i("TTS",
+            "Reply drained: wrote ${totalFrames * 2} bytes (${totalFrames} frames @${rateNow}Hz), " +
+                "head reached ${head} frames, undrained ${totalFrames - head} frames")
         try { t.release() } catch (_: Exception) {}
         track = null
         totalFrames = 0

@@ -20,6 +20,7 @@ class ConversationLifetimeTest {
         // the same observable state through the public API alone.
         ConversationStore.setAppSurfaceOpen(false)
         ConversationStore.setPopupSurfaceOpen(false)
+        ConversationStore.setAssistantSurfaceOpen(false)
         ConversationStore.setCallActive(false)
         ConversationStore.clear()
         ConversationStore.markConversationOpen()
@@ -40,6 +41,18 @@ class ConversationLifetimeTest {
     }
 
     @Test
+    fun theAssistantServiceIsASurfaceToo() {
+        // The always-listening service claims a surface while its foreground
+        // notification is live: a hang-up there ends the call but not the
+        // conversation.
+        ConversationStore.setAssistantSurfaceOpen(true)
+        ConversationStore.setCallActive(false)
+        assertFalse(ConversationStore.conversationEnded)
+        ConversationStore.setAssistantSurfaceOpen(false)
+        assertTrue(ConversationStore.conversationEnded)
+    }
+
+    @Test
     fun closingEverySurfaceWithNoCallEndsTheConversation() {
         ConversationStore.setAppSurfaceOpen(true)
         ConversationStore.setPopupSurfaceOpen(true)
@@ -54,6 +67,7 @@ class ConversationLifetimeTest {
         // The user went home mid-call: no surface, but the call is live.
         ConversationStore.setAppSurfaceOpen(false)
         ConversationStore.setPopupSurfaceOpen(false)
+        ConversationStore.setAssistantSurfaceOpen(false)
         ConversationStore.setCallActive(true)
         assertFalse(ConversationStore.conversationEnded)
         // The call then finished on its own: only then is it over.
