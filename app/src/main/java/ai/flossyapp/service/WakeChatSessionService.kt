@@ -623,7 +623,23 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
      * so the caret's phase keeps running even when nothing draws it.
      */
     override fun onPrepareShow(args: android.os.Bundle, showFlags: Int) {
+        // A show the platform raised itself (the assistant gesture, a voice
+        // session the system asked for on its own) carries none of our state
+        // keys: the bundle is the system's, not this service's. Such a session
+        // is the assistant at its most idle - listening for the user - so an
+        // unknown or missing state renders as listening rather than as a fault
+        // ("Something went wrong" was the whole card the gesture produced).
+        // Our own show() calls always name one of the SESSION_STATE_* values,
+        // so they are unaffected by the fallback.
         state = args.getString(SESSION_STATE_KEY) ?: ""
+        if (state !in listOf(
+                SESSION_STATE_RISE, SESSION_STATE_LISTENING, SESSION_STATE_REQUEST,
+                SESSION_STATE_STREAMING, SESSION_STATE_SPEAKING, SESSION_STATE_REPLY,
+                SESSION_STATE_CLOSE
+            )
+        ) {
+            state = SESSION_STATE_LISTENING
+        }
         request = args.getString(SESSION_REQUEST_KEY) ?: ""
         reply = args.getString(SESSION_REPLY_KEY) ?: ""
         // The tool calls arrive as one JSON document; a corrupt one costs

@@ -843,42 +843,24 @@ class ReplyAudioPlayer(
 
     private fun drain() {
         val t = track ?: return
+        val written = totalFrames
+        val rateNow = rate
+        var head = 0L
         try {
-            t.stop()
-            // The poll is only a release guard - its deadline is the audio's
-            // own length plus slack, and the frame count it waits for is the
-            // count the track actually received, so nothing is cut.
-            val drainMs = if (rate > 0) totalFrames * 1000 / rate + 500 else 500L
-            val deadline = System.currentTimeMillis() + drainMs
-            var lastHead = -1L
-            var stalledFor = 0L
-            while (System.currentTimeMillis() < deadline) {
-                val head = t.playbackHeadPosition.toLong()
-                if (head >= totalFrames) break
-                if (head == lastHead) {
-                    stalledFor += 20
-                    // A head that has not moved for a second will never move
-                    // again - waiting out the full deadline of a dead track
-                    // is what froze the UI here before the dispatcher fix.
-                    if (stalledFor >= 1000) break
-                } else {
-                    stalledFor = 0
-                    lastHead = head
-                }
-                Thread.sleep(20)
-            }
+            // The head is polled while the track is still playing: streaming
+            // stop() resets it to zero, so stopping first would make the poll
+            // read 0 forever and cut the reply's tail (see playOutThenStop).
+            head = playOutThenStop(t, written, rateNow)
         } catch (e: Exception) {
             android.util.Log.w("TTS", "Drain failed: ${e.message}")
         }
         // Diagnostic for the reported reply truncation: how many frames the
-        // track actually received versus how far its playback head got. A
-        // head short of the written count means the tail was cut at the
-        // mixer, not in the producer - the one case this player cannot fix.
-        val head = t.playbackHeadPosition.toLong()
-        val rateNow = if (rate > 0) rate else 1
+        // track actually received versus how far its playback head got before
+        // the stop. A head short of the written count means the tail was cut
+        // at the mixer, not in the producer.
         android.util.Log.i("TTS",
-            "Reply drained: wrote ${totalFrames * 2} bytes (${totalFrames} frames @${rateNow}Hz), " +
-                "head reached ${head} frames, undrained ${totalFrames - head} frames")
+            "Reply drained: wrote ${written * 2} bytes (${written} frames @${rateNow}Hz), " +
+                "head reached ${head} frames, undrained ${written - head} frames")
         try { t.release() } catch (_: Exception) {}
         track = null
         totalFrames = 0
@@ -907,6 +889,74 @@ class ReplyAudioPlayer(
  *   wake word can take over mid-reply.
  * @return true if any audio was played.
  */
+/**
+ * Plays a streaming [AudioTrack] out and only then stops it, and returns the
+ * playback head as it stood just before the stop.
+ *
+ * The order here is the whole fix: streaming stop() resets the playback head
+ * to zero, so a drain that stops first and polls afterwards reads 0 forever,
+ * mistakes the frozen counter for a dead track, and releases the track while
+ * the reply's tail is still unplayed - the device-verified truncation. The
+ * head is therefore polled while the track is still playing, and stop() comes
+ * only after the head reached the frame count the track actually received (or
+ * the audio's own duration plus slack elapsed, which bounds a track the mixer
+ * never serves).
+ *
+ * Runs on the IO dispatcher - the poll sleeps on the playback head, and a
+ * caller on the main thread must never sleep in that wait (the ANR trace).
+ *
+ * @param totalFrames frames the track received (16-bit mono frames).
+ * @param rate sample rate in Hz, for the duration-scaled deadline.
+ * @return the head position observed while the track was still playing.
+ */
+internal fun playOutThenStop(track: android.media.AudioTrack, totalFrames: Long, rate: Int): Long {
+    val head = playOutUntilHead(
+        head = { track.playbackHeadPosition.toLong() },
+        totalFrames = totalFrames,
+        rate = rate,
+        onDone = { try { track.stop() } catch (_: Exception) {} }
+    )
+    return head
+}
+
+/**
+ * The drain loop itself, with the head read injected so a unit test can
+ * simulate a mixer (advancing, stalled, or stopped) without audio hardware.
+ * [stallLimitMs] is the head-frozen guard, 2.5s in production; tests pass
+ * something small so a dead track does not slow the suite.
+ */
+internal fun playOutUntilHead(
+    head: () -> Long,
+    totalFrames: Long,
+    rate: Int,
+    onDone: () -> Unit,
+    stallLimitMs: Long = 2500L
+): Long {
+    val drainMs = if (rate > 0) totalFrames * 1000L / rate + 500 else 500L
+    val deadline = System.currentTimeMillis() + drainMs
+    var lastHead = -1L
+    var stalledFor = 0L
+    var observed = 0L
+    while (System.currentTimeMillis() < deadline) {
+        observed = head()
+        if (observed >= totalFrames) break
+        if (observed == lastHead) {
+            stalledFor += 20
+            // A head frozen this long while the track is nominally playing
+            // means the mixer has stopped serving it (an underrun-disabled
+            // track nobody restarted) - waiting out the full deadline of a
+            // dead track is what froze the UI here before the dispatcher fix.
+            if (stalledFor >= stallLimitMs) break
+        } else {
+            stalledFor = 0
+            lastHead = observed
+        }
+        try { Thread.sleep(20) } catch (_: InterruptedException) { break }
+    }
+    onDone()
+    return observed
+}
+
 suspend fun playPcmAudio(pcmBytes: ByteArray, sampleRate: Int, abortSignal: AtomicBoolean? = null, player: ReplyAudioPlayer? = null): Boolean {
     if (pcmBytes.isEmpty()) return false
     if (player != null) return player.write(pcmBytes, pcmBytes.size, sampleRate)
@@ -990,21 +1040,11 @@ private fun playPcmAudioOnOwnTrack(pcmBytes: ByteArray, sampleRate: Int, abortSi
             // The write is blocking but only until the buffer accepts the data,
             // so returning here would leave the speaker still sounding the tail
             // - which the freshly re-armed microphone then hears as speech and
-            // turns into phantom utterances. stop() plays out what was written
-            // (flush() would discard it), and the head position is polled until
-            // every frame has actually left the speaker.
-            audioTrack.stop()
+            // turns into phantom utterances. The head is polled while the track
+            // is still playing and only then stopped: stop() first would reset
+            // the streaming head to zero and cut the tail (see playOutThenStop).
             val totalFrames = totalWritten / 2L
-            // The drain waits as long as the audio itself lasts plus a beat of
-            // slack - a fixed cap truncates every sentence longer than the cap,
-            // which is exactly the "reply cut off at the end of each portion"
-            // a fixed two-second deadline used to produce on long sentences.
-            val drainMs = totalFrames * 1000L / rate + 500
-            val deadline = System.currentTimeMillis() + drainMs
-            while (System.currentTimeMillis() < deadline) {
-                if (audioTrack.playbackHeadPosition >= totalFrames) break
-                Thread.sleep(20)
-            }
+            playOutThenStop(audioTrack, totalFrames, rate)
             audioTrack.release()
             android.util.Log.d("TTS", "Played ${totalWritten} bytes at ${rate}Hz")
             return true
@@ -1764,18 +1804,14 @@ suspend fun playAudioBytes(data: ByteArray, abortSignal: AtomicBoolean? = null, 
             // Same drain discipline as playPcmAudio: stop() plays out what is
             // already written (flush() would cut the reply's tail), and the head
             // position is polled until the speaker has actually finished.
-            track?.stop()
-            val totalFrames = totalWritten / 2L
             // Duration-scaled, like playPcmAudio: a fixed cap amputates the
             // tail of every sentence that outlives it. The decoder names the
             // rate its PCM really plays at - the old hardcoded guess is what
-            // cut long sentences short.
-            val drainMs = totalFrames * 1000L / decodedRate + 500
-            val drainDeadline = System.currentTimeMillis() + drainMs
-            while (System.currentTimeMillis() < drainDeadline) {
-                if (track?.playbackHeadPosition ?: 0 >= totalFrames) break
-                Thread.sleep(20)
-            }
+            // cut long sentences short. The head is polled while the track is
+            // still playing (stop() first resets it to zero - playOutThenStop).
+            val totalFrames = totalWritten / 2L
+            val t = track
+            if (t != null) playOutThenStop(t, totalFrames, decodedRate)
             track?.release()
             codec.stop()
             codec.release()
