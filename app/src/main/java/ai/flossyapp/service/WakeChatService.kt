@@ -533,7 +533,7 @@ class WakeChatService : VoiceInteractionService() {
         // closes and any exchange still in flight is cut short, unless the
         // chat screen has already taken the mic for a call of its own.
         val engine = VoiceCallEngine.instance(applicationContext)
-        if (engine.mode == VoiceCallEngine.Mode.WAKE) engine.stop()
+        if (engine.micState == VoiceCallEngine.MicState.WAKE) engine.stop()
         // The mid-turn watcher is holding the microphone when a stop arrives
         // between turns, so it has to be told to let go as well - otherwise the
         // next exchange opens a second recorder beside the one still running.
@@ -1249,15 +1249,15 @@ class WakeChatService : VoiceInteractionService() {
      * can act on survives the animation.
      */
     private suspend fun endExchange() {
-        // The call is over everywhere: the fullscreen view drops its call UI
-        // (and with it the avatar) the moment this lands.
-        ConversationStore.setCallActive(false)
         // The engine's call flag drops with it, so the next wake phrase
         // begins a fresh conversation - but only when the wake service owns
         // the call: a chat-screen call keeps its capture (the chat-hangup
-        // protection) and is ended by the screen's own hang-up path.
-        if (VoiceCallEngine.instance(applicationContext).mode == VoiceCallEngine.Mode.WAKE) {
-            VoiceCallEngine.instance(applicationContext).endCallKeepCapture()
+        // protection) and is ended by the screen's own hang-up path. The
+        // shared store is published by the engine alone - no surface writes
+        // call-liveness behind its back any more.
+        val engine = VoiceCallEngine.instance(applicationContext)
+        if (engine.micState == VoiceCallEngine.MicState.WAKE) {
+            engine.endCallKeepCapture()
         }
         closeChat()
         for (frame in SINK_FRAMES - 1 downTo 0) {

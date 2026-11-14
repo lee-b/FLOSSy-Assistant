@@ -26,24 +26,27 @@ import kotlinx.coroutines.withTimeoutOrNull
  * network), complete utterances cut on the network's own speech span, and each
  * utterance carried through STT, the LLM and synchronous TTS by [runExchange].
  *
- * The engine owns the microphone for as long as a voice mode is active, so
- * there is never a second recorder fighting for it - the wake service's old
- * per-window [recordAudioWithVAD] recorder and the screen's capture used to
- * run side by side, and one of them read a silent device (the "Could not hear
- * the request" that appeared as soon as both paths were live).
+ * Everything the pipeline needs to know about "may I hear?" is derived from
+ * ONE state machine: [micState]. There are no latched flags to forget to
+ * reset - the capture gate, the per-exchange aborts and the conversation
+ * store are all projections of the state, computed at read time. A teardown
+ * path that misses a reset ceremony is unrepresentable by construction,
+ * because there are no reset ceremonies and nothing to miss.
  *
  * A mode says who gets the utterances:
- * - [Mode.APP]: the chat screen is in a call; every utterance becomes one
+ * - [MicState.APP]: the chat screen is in a call; every utterance becomes one
  *   exchange rendered through the screen's host.
- * - [Mode.WAKE]: the background service is listening for the phrase; every
+ * - [MicState.WAKE]: the background service is listening for the phrase; every
  *   utterance is handed to it through [nextUtterance], so it can match the
  *   wake word on-device exactly as before - only on clips the shared capture
  *   already produced.
+ * - [MicState.IDLE]: nothing owns the microphone; the capture is closed.
  *
- * The host interfaces below are the only surface each caller implements, which
- * keeps the engine free of Compose state and free of the session-window
- * plumbing: the screen draws bubbles, the service draws its card, and both
- * hear about the same exchange the same way.
+ * Every state change goes through [transitionFromTo], which is the single
+ * writer of the state and performs the transition's side effects (capture
+ * open/close, channel drain, exchange-scope cancel, store publication) under
+ * one lock. Callers pass their own sense of the current state, so a caller
+ * acting on stale information is detected instead of silently mis-transitioning.
  */
 class VoiceCallEngine private constructor(context: Context?) {
 
@@ -155,12 +158,38 @@ class VoiceCallEngine private constructor(context: Context?) {
     }
 
     /**
-     * Where a completed utterance goes right now: the wake service's
-     * matcher, the chat screen's exchange pipeline, or nowhere. This is
-     * mic *routing*, not call ownership - there is one call, and the
-     * surfaces that draw it are views, not owners.
+     * The one mic state: who owns the microphone right now. Every public
+     * entry point of the engine is a thin adapter over [transitionFromTo],
+     * so this enum - not a scatter of booleans - is the whole truth about
+     * hearing.
      */
-    enum class Mode { IDLE, APP, WAKE }
+    enum class MicState {
+        /** Nothing owns the microphone; the capture is closed. */
+        IDLE,
+        /** The wake service slumbers or listens for the phrase on the shared capture. */
+        WAKE,
+        /** The chat screen is in a voice call on the shared capture. */
+        APP
+    }
+
+    /**
+     * The outcome of a [transitionFromTo] attempt. [ok] is true only for the
+     * outcomes that leave the engine in [MicState] `newState` (or already
+     * there, for the no-op).
+     */
+    enum class TransitionOutcome(val ok: Boolean) {
+        /** The transition ran; the state is now newState. */
+        COMMITTED(true),
+        /** Already in newState; the request was valid but had nothing to do. */
+        NOOP(true),
+        /** The caller's sense of the current state did not match reality. */
+        STALE_EXPECTATION(false),
+        /** The (currentState, newState) pair is not in the legal table. */
+        ILLEGAL_TRANSITION(false),
+        /** The transition was committed but the capture would not open; the
+         * state was rolled back so the caller's next attempt retries. */
+        CAPTURE_FAILED(false)
+    }
 
     /**
      * What a voice-call host must provide: the engine runs the exchange and
@@ -199,22 +228,48 @@ class VoiceCallEngine private constructor(context: Context?) {
         fun onError(message: String)
     }
 
+    /**
+     * One exchange's own abort/discard pair. These flags used to be
+     * engine-wide latches reset by hand at every mode entry - a ceremony
+     * each new entry point could forget. They now live and die with the
+     * exchange that owns them: [teardownCurrentExchange] marks the live
+     * one, and a new exchange simply carries fresh flags.
+     */
+    private class Exchange(externalAbort: java.util.concurrent.atomic.AtomicBoolean?) {
+        // Cut the reply short when the call ends mid-speech. The external
+        // abort (the wake service's interrupt signal) is folded in by the
+        // watcher launched in runExchange, so the TTS runner polls ONE flag.
+        val ttsAbort = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        // Drop a half-heard utterance when the call ends mid-capture.
+        val discard = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        val externalAbort: java.util.concurrent.atomic.AtomicBoolean? = externalAbort
+    }
+
     private val appContext: Context? = context?.applicationContext
 
     // One scope for every exchange coroutine the engine carries. Exchanges
-    // are cancelled wholesale when the mode drops, so nothing can answer or
-    // speak after the call ended.
+    // are cancelled wholesale when the mic state drops, so nothing can
+    // answer or speak after the call ended.
     private var jobScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
+    // Opens and closes the AudioRecord. Deliberately NOT the exchange scope:
+    // cancelling exchanges must not orphan a recorder mid-open.
+    private val captureScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    // The one state. Read freely; written only by transitionFromTo under its
+    // own lock.
     @Volatile
-    var mode: Mode = Mode.IDLE
+    var micState: MicState = MicState.IDLE
         private set
 
     // The one call. True from the moment a conversation opens (wake phrase,
     // mic button, or the screen adopting a live exchange) until [hangUp]
     // ends it; the surfaces read this through ConversationStore to decide
     // what to draw, and the engine reads it to decide what still speaks.
-    // Volatile: the notification thread hangs up while an exchange runs.
+    // Maintained only by the state machine's side effects - never written
+    // from the outside.
     @Volatile
     var callActive: Boolean = false
         private set
@@ -233,10 +288,12 @@ class VoiceCallEngine private constructor(context: Context?) {
     // whoever owns it.
     private var capture: StreamingCallCapture? = null
 
-    // While the assistant speaks the capture must not hear its own reply as
-    // an utterance; the gate is closed for the whole exchange and reopened
-    // on its exit.
-    private val captureGate = java.util.concurrent.atomic.AtomicBoolean(true)
+    // The live exchange's own abort/discard pair, or null when no exchange
+    // runs. The capture gate is DERIVED from this: the mic hears only when
+    // a state is active and no exchange is in flight. There is no gate
+    // boolean anywhere - so none can latch closed behind a teardown path.
+    @Volatile
+    private var currentExchange: Exchange? = null
 
     // One exchange at a time - a second utterance while one runs is either
     // self-echo or talk-over, and both are dropped. A mutex whose lock is
@@ -244,12 +301,6 @@ class VoiceCallEngine private constructor(context: Context?) {
     // before the body runs holds nothing, and the body's own finally always
     // releases what it took.
     private val exchangeMutex = kotlinx.coroutines.sync.Mutex()
-
-    // Cutting the reply short when the call ends mid-speech.
-    private val ttsAbortSignal = java.util.concurrent.atomic.AtomicBoolean(false)
-
-    // Dropping a half-heard utterance when the call ends mid-capture.
-    private val discardCurrentUtterance = java.util.concurrent.atomic.AtomicBoolean(false)
 
     // Utterances in WAKE mode travel to the service through this channel.
     private val utteranceChannel = Channel<ByteArray>(Channel.UNLIMITED)
@@ -261,64 +312,6 @@ class VoiceCallEngine private constructor(context: Context?) {
     var chunkListener: ((FloatArray) -> Unit)? = null
 
     private var appHost: ExchangeHost? = null
-
-    // android.util.Log is not mockable in a plain JVM unit suite, so the
-    // engine's own logging goes through this seam: in testMode the calls
-    // vanish, everywhere else they are the ordinary logcat lines.
-    private fun log(message: String, level: String = "d", error: Throwable? = null) {
-        if (testMode) return
-        when (level) {
-            "w" -> android.util.Log.w("VoiceCallEngine", message)
-            "e" -> android.util.Log.e("VoiceCallEngine", message, error)
-            else -> android.util.Log.d("VoiceCallEngine", message)
-        }
-    }
-
-
-    /**
-     * Start (or re-enter) app mode: the chat screen owns the microphone and
-     * every utterance becomes an exchange through [host].
-     */
-    fun startAppMode(host: ExchangeHost) {
-        appHost = host
-        mode = Mode.APP
-        beginCall()
-        ttsAbortSignal.set(false)
-        discardCurrentUtterance.set(false)
-        ensureCapture()
-    }
-
-    /**
-     * Start (or re-enter) wake mode: the service listens for the phrase and
-     * collects utterances through [nextUtterance].
-     *
-     * Refuses when the chat screen is in a voice call: a wake listener and a
-     * call are different states, the microphone belongs to the call, and
-     * stealing it here would both deafen the call and let the wake matcher
-     * hear the exchange it must not hear. The caller waits and tries again.
-     *
-     * @return whether wake mode now owns the capture.
-     */
-    fun startWakeMode(): Boolean {
-        if (mode == Mode.APP) return false
-        mode = Mode.WAKE
-        if (callActive) {
-            // A live call (the screen released it, or the wake loop adopted
-            // it) continues: this re-entry is the wake service re-arming as
-            // the utterance router, not a new conversation.
-            return true
-        }
-        // Per-exchange state must be cleared on this path too, not only in
-        // startAppMode: stop() latches discardCurrentUtterance (and the tts
-        // abort) on, and a wake session entered afterwards would otherwise
-        // return every exchange's body before STT - the wake word is heard,
-        // the chime plays, and no reply is ever spoken, with no error
-        // anywhere. This flag belongs to a session, not to the screen.
-        ttsAbortSignal.set(false)
-        discardCurrentUtterance.set(false)
-        ensureCapture()
-        return true
-    }
 
     // A screen call that ended while it was still live - the user hung up,
     // or the window that hosted it was swiped away - hands the microphone
@@ -336,48 +329,149 @@ class VoiceCallEngine private constructor(context: Context?) {
     @Volatile
     private var handoffAt = 0L
 
-    /**
-     * Whether APP mode just released a live call. The wake service reads and
-     * clears this when it regains the capture, so the same conversation can
-     * continue in the popup without a fresh wake phrase.
-     */
-    fun consumeHandoff(): Boolean {
-        val handoff = pendingHandoff && System.currentTimeMillis() - handoffAt < HANDOFF_TTL_MS
-        pendingHandoff = false
-        return handoff
+    // android.util.Log is not mockable in a plain JVM unit suite, so the
+    // engine's own logging goes through this seam: in testMode the calls
+    // vanish, everywhere else they are the ordinary logcat lines.
+    private fun log(message: String, level: String = "d", error: Throwable? = null) {
+        if (testMode) return
+        when (level) {
+            "w" -> android.util.Log.w("VoiceCallEngine", message)
+            "e" -> android.util.Log.e("VoiceCallEngine", message, error)
+            else -> android.util.Log.d("VoiceCallEngine", message)
+        }
     }
 
-    /** Whether a handoff is pending, without consuming it. */
-    fun hasHandoff(): Boolean =
-        pendingHandoff && System.currentTimeMillis() - handoffAt < HANDOFF_TTL_MS
+    // ==================== the one state transition ====================
+
+    // The legal (currentState, newState) pairs. Every pair not listed here -
+    // including any pair a future caller invents - is refused. The table is
+    // exhaustive for the three-state machine: same-state is the no-op case
+    // handled before the table check.
+    private val legalTransitions: Set<Pair<MicState, MicState>> = setOf(
+        MicState.IDLE to MicState.WAKE,
+        MicState.IDLE to MicState.APP,
+        MicState.WAKE to MicState.APP,   // the screen takes over a slumbering wake listener
+        MicState.WAKE to MicState.IDLE,  // the wake service stops
+        MicState.APP to MicState.WAKE,   // handoff: the screen released a live call
+        MicState.APP to MicState.IDLE    // deliberate hang-up from any surface
+    )
 
     /**
-     * Leave APP mode: [handoffToWake] says whether the call was released
-     * because its window vanished (a handoff the wake service adopts - the
-     * conversation continues in the popup) or because the user hung up
-     * deliberately (no handoff - the call is over and the wake service goes
-     * back to listening for the wake phrase).
+     * The single writer of [micState] and of every side effect a state
+     * change implies.
+     *
+     * [currentState] is the CALLER'S sense of what the state is right now.
+     * The engine checks it against reality under its own lock: a mismatch
+     * is [TransitionOutcome.STALE_EXPECTATION] - the caller acted on stale
+     * information and must re-read [micState] instead of having pushed the
+     * engine somewhere it did not mean to go. The pair itself is checked
+     * against the legal table, so an invented transition is refused rather
+     * than improvised.
+     *
+     * Same-state requests are a valid no-op ([TransitionOutcome.NOOP]) with
+     * one exception kept: re-entering a hearing state re-arms the capture,
+     * because the wake loop's every pass relies on that idempotent re-arm
+     * bringing a dead capture back.
+     *
+     * Side effects by target state, all under one lock:
+     * - into WAKE/APP: drain stale utterances, (re)open the capture. A
+     *   capture that cannot open rolls the state back, so the caller's next
+     *   attempt is a genuine retry; the wake loop re-polls every 500 ms.
+     * - into APP: [beginCall] - a new conversation when none was live.
+     * - APP to WAKE: the handoff - the capture and the call survive, the
+     *   vanished screen's exchange is cancelled, the wake loop adopts.
+     * - into IDLE: full teardown - capture closed, exchanges cancelled,
+     *   stale utterances drained, call flag dropped (and published to the
+     *   shared store, which the engine alone writes).
      */
-    fun stopAppMode(handoffToWake: Boolean) {
-        pendingHandoff = handoffToWake && mode == Mode.APP
-        handoffAt = System.currentTimeMillis()
-        if (handoffToWake) {
-            // The call itself survives: the engine keeps the capture and the
-            // conversation; only the surface changes. The wake loop adopts
-            // it on its next pass. The running exchange (whose host was the
-            // vanished window) is cancelled like in stop(), but the capture
-            // stays and the gate reopens so the wake loop can hear the user.
-            appHost = null
-            mode = Mode.WAKE
-            discardCurrentUtterance.set(true)
-            ttsAbortSignal.set(true)
-            cancelExchangeScope()
-            ttsAbortSignal.set(false)
-            discardCurrentUtterance.set(false)
-            captureGate.set(true)
-        } else {
-            hangUp("ChatScreen endVoiceCall")
+    @Synchronized
+    fun transitionFromTo(currentState: MicState, newState: MicState): TransitionOutcome {
+        val actual = micState
+        if (currentState != actual) {
+            log("Transition refused (stale): caller said $currentState, reality is $actual", level="w")
+            return TransitionOutcome.STALE_EXPECTATION
         }
+        if (newState == actual) {
+            // Idempotent re-entry: hearing states re-arm the capture (a dead
+            // one is reopened by the loop's next pass), IDLE has nothing to do.
+            if (newState == MicState.WAKE || newState == MicState.APP) {
+                if (!ensureCapture()) return TransitionOutcome.CAPTURE_FAILED
+            }
+            return TransitionOutcome.NOOP
+        }
+        if ((currentState to newState) !in legalTransitions) {
+            log("Transition refused (illegal): $currentState -> $newState", level="w")
+            return TransitionOutcome.ILLEGAL_TRANSITION
+        }
+
+        val from = actual
+        when (newState) {
+            MicState.WAKE, MicState.APP -> {
+                // A session entered fresh must never inherit stale clips or
+                // a latched exchange: drain the channel and make sure the
+                // capture is live. (Per-exchange flags cannot leak across -
+                // they are born with the exchange.)
+                drainUtteranceChannel()
+                if (!ensureCapture()) {
+                    // Roll back so the caller's next attempt is a real retry
+                    // instead of a state that claims to hear through a dead mic.
+                    micState = from
+                    if (newState == MicState.APP) {
+                        callActive = false
+                        if (!testMode) ConversationStore.setCallActive(false)
+                    }
+                    return TransitionOutcome.CAPTURE_FAILED
+                }
+                if (newState == MicState.APP) beginCall()
+            }
+            MicState.IDLE -> {
+                teardownFor(from)
+            }
+        }
+        micState = newState
+        log("Mic state: $from -> $newState")
+        return TransitionOutcome.COMMITTED
+    }
+
+    /**
+     * The live mic state, read at decision time: pass it back as the
+     * [MicState] argument of [transitionFromTo] (via [startAppMode],
+     * [startWakeMode] or a direct call) so a caller that held the belief
+     * across a wait is told it went stale instead of mis-transitioning.
+     */
+
+    /**
+     * Teardown belonging to leaving a hearing state for IDLE: close the
+     * capture, cancel every exchange the scope still carries (and start a
+     * fresh scope, so the next session cannot inherit a cancelled-scope
+     * error), drain a stale utterance, drop the host, and drop the call
+     * flag - published to the shared store here and nowhere else.
+     */
+    private fun teardownFor(from: MicState) {
+        if (from == MicState.APP) {
+            // A handoff is a moment, not a state: leaving APP for IDLE
+            // kills any handoff the screen latched on its way out.
+            pendingHandoff = false
+        }
+        appHost = null
+        teardownCurrentExchange()
+        capture?.stop()
+        capture = null
+        chunkListener = null
+        drainUtteranceChannel()
+        cancelExchangeScope()
+        callActive = false
+        lastCallEndAt = System.currentTimeMillis()
+        if (!testMode) ConversationStore.setCallActive(false)
+    }
+
+    /** Mark the live exchange (if any) as discarded and abortable. */
+    private fun teardownCurrentExchange() {
+        currentExchange?.let { ex ->
+            ex.discard.set(true)
+            ex.ttsAbort.set(true)
+        }
+        currentExchange = null
     }
 
     /** Cancel every exchange the scope still carries and start fresh, so
@@ -391,10 +485,19 @@ class VoiceCallEngine private constructor(context: Context?) {
         }
     }
 
+    /** Empty the utterance channel, so a stale clip can never reach the
+     * next session (as a wake phrase scored minutes late, or worse, as a
+     * request delivered from a conversation that already ended). */
+    private fun drainUtteranceChannel() {
+        while (true) {
+            val got = runCatching { utteranceChannel.tryReceive().getOrNull() }.getOrNull() ?: break
+        }
+    }
+
     /**
      * Deliberate hang-ups are announced, so every surface that draws the
      * call can drop its own view of it (the exchange itself is torn down
-     * inside [hangUp]).
+     * inside the transition to IDLE).
      */
     val hangUpEvents = kotlinx.coroutines.flow.MutableSharedFlow<Unit>(extraBufferCapacity = 1)
 
@@ -405,6 +508,9 @@ class VoiceCallEngine private constructor(context: Context?) {
      * until the sidebar drawer exists). When a call is already live - the
      * wake service adopting a released screen call, or the screen joining
      * the popup's conversation - the same conversation continues.
+     *
+     * Called by the state machine on entering APP; also called by the wake
+     * service on hearing the phrase, which marks the wake conversation live.
      *
      * @return true when this call began a fresh conversation.
      */
@@ -445,40 +551,116 @@ class VoiceCallEngine private constructor(context: Context?) {
      * Clearing happens when a NEW conversation starts.
      */
     fun hangUp(reason: String) {
-        if (!callActive && mode == Mode.IDLE) {
+        if (!callActive && micState == MicState.IDLE) {
             log("hangUp ignored (no call): $reason")
             return
         }
         log("hangUp: $reason", level="w")
         callActive = false
-        lastCallEndAt = System.currentTimeMillis()
         hangUpEvents.tryEmit(Unit)
-        stop()
+        // The transition to IDLE tears the exchange and the capture down
+        // under the state lock.
+        transitionFromTo(micState, MicState.IDLE)
     }
 
     /**
-     * Leave whatever mode is active: the capture closes, running exchanges
-     * are cancelled and cut short, and the mic is released for whoever wants
-     * it next.
+     * Leave whatever hearing state is active: the capture closes, running
+     * exchanges are cancelled and cut short, and the mic is released for
+     * whoever wants it next.
      */
     fun stop() {
-        mode = Mode.IDLE
-        appHost = null
-        discardCurrentUtterance.set(true)
-        ttsAbortSignal.set(true)
-        capture?.stop()
-        capture = null
-        chunkListener = null
-        // Drain so a stale utterance can never reach the next session.
-        utteranceChannel.tryReceive() // single-shot drain of one pending clip
-        while (true) {
-            val got = runCatching { utteranceChannel.tryReceive().getOrNull() }.getOrNull()
-            if (got == null) break
+        transitionFromTo(micState, MicState.IDLE)
+    }
+
+    /**
+     * Start (or re-enter) app mode: the chat screen owns the microphone and
+     * every utterance becomes an exchange through [host].
+     *
+     * [expectedState] is the caller's sense of the mic state at the moment
+     * it decided to act (read it with [micState] or track it across turns);
+     * a stale sense is refused with [TransitionOutcome.STALE_EXPECTATION]
+     * rather than mis-transitioning. Passing null means "use the live
+     * state", which is right when the caller has no better information.
+     */
+    fun startAppMode(host: ExchangeHost, expectedState: MicState? = null) {
+        val expected = expectedState ?: micState
+        appHost = host
+        val outcome = when {
+            // Re-entering a call the screen already owns is a no-op re-arm.
+            micState == MicState.APP && (expected == MicState.APP || expected == null) ->
+                transitionFromTo(MicState.APP, MicState.APP)
+            micState == MicState.APP -> TransitionOutcome.STALE_EXPECTATION
+            else -> transitionFromTo(expected, MicState.APP)
         }
-        // Cancel every exchange the old scope still carries and start fresh,
-        // so the next session cannot inherit a cancelled-scope error.
-        cancelExchangeScope()
-        if (!testMode) ConversationStore.setCallActive(false)
+        if (!outcome.ok) {
+            appHost = null
+            log("startAppMode failed: $outcome")
+        }
+    }
+
+    /**
+     * Start (or re-enter) wake mode: the service listens for the phrase and
+     * collects utterances through [nextUtterance].
+     *
+     * [expectedState] is the wake loop's own belief of the mic state, so a
+     * loop acting on stale information is detected (and its next 500 ms
+     * retry fixes itself) instead of silently stealing a state.
+     *
+     * Refuses when the chat screen is in a voice call: a wake listener and a
+     * call are different states, the microphone belongs to the call, and
+     * stealing it here would both deafen the call and let the wake matcher
+     * hear the exchange it must not hear. The caller waits and tries again.
+     *
+     * @return whether wake mode now owns the capture.
+     */
+    fun startWakeMode(expectedState: MicState? = null): Boolean {
+        if (micState == MicState.APP) return false
+        val expected = expectedState ?: micState
+        return transitionFromTo(expected, MicState.WAKE).ok
+    }
+
+    /**
+     * Whether APP mode just released a live call. The wake service reads and
+     * clears this when it regains the capture, so the same conversation can
+     * continue in the popup without a fresh wake phrase.
+     */
+    fun consumeHandoff(): Boolean {
+        val handoff = pendingHandoff && System.currentTimeMillis() - handoffAt < HANDOFF_TTL_MS
+        pendingHandoff = false
+        return handoff
+    }
+
+    /** Whether a handoff is pending, without consuming it. */
+    fun hasHandoff(): Boolean =
+        pendingHandoff && System.currentTimeMillis() - handoffAt < HANDOFF_TTL_MS
+
+    /**
+     * Leave APP mode: [handoffToWake] says whether the call was released
+     * because its window vanished (a handoff the wake service adopts - the
+     * conversation continues in the popup) or because the user hung up
+     * deliberately (no handoff - the call is over and the wake service goes
+     * back to listening for the wake phrase).
+     */
+    fun stopAppMode(handoffToWake: Boolean) {
+        if (micState != MicState.APP) {
+            // The screen's window closed while the call was already
+            // elsewhere (the wake service owns it, or it was hung up):
+            // nothing of APP mode is left to release.
+            appHost = null
+            return
+        }
+        if (handoffToWake) {
+            // The call itself survives: the engine keeps the capture and the
+            // conversation; only the surface changes. The running exchange
+            // (whose host was the vanished window) is cancelled like in
+            // stop(), but the capture stays and the gate - derived from the
+            // state and the live exchange - reopens on its own.
+            pendingHandoff = true
+            handoffAt = System.currentTimeMillis()
+            transitionFromTo(MicState.APP, MicState.WAKE)
+        } else {
+            hangUp("ChatScreen endVoiceCall")
+        }
     }
 
     /**
@@ -496,20 +678,22 @@ class VoiceCallEngine private constructor(context: Context?) {
      * Carry one complete utterance through STT -> LLM -> TTS as a voice job,
      * reporting every step to [host]. Serialized: a second utterance while
      * one exchange runs is dropped, because it is either self-echo or the
-     * user talking over the reply. [ttsAbort] lets the owner cut the reply
-     * short (the wake service's interrupt signal, for one). Returns the job
-     * carrying the exchange, so a caller that must not race ahead can join it.
+     * user talking over the reply. [externalAbort] lets the owner cut the
+     * reply short (the wake service's interrupt signal, for one). Returns the
+     * job carrying the exchange, so a caller that must not race ahead can
+     * join it.
      */
     fun runExchange(
         wavBytes: ByteArray,
         host: ExchangeHost,
-        ttsAbort: java.util.concurrent.atomic.AtomicBoolean
+        externalAbort: java.util.concurrent.atomic.AtomicBoolean?
     ): kotlinx.coroutines.Job? {
         // One exchange at a time is enforced by a mutex taken *inside* the
         // coroutine rather than a CAS before the launch: with the CAS, a
         // scope cancelled between compareAndSet and the body's first line
-        // left the flag (and the closed capture gate) latched forever, and
-        // every later utterance was silently dropped.
+        // left the flag latched forever, and every later utterance was
+        // silently dropped.
+        val exchange = Exchange(externalAbort)
         val job = jobScope.launch {
             // Declared before the try so the finally can reach it: a Job
             // cannot complete while an active child runs, so an infinite
@@ -517,20 +701,36 @@ class VoiceCallEngine private constructor(context: Context?) {
             // alive - and kept the ticks playing long after a failed tool
             // round had ended the real work.
             var waitingCue: kotlinx.coroutines.Job? = null
+            var abortWatcher: kotlinx.coroutines.Job? = null
             if (!exchangeMutex.tryLock()) {
                 log("Exchange already running, dropping the new utterance", level="d")
                 return@launch
             }
+            // The exchange owns the gate by existing: the capture reads
+            // `currentExchange == null` to decide what may become an
+            // utterance, so the gate closes here and reopens in the finally
+            // with no latch to forget.
+            currentExchange = exchange
             try {
-                // The gate is closed here, inside the accepted exchange, so
-                // a dropped utterance never closes the microphone behind it.
-                captureGate.set(false)
+                // Fold the owner's external abort (the wake interrupt) into
+                // the exchange's own flag, so the TTS runner polls one
+                // AtomicBoolean regardless of who asked to stop.
+                val ext = exchange.externalAbort
+                if (ext != null) {
+                    // A child of the exchange job: cancelled with it, so the
+                    // loop needs no liveness check of its own.
+                    abortWatcher = launch {
+                        while (!ext.get()) delay(50)
+                        if (ext.get()) exchange.ttsAbort.set(true)
+                    }
+                }
+
                 host.onPhase(VoiceCallPhase.TRANSCRIBING)
 
                 // The call ended while this take was still being heard - the
                 // half-captured words are the user's to drop, not to send on
                 // to STT.
-                if (discardCurrentUtterance.get() || !host.isActive()) {
+                if (exchange.discard.get() || !host.isActive()) {
                     return@launch
                 }
 
@@ -585,7 +785,7 @@ class VoiceCallEngine private constructor(context: Context?) {
                                 fullResponse.append(chunk)
                                 host.onStreamingContent(fullResponse.toString())
                             }
-                        }, ttsAbort) { hangUp("model asked to end the call") }
+                        }, exchange.ttsAbort) { hangUp("model asked to end the call") }
                     }
 
                     var finalText = fullResponse.toString().trim()
@@ -622,8 +822,8 @@ class VoiceCallEngine private constructor(context: Context?) {
                         waitingCue?.cancel()
                         host.onPhase(VoiceCallPhase.SPEAKING)
                         try {
-                            ttsAbortSignal.set(false)
-                            ttsRunner(finalText, settings, ttsAbort) {
+                            exchange.ttsAbort.set(false)
+                            ttsRunner(finalText, settings, exchange.ttsAbort) {
                                 // The callback runs on the audio thread, so
                                 // the tick is carried on the engine's scope.
                                 if (host.isActive()) jobScope.launch { waitingCueRunner() }
@@ -641,8 +841,8 @@ class VoiceCallEngine private constructor(context: Context?) {
                     if (host.isActive()) {
                         host.onPhase(VoiceCallPhase.SPEAKING)
                         try {
-                            ttsAbortSignal.set(false)
-                            ttsRunner("Sorry, I misheard you. Please repeat.", settings, ttsAbort, null)
+                            exchange.ttsAbort.set(false)
+                            ttsRunner("Sorry, I misheard you. Please repeat.", settings, exchange.ttsAbort, null)
                         } finally {
                             host.onPhase(VoiceCallPhase.IDLE)
                         }
@@ -660,12 +860,12 @@ class VoiceCallEngine private constructor(context: Context?) {
                 // one that reaches speech: a swallowed failure must never
                 // leave the ticks playing after the work is gone.
                 waitingCue?.cancel()
-                // Reopen only if the call is still on; a hung-up call has a
-                // closed capture, and a closed gate cannot hear anything.
-                // The engine's own call flag is the arbiter here, not the
-                // surface's dialog state, so a call handed between surfaces
-                // keeps its gate consistent.
-                captureGate.set(callActive)
+                abortWatcher?.cancel()
+                // The gate reopens here by construction: the exchange stops
+                // existing, so the capture's derived read turns true again -
+                // a hung-up call has a closed capture anyway, and a call that
+                // continues hears its next turn immediately.
+                if (currentExchange === exchange) currentExchange = null
                 exchangeMutex.unlock()
             }
         }
@@ -674,42 +874,77 @@ class VoiceCallEngine private constructor(context: Context?) {
 
     /**
      * Opens the persistent capture if it is not already live. Where each
-     * completed utterance goes is read from the live [mode] at utterance
+     * completed utterance goes is read from the live [micState] at utterance
      * time, not captured at construction: the capture is shared, so a wake
      * session that opened it and a chat call that inherited it must both see
-     * their own routing. Reading the mode once was the bug that deafened the
+     * their own routing. Reading the state once was the bug that deafened the
      * chat screen - the capture opened in WAKE mode kept sending every
      * utterance to the wake channel nobody drains after the screen took
      * over, so the mic button produced no transcript at all.
+     *
+     * Returns false when the recorder would not open: the state machine
+     * rolls the just-committed state back, so a transient failure (the mic
+     * busy, initialization refused) becomes the caller's next retry rather
+     * than a capture slot cached on a dead recorder. A failed start is
+     * logged loudly - it used to be swallowed, and the engine went on
+     * "listening" through a recorder that never opened.
      */
     @Synchronized
-    private fun ensureCapture() {
-        if (testMode) return // unit tests drive the state machine only
-        if (capture != null) return
+    private fun ensureCapture(): Boolean {
+        if (testMode) return true // unit tests drive the state machine only
+        capture?.let { return true }
+        val gateOpen: () -> Boolean = {
+            // Derived, never latched: the mic hears while a hearing state is
+            // active and no exchange is in flight. A hung-up call is IDLE -
+            // closed. A call between turns is APP/WAKE with no exchange -
+            // open. Mid-exchange - closed, so the speakers are never heard.
+            micState != MicState.IDLE && currentExchange == null
+        }
         val cap = StreamingCallCapture(
             appContext!!,
             java.util.concurrent.atomic.AtomicBoolean(false),
-            captureGate,
+            gateOpen,
             vad
         ) { clip ->
-            when (mode) {
-                Mode.WAKE -> utteranceChannel.trySend(clip)
-                Mode.APP -> {
+            when (micState) {
+                MicState.WAKE -> utteranceChannel.trySend(clip)
+                MicState.APP -> {
                     val host = appHost ?: return@StreamingCallCapture
-                    jobScope.launch { runExchange(clip, host, ttsAbortSignal) }
+                    jobScope.launch { runExchange(clip, host, null) }
                 }
-                Mode.IDLE -> {}
+                MicState.IDLE -> {}
             }
         }
         // Chunks flow to the barge-in matcher regardless of the gate, so a
         // phrase said over a spoken reply can still be heard.
         cap.chunkListener = { chunk -> chunkListener?.invoke(chunk) }
         capture = cap
-        // The capture opens its own recorder and route; that blocking work
-        // belongs off whatever thread called this.
-        Thread {
+        // Opening a recorder is blocking audio-framework work: it belongs
+        // off whatever thread called this. The result decides whether the
+        // capture slot stays or is handed back for a retry.
+        captureScope.launch {
             val started = cap.start()
-            log("Capture started=$started mode=$mode", level="d")
-        }.start()
+            if (started) {
+                log("Capture started state=$micState", level="d")
+            } else {
+                synchronized(this@VoiceCallEngine) {
+                    if (capture === cap) {
+                        capture = null
+                        log("Capture failed to open; capture slot released for retry", level="w")
+                        if (micState != MicState.IDLE) {
+                            // Roll the state back: the engine must not claim
+                            // to hear through a recorder that never opened.
+                            val from = micState
+                            micState = MicState.IDLE
+                            if (from == MicState.APP) {
+                                callActive = false
+                                if (!testMode) ConversationStore.setCallActive(false)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return true
     }
 }

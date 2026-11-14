@@ -273,13 +273,19 @@ fun ChatScreen(
     // capture and the big icon is not decoration. Tapping either one again ends
     // the recording the same way.
     fun startMicRecording(announce: Boolean = true) {
+        // The engine's live mic state, read before the guards: passed to
+        // startAppMode as the caller's sense of reality, so a wake phrase
+        // that opened a call between this read and the transition is refused
+        // as stale instead of silently mis-transitioning.
+        val knownMicState = ai.flossyapp.ui.common.VoiceCallEngine
+            .instance(context.applicationContext).micState
         // A capture is already in flight - the re-arm after a spoken turn hands
         // back to this guard, and the user's own taps must not stack recorders.
         if (viewModel.dialogState.value.isListening) return
         // A wake conversation is already a live call: the microphone belongs
         // to it, and this screen is simply one of its views. Starting a second
         // call here would steal an exchange the popup is mid-way through.
-        if (ConversationStore.callActive.value) return
+        if (ConversationStore.callActive.value || knownMicState != ai.flossyapp.ui.common.VoiceCallEngine.MicState.IDLE) return
         // Opening the call is one typed transition; every derived flag falls
         // out of it.
         viewModel.setDialogState(DialogMode.VOICE_CALL, VoiceCallPhase.LISTENING)
@@ -314,8 +320,11 @@ fun ChatScreen(
         }
         // The engine owns the capture and the exchange pipeline from here:
         // every complete utterance arrives at voiceCallHost as one exchange.
+        // The engine marks the call live (and clears stale turns when no
+        // call was live) inside the transition, so the store and the engine
+        // agree on the one call from the engine as its single writer.
         ai.flossyapp.ui.common.VoiceCallEngine.instance(context.applicationContext)
-            .startAppMode(voiceCallHost)
+            .startAppMode(voiceCallHost, knownMicState)
     }
 
     /**
@@ -335,12 +344,13 @@ fun ChatScreen(
         // kill it (that is what deafened the wake word whenever the chat view
         // was opened and closed mid-listen).
         val engine = ai.flossyapp.ui.common.VoiceCallEngine.instance(context.applicationContext)
-        if (engine.mode == ai.flossyapp.ui.common.VoiceCallEngine.Mode.APP) {
+        if (engine.micState == ai.flossyapp.ui.common.VoiceCallEngine.MicState.APP) {
             // A deliberate hang-up ends the call: no handoff - the wake
-            // service goes back to listening for the wake phrase.
+            // service goes back to listening for the wake phrase. The
+            // transition to IDLE publishes the store (the engine alone
+            // writes call-liveness), so no direct store write here.
             engine.stopAppMode(handoffToWake = false)
         }
-        ConversationStore.setCallActive(false)
         // Cancel every coroutine still carrying the call on the screen side -
         // the spoken cues, any text-chat TTS - so nothing can speak after the
         // user hung up.
@@ -404,7 +414,7 @@ fun ChatScreen(
     DisposableEffect(Unit) {
         onDispose {
             val engine = ai.flossyapp.ui.common.VoiceCallEngine.instance(context.applicationContext)
-            if (engine.mode == ai.flossyapp.ui.common.VoiceCallEngine.Mode.APP) {
+            if (engine.micState == ai.flossyapp.ui.common.VoiceCallEngine.MicState.APP) {
                 android.util.Log.d("ChatScreen", "Window gone mid-call: handing the call to the wake service")
                 engine.stopAppMode(handoffToWake = true)
             }

@@ -61,10 +61,10 @@ class RecreateSurvivalTest {
             override fun onSystemNote(text: String) {}
             override fun onError(message: String) {}
         })
-        val mode = engine.mode
+        val mode = engine.micState
         // The engine owns its mode; nothing a recreated surface holds can
         // change it behind its back.
-        assertTrue("an adopted call is a live mode", mode != VoiceCallEngine.Mode.IDLE)
+        assertTrue("an adopted call is a live mode", mode != VoiceCallEngine.MicState.IDLE)
         assertTrue(engine.callActive)
         engine.hangUp("test teardown")
         assertFalse(engine.callActive)

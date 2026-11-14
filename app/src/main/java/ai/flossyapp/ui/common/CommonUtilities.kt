@@ -130,21 +130,25 @@ fun recordAudioForSTT(
  * (STT) while the stream keeps running - so the next turn begins the instant
  * the previous one ends.
  *
- * The gate is phase-aware: while the assistant speaks, the mic hears its own
- * reply, so the gate is suspended and any samples taken during playback are
- * dropped rather than turned into a phantom utterance.
+ * The gate is derived, not latched: the owner supplies a supplier polled
+ * each chunk, so "may I hear?" is computed from the live state (a call is
+ * on, no exchange in flight) instead of stored in a boolean a teardown
+ * path could forget to reset. While the assistant speaks, the mic hears
+ * its own reply, so a false gate drops the samples rather than turning
+ * them into a phantom utterance.
  *
  * @param context used to open the communication route and the recorder.
  * @param stopSignal raised to end the capture and close the call.
- * @param listeningGate polled each chunk: true means VAD may act (the call is
- *   not speaking), false means the stream is recorded but ignored.
+ * @param listeningGate polled each chunk: true means VAD may act (a hearing
+ *   state is active and no exchange is in flight), false means the stream is
+ *   recorded but ignored.
  * @param onUtterance invoked on the capture thread with a WAV clip of one
  *   complete utterance.
  */
 class StreamingCallCapture(
     private val context: android.content.Context,
     private val stopSignal: java.util.concurrent.atomic.AtomicBoolean,
-    private val listeningGate: java.util.concurrent.atomic.AtomicBoolean,
+    private val listeningGate: () -> Boolean,
     // The bundled Silero network decides what is speech; one instance is
     // shared by every capture in the process.
     private val vad: SileroVad,
@@ -253,7 +257,7 @@ class StreamingCallCapture(
 
                 // While the assistant speaks, this stream hears its own reply:
                 // the gate is closed and nothing here may become an utterance.
-                if (!listeningGate.get()) {
+                if (!listeningGate()) {
                     utterance.clear()
                     utteranceProbs.clear()
                     inUtterance = false
