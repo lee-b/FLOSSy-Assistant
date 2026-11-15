@@ -22,5 +22,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "FLOSSy Assistant"
+rootProject.name = "Jarvis Libre"
 include(":app")

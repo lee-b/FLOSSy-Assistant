@@ -1,0 +1,35 @@
+package ai.jarvislibre
+
+import android.app.Application
+
+/**
+ * Application class for Jarvis Libre.
+ * 
+ * Provides application-level singleton access and initializes core components.
+ */
+class JarvisApplication : Application() {
+
+    companion object {
+        @Volatile
+        private var INSTANCE: JarvisApplication? = null
+        
+        /**
+         * Get the application instance from anywhere in the app.
+         * Use with caution - prefer dependency injection or passing context explicitly.
+         */
+        fun getInstance(): JarvisApplication {
+            return INSTANCE ?: throw IllegalStateException(
+                "Application not initialized. Call getApplicationContext() first."
+            )
+        }
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        synchronized(this) {
+            if (INSTANCE == null) {
+                INSTANCE = this
+            }
+        }
+    }
+}
