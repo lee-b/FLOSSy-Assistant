@@ -43,6 +43,15 @@
     <!-- Bluetooth for headset controls (optional enhancement) -->
     <!-- <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" /> -->
 
+    <!--
+        CamAPS FX is the package the blood-sugar tool reads notifications
+        from. Declared at manifest level so PackageManager.getPackageInfo can
+        answer for it without QUERY_ALL_PACKAGES.
+    -->
+    <queries>
+        <package android:name="com.camdiab.fx_alert.mmoll" />
+    </queries>
+
     <application
         android:name=".FlossyApplication"
         android:allowBackup="false"
@@ -196,6 +205,25 @@
                 android:name="android.appwidget.provider"
                 android:resource="@xml/widget_voice_assistant" />
         </receiver>
+
+        <!--
+            NOTIFICATION CAPTURE SERVICE
+
+            Reads posted notifications so tools can answer from them (see
+            ai.flossyapp.notification.NotificationCaptureService). The service is
+            exported only to the system: android:permission gates binding to the
+            platform, and the intent filter action is what the system's
+            notification-access settings screen lists the service under. It is
+            dormant until the user grants notification access there.
+        -->
+        <service
+            android:name=".notification.NotificationCaptureService"
+            android:exported="true"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
 
         <!--
             XML Resource for Network Security Config

@@ -56,8 +56,8 @@ class ToolsConfigTest {
         assert(mcp.size == 2) { "one instance per server: ${mcp}" }
         assert(mcp.all { it.enabled }) { "the old switch was on" }
         // And every internal tool is in place too.
-        assert(migrated.instances.count { it.type != ToolTypes.TYPE_MCP } == 5) {
-            "the five internal tools ship: ${migrated.instances}"
+        assert(migrated.instances.count { it.type != ToolTypes.TYPE_MCP } == 7) {
+            "the seven internal tools ship: ${migrated.instances}"
         }
     }
 
@@ -75,10 +75,20 @@ class ToolsConfigTest {
         val defaults = ToolsConfig.default()
         val getUrl = defaults.instances.first { it.type == ToolTypes.TYPE_GET_URL }
         assert(!getUrl.enabled) { "URL retrieval starts off" }
-        assert(defaults.instances.filter { it.type != ToolTypes.TYPE_GET_URL }.all { it.enabled }) {
-            "every other internal tool starts on: ${defaults.instances}"
+        val alwaysOn = defaults.instances.filter {
+            it.type != ToolTypes.TYPE_GET_URL &&
+            it.type != ToolTypes.TYPE_READ_BLOOD_SUGAR &&
+            it.type != ToolTypes.TYPE_READ_NOTIFICATIONS
         }
-        assert(defaults.instances.size == 5)
+        assert(alwaysOn.all { it.enabled }) {
+            "the always-on internal tools start on: ${defaults.instances}"
+        }
+        assert(defaults.instances.size == 7)
+        val sugar = defaults.instances.first { it.type == ToolTypes.TYPE_READ_BLOOD_SUGAR }
+        val notifications = defaults.instances.first { it.type == ToolTypes.TYPE_READ_NOTIFICATIONS }
+        assert(!sugar.enabled && !notifications.enabled) {
+            "the notification tools start off: ${defaults.instances}"
+        }
     }
 
     @Test

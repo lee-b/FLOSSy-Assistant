@@ -38,6 +38,43 @@ class SettingsRepository(private val context: Context) {
     private val _settingsFlow = MutableStateFlow(loadSettings())
     val settingsFlow: StateFlow<ai.flossyapp.domain.model.AppSettings> = _settingsFlow.asStateFlow()
 
+    init {
+        syncNotificationWatchers()
+    }
+
+    /**
+     * Rebuilds the notification watcher set from the enabled tools.
+     *
+     * The blood-sugar tool and the general notification reader are the two
+     * tool types whose data arrives through the platform's notification
+     * listener; when neither is enabled the set is empty and the capture
+     * service is a no-op that lets every post fall through untouched. Called
+     * whenever the committed settings change, so an enable switch flip is the
+     * only thing that decides whether CamAPS FX's notifications are read.
+     */
+    private fun syncNotificationWatchers() {
+        val instances = ai.flossyapp.domain.model.ToolsConfig
+            .fromJson(_settingsFlow.value.toolsConfig).instances
+            .filter { it.enabled && it.configured }
+        val watchers = mutableListOf<ai.flossyapp.notification.NotificationWatcher>()
+        if (instances.any { it.type == ai.flossyapp.domain.model.ToolTypes.TYPE_READ_BLOOD_SUGAR }) {
+            watchers.add(ai.flossyapp.data.tools.CamApsFxTool.watcher())
+        }
+        if (instances.any { it.type == ai.flossyapp.domain.model.ToolTypes.TYPE_READ_NOTIFICATIONS }) {
+            // The general reader wants everything the listener can see, so its
+            // watcher is registered with a catch-all package filter handled by
+            // the capture: a null-package watcher means "any package".
+            watchers.add(
+                ai.flossyapp.notification.NotificationWatcher(
+                    packageName = "",
+                    extract = ai.flossyapp.notification.NotificationCapture.standardExtract
+                )
+            )
+        }
+        ai.flossyapp.notification.NotificationCapture.setWatchers(watchers)
+        ai.flossyapp.notification.FlossyLog.debug = _settingsFlow.value.debugLoggingEnabled
+    }
+
     /**
      * Load all settings from SharedPreferences.
      */

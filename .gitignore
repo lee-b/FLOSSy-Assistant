@@ -26,3 +26,4 @@ test_audio/
 
 # Machine-specific notes (endpoints, adb device, local commands) - not part of the project
 AGENTS.local.md
+.pi/

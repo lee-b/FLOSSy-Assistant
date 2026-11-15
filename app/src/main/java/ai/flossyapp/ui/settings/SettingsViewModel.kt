@@ -193,6 +193,16 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         val config = ai.flossyapp.domain.model.ToolsConfig.fromJson(_settings.value.toolsConfig)
         val target = config.instances.firstOrNull { it.id == id } ?: return
         if (enabled && !target.configured) return
+        if (enabled) {
+            // A notification-backed tool needs its device prerequisites too:
+            // the app it reads from installed, notification access granted.
+            val ready = when (target.type) {
+                ai.flossyapp.domain.model.ToolTypes.TYPE_READ_BLOOD_SUGAR ->
+                    ai.flossyapp.data.tools.CamApsFxTool.readiness(getApplication()).first
+                else -> true
+            }
+            if (!ready) return
+        }
         mutateTools { list ->
             val index = list.indexOfFirst { it.id == id }
             if (index >= 0) list[index] = list[index].copy(enabled = enabled)

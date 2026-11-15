@@ -235,14 +235,16 @@ class VoiceCallEngine private constructor(context: Context?) {
         appContext?.let { ai.flossyapp.data.settings.SettingsRepository(it) }
     }
 
-    // Headset watch: while the capture is live, a headset joining the call
-    // transparently takes the microphone over (per-recorder re-steering,
-    // never a global route), and a headset leaving ends the call for privacy
-    // unless the user opted into continuing on the phone.
+    // Headset watch: the privacy half only. The capture itself rides the
+    // framework's default input, which follows a headset joining or leaving
+    // on its own - nothing here steers a device. A headset leaving ends the
+    // call for privacy unless the user opted into continuing on the phone.
     private val headsetWatch: android.media.AudioDeviceCallback? = if (appContext != null) {
         object : android.media.AudioDeviceCallback() {
             override fun onAudioDevicesAdded(addedDevices: Array<android.media.AudioDeviceInfo>) {
-                rerouteCapture()
+                // The framework re-routes the default input itself; nothing
+                // to do but note it.
+                log("Headset connected; the capture follows the default input", level="d")
             }
 
             override fun onAudioDevicesRemoved(removedDevices: Array<android.media.AudioDeviceInfo>) {
@@ -257,7 +259,6 @@ class VoiceCallEngine private constructor(context: Context?) {
                 }.getOrNull() ?: false
                 if (keep) {
                     log("Headset disconnected; keeping the call on the phone (user preference)", level="d")
-                    rerouteCapture()
                 } else {
                     log("Headset disconnected; hanging up for privacy", level="w")
                     hangUp("headset disconnected")
@@ -800,9 +801,4 @@ class VoiceCallEngine private constructor(context: Context?) {
         }
     }
 
-    /** Hands the live capture over to whatever the current preferred input is. */
-    private fun rerouteCapture() {
-        if (testMode) return
-        capture?.reroute()
-    }
 }

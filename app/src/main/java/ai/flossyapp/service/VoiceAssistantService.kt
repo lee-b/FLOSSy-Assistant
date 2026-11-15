@@ -24,7 +24,6 @@ import ai.flossyapp.FlossyApplication
 import ai.flossyapp.data.remote.ApiClient
 import ai.flossyapp.domain.model.ChatMessage
 import ai.flossyapp.ui.common.ConversationStore
-import ai.flossyapp.ui.common.preferredCaptureDevice
 import ai.flossyapp.ui.common.playListenEndCue
 import ai.flossyapp.ui.common.playListenStartCue
 import kotlinx.coroutines.*

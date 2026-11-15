@@ -48,9 +48,6 @@ fun recordAudioForSTT(
     val minBufferSize = android.media.AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
     if (minBufferSize <= 0) return null
 
-    // The headset input to steer this recorder at, if any exists.
-    val captureDevice = preferredCaptureDevice(context)
-
     val audioRecord = android.media.AudioRecord(
         MediaRecorder.AudioSource.VOICE_COMMUNICATION,
         sampleRate, channelConfig, audioFormat, minBufferSize * 4
@@ -60,11 +57,10 @@ fun recordAudioForSTT(
         audioRecord.release()
         return null
     }
-    // Steer this recorder alone at the headset input - per-recorder routing
-    // with no global side effects (no volume curve, no SCO toggling).
-    captureDevice?.let { device ->
-        runCatching { audioRecord.setPreferredDevice(device) }
-    }
+    // No steering: the recorder rides the framework's default input, which
+    // follows device connects and disconnects on its own. Enrollment and
+    // detection must hear the same microphone, and a preference of headset
+    // over built-in is what drifted them onto different ones.
 
     val buffer = ShortArray(minBufferSize / 2)
     val output = ByteArrayOutputStream()
@@ -200,36 +196,17 @@ class StreamingCallCapture(
             rec.release()
             return false
         }
-        // Steer this recorder alone at the headset input; the framework's
-        // default input is used as-is when there is nothing to steer at. No
-        // communication route is set or cleared anywhere: setting one toggles
-        // the SCO link, which yanks the headset's volume and knocks out
-        // whatever media is playing.
-        preferredCaptureDevice(context)?.let { device ->
-            runCatching { rec.setPreferredDevice(device) }
-                .onFailure { android.util.Log.w("VAD", "Could not steer capture device: ${it.message}") }
-        }
+        // No steering here either: the framework's default input is used
+        // as-is, so enrollment and live detection always share one
+        // microphone. No communication route is set or cleared anywhere:
+        // setting one toggles the SCO link, which yanks the headset's volume
+        // and knocks out whatever media is playing.
         record = rec
         rec.startRecording()
         thread = Thread {
             run()
         }.also { it.start() }
         return true
-    }
-
-    /**
-     * Re-steers the live recorder at the current preferred input, so a
-     * headset connected mid-call transparently takes the capture over (and
-     * a headset that left hands it back to the built-in mic). Per-recorder
-     * routing only - no global communication route is ever set.
-     */
-    fun reroute() {
-        val rec = record ?: return
-        preferredCaptureDevice(context)?.let { device ->
-            runCatching { rec.setPreferredDevice(device) }
-                .onSuccess { android.util.Log.d("VAD", "Capture re-steered mid-call") }
-                .onFailure { android.util.Log.w("VAD", "Could not re-steer capture: ${it.message}") }
-        }
     }
 
     /** Ends the stream and releases the recorder and the route. */
@@ -405,9 +382,6 @@ fun recordAudioWithVAD(
         return null
     }
 
-    // The headset input to steer this recorder at, if any exists.
-    val captureDevice = preferredCaptureDevice(context)
-
     val audioRecord = android.media.AudioRecord(
         MediaRecorder.AudioSource.VOICE_COMMUNICATION,
         sampleRate, channelConfig, audioFormat, minBufferSize * 4
@@ -418,11 +392,8 @@ fun recordAudioWithVAD(
         audioRecord.release()
         return null
     }
-    // Steer this recorder alone at the headset input - per-recorder routing
-    // with no global side effects (no volume curve, no SCO toggling).
-    captureDevice?.let { device ->
-        runCatching { audioRecord.setPreferredDevice(device) }
-    }
+    // No steering: the framework's default input, so every recorder in the
+    // app hears the same microphone.
 
     val audioBuffers = mutableListOf<Short>()
     val buffer = ShortArray(minBufferSize / 2)
@@ -1381,63 +1352,6 @@ private suspend fun playPlopCue(fromHz: Double, toHz: Double): Boolean {
     }
     return playPcmAudio(pcm, WAITING_CUE_SAMPLE_RATE)
 }
-
-/**
- * Routes microphone capture through the audio manager's communication routing,
- * which is the meta input that follows whatever the user is actually using -
- * Bluetooth headphones, a wired headset, or the phone's own mic.
- *
- * AudioSource.VOICE_COMMUNICATION keeps recording the phone's own mic unless
- * the audio manager is told where communication audio belongs, so with modern
- * Bluetooth headphones (Sony XM5 and friends) the recorder either reads the
- * phone mic or silence - the STT then hears nothing or hears the room.
- *
- * A headset mic is always claimed explicitly when one is available. Trusting
- * the framework's [AudioManager.getCommunicationDevice] is not enough: on a
- * modern Bluetooth headset the framework reports the A2DP output as the
- * "active communication device" (audio_flinger then shows Input device:
- * AUDIO_DEVICE_IN_BUILTIN_MIC), so the output plays through the headphones
- * while the input rides the phone mic - the mismatch this function exists to
- * fix. Only when no headset candidate exists at all does the built-in mic
- * carry the capture.
- *
- * Returns a restore runnable callers run in a finally block; it undoes
- * exactly what was set here.
- */
-/**
- * Finds the input device the recorder should ride, and nothing else.
- *
- * This used to *set* the global communication route
- * ([AudioManager.setCommunicationDevice]) before every capture and clear it
- * after, which is the root of two user-visible harms: every set/clear cycle
- * toggles the Bluetooth SCO link, and SCO activation yanks the headset onto
- * the call volume curve - the volume changes the user never asked for - and
- * tears down A2DP, which stutters a podcast mid-playback. The route is also
- * simply not ours to touch: other apps are playing through the very link we
- * kept flipping.
- *
- * Now the device is only *read*: the same preference order (headset, then
- * built-in mic) is returned and the caller aims its own recorder at it with
- * [AudioRecord.setPreferredDevice], which steers one capture without any
- * global routing, volume or SCO side effects.
- *
- * @return the preferred input device, or null when there is nothing to steer
- *   at - the recorder then just uses the framework's default input.
- */
-fun preferredCaptureDevice(context: Context): AudioDeviceInfo? {
-    val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-        ?: return null
-    val candidates = audioManager.getAvailableCommunicationDevices()
-    // Prefer the headset the user is actually wearing; fall back to the
-    // built-in mic only when there is nothing else.
-    return candidates.firstOrNull {
-        it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
-            it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
-            it.type == AudioDeviceInfo.TYPE_USB_HEADSET
-    } ?: candidates.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
-}
-
-
 
 /**
  * Plays the busy cue: three light, quick "tippy-tap" ticks, like a small
