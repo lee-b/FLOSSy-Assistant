@@ -323,13 +323,24 @@ class VoiceCallEngine private constructor(context: Context?) {
         mode == Mode.APP && appHost === host
 
     /**
-     * Start (or re-enter) app mode: the chat screen owns the microphone and
-     * every utterance becomes an exchange through [host].
+     * Start (or re-enter) app mode: [host] owns the microphone and every
+     * utterance becomes an exchange through it.
+     *
+     * [beginCall] says whether taking the microphone opens a call. The chat
+     * screen's mic button does - a tap is the user opening a call. The
+     * always-listening assistant service does not: it idles between
+     * utterances with the microphone held but no call live, so the screen's
+     * own guards ("a wake conversation is live, don't steal it" and "open a
+     * call on launch") keep working, and [runExchange] opens the call when
+     * an utterance is actually accepted. Starting the service's listening
+     * with a call already live would wedge [callActive] on forever, which
+     * blocked the wake word, the mic button and the launch auto-start all at
+     * once.
      */
-    fun startAppMode(host: ExchangeHost) {
+    fun startAppMode(host: ExchangeHost, beginCall: Boolean = true) {
         appHost = host
         mode = Mode.APP
-        beginCall()
+        if (beginCall) beginCall()
         ttsAbortSignal.set(false)
         discardCurrentUtterance.set(false)
         ensureCapture()

@@ -209,11 +209,36 @@ class VoiceAssistantService : Service() {
      * the engine's StreamingCallCapture own it. Accepted utterances flow into
      * [assistantExchangeHost] automatically; this service never opens an
      * AudioRecord of its own.
+     *
+     * When the wake chat is running, this service stands down instead: the
+     * two always-on listeners cannot share one microphone, and the wake word
+     * is the hands-free path the user chose - an assistant that kept APP mode
+     * alive from boot wedged the engine's call flag on for good, which muted
+     * the wake word, the mic button and the launch auto-start at once. The
+     * gesture that reached here (a media key, say) still wants to be heard
+     * now, so it is forwarded to the wake chat's trigger seam, which runs one
+     * exchange without the phrase.
      */
     private suspend fun startListening() {
         // A previous stopListening() cancelled the scope; resumeService()/the
         // home-screen widget can start again without the service being recreated.
         if (!serviceScope.isActive) serviceScope = newServiceScope()
+
+        if (WakeChatService.isRunning) {
+            _state.value = STATE_IDLE
+            updateNotification("Wake chat is listening")
+            // One exchange without the phrase, through the wake chat's own
+            // seam - the same path the Settings debug trigger uses.
+            runCatching {
+                startService(
+                    WakeChatService.buildIntent(
+                        applicationContext,
+                        WakeChatService.ACTION_TRIGGER_EXCHANGE
+                    )
+                )
+            }
+            return
+        }
 
         try {
             // The service is a listening surface of the one conversation: while
@@ -222,7 +247,10 @@ class VoiceAssistantService : Service() {
             val engine = ai.flossyapp.ui.common.VoiceCallEngine.instance(applicationContext)
             // The start cue blocks, so it plays before the mic opens.
             playListenStartCue()
-            engine.startAppMode(assistantExchangeHost)
+            // Listening is not a call: the call opens when an utterance is
+            // accepted (runExchange does it), so the screen's own guards keep
+            // working while this service holds the idle microphone.
+            engine.startAppMode(assistantExchangeHost, beginCall = false)
             _state.value = STATE_LISTENING
             updateNotification("Listening...")
         } catch (e: Exception) {
@@ -256,8 +284,10 @@ class VoiceAssistantService : Service() {
         serviceScope.cancel()
         serviceScope = newServiceScope()
 
-        // The matched downbeat closes the listening window.
-        playListenEndCue()
+        // The matched downbeat closes the listening window - only when a
+        // listening window was actually open: a stand-down or a repeat pause
+        // of an already-idle service has nothing to close.
+        if (_state.value != STATE_IDLE) playListenEndCue()
 
         _state.value = STATE_IDLE
         updateNotification("Stopped")
