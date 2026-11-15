@@ -284,6 +284,44 @@ class VoiceCallEngine private constructor(context: Context?) {
     // whether the request came from the screen or the wake word.
     private val vad by lazy { SileroVad(appContext!!) }
 
+    // Settings, read fresh when a headset leaves so the disconnect policy is
+    // whatever the user last chose. Null in unit tests (no context).
+    private val settingsRepository by lazy {
+        appContext?.let { ai.jarvislibre.data.settings.SettingsRepository(it) }
+    }
+
+    // Headset watch: the privacy half only. The capture itself rides the
+    // framework's default input, which follows a headset joining or leaving
+    // on its own - nothing here steers a device. A headset leaving ends the
+    // call for privacy unless the user opted into continuing on the phone.
+    private val headsetWatch: android.media.AudioDeviceCallback? = if (appContext != null) {
+        object : android.media.AudioDeviceCallback() {
+            override fun onAudioDevicesAdded(addedDevices: Array<android.media.AudioDeviceInfo>) {
+                // The framework re-routes the default input itself; nothing
+                // to do but note it.
+                log("Headset connected; the capture follows the default input", level="d")
+            }
+
+            override fun onAudioDevicesRemoved(removedDevices: Array<android.media.AudioDeviceInfo>) {
+                val headsetGone = removedDevices.any {
+                    it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                        it.type == android.media.AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+                        it.type == android.media.AudioDeviceInfo.TYPE_USB_HEADSET
+                }
+                if (!headsetGone || !callActive) return
+                val keep = runCatching {
+                    settingsRepository?.settingsFlow?.value?.continueCallsOnPhoneWhenHeadsetDisconnects
+                }.getOrNull() ?: false
+                if (keep) {
+                    log("Headset disconnected; keeping the call on the phone (user preference)", level="d")
+                } else {
+                    log("Headset disconnected; hanging up for privacy", level="w")
+                    hangUp("headset disconnected")
+                }
+            }
+        }
+    } else null
+
     // The persistent capture. One AudioRecord for the whole voice session,
     // whoever owns it.
     private var capture: StreamingCallCapture? = null
@@ -312,6 +350,15 @@ class VoiceCallEngine private constructor(context: Context?) {
     var chunkListener: ((FloatArray) -> Unit)? = null
 
     private var appHost: ExchangeHost? = null
+
+    /**
+     * True when [host] is the surface the APP state currently routes the mic
+     * to. The always-listening assistant service checks this before hanging
+     * up on a stop: it may only end a call it owns, never the screen's or
+     * the wake service's.
+     */
+    fun isAppHost(host: ExchangeHost): Boolean =
+        micState == MicState.APP && appHost === host
 
     // A screen call that ended while it was still live - the user hung up,
     // or the window that hosted it was swiped away - hands the microphone
@@ -458,6 +505,12 @@ class VoiceCallEngine private constructor(context: Context?) {
         capture?.stop()
         capture = null
         chunkListener = null
+        if (!testMode && headsetWatch != null) {
+            runCatching {
+                (appContext!!.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager)
+                    .unregisterAudioDeviceCallback(headsetWatch)
+            }
+        }
         drainUtteranceChannel()
         cancelExchangeScope()
         callActive = false
@@ -515,14 +568,30 @@ class VoiceCallEngine private constructor(context: Context?) {
      * @return true when this call began a fresh conversation.
      */
     fun beginCall(): Boolean {
-        val fresh = !callActive
+        // Whether this call began a fresh conversation is the conversation's
+        // own lifetime, not the call's: a call that resumes while a surface
+        // still shows the transcript continues the same conversation, and
+        // only a conversation that has truly ended (the model's end_call, or
+        // every surface closed with no call live) makes the next call a
+        // fresh one. See [ConversationStore] for the lifetime rules.
+        val fresh = if (testMode) {
+            !callActive
+        } else {
+            !callActive && ConversationStore.conversationEnded
+        }
         callActive = true
         if (fresh) {
             if (!testMode) {
                 ConversationStore.clear()
+                ConversationStore.markConversationOpen()
                 ConversationStore.setCallActive(true)
             }
             log("New call: fresh conversation (previous turns cleared)")
+        } else if (!testMode) {
+            // The same conversation continues; make sure the ended mark a
+            // previous lifecycle left behind is not carried into it.
+            ConversationStore.markConversationOpen()
+            ConversationStore.setCallActive(true)
         }
         return fresh
     }
@@ -556,7 +625,15 @@ class VoiceCallEngine private constructor(context: Context?) {
             return
         }
         log("hangUp: $reason", level="w")
+        // The model ending the call itself is a true end of the conversation
+        // (see ConversationStore), not just the end of this exchange: the
+        // next wake phrase or mic button starts a new one, even with a
+        // surface still on screen showing the transcript.
+        if (reason.contains("model asked to end")) {
+            ConversationStore.markConversationEndedByModel()
+        }
         callActive = false
+        lastCallEndAt = System.currentTimeMillis()
         hangUpEvents.tryEmit(Unit)
         // The transition to IDLE tears the exchange and the capture down
         // under the state lock.

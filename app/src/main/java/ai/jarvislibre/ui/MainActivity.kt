@@ -29,6 +29,7 @@ import androidx.navigation.compose.composable
 import ai.jarvislibre.R
 import ai.jarvislibre.data.settings.SettingsRepository
 import ai.jarvislibre.ui.chat.ChatScreen
+import ai.jarvislibre.ui.common.ConversationStore
 import ai.jarvislibre.ui.common.VoiceCallEngine
 import ai.jarvislibre.ui.settings.SettingsScreen
 import ai.jarvislibre.ui.theme.JarvisLibreTheme
@@ -268,14 +269,20 @@ class MainActivity : ComponentActivity() {
     // The app is on screen as an app proper: the wake service reads this to
     // stay silent while the app is visible, so the wake word cannot start an
     // exchange and the popup cannot be drawn over the app the user is using.
+    // The same lifecycle brackets the fullscreen conversation surface: while
+    // the app is in the foreground the conversation stays open (settings
+    // round trips included - the activity never stops), and only the app
+    // leaving the screen counts its surface as closed.
     override fun onStart() {
         super.onStart()
         VoiceCallEngine.isAppOnScreen = true
+        ConversationStore.setAppSurfaceOpen(true)
     }
 
     override fun onStop() {
         super.onStop()
         VoiceCallEngine.isAppOnScreen = false
+        ConversationStore.setAppSurfaceOpen(false)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -335,17 +342,20 @@ class MainActivity : ComponentActivity() {
             }
 
             if (showSplash.value) {
-                // Splash screen with fade-in animation
+                // Splash screen with fade-in animation. The animated bot face
+                // (the same one the voice surfaces ride) fills about two
+                // thirds of the screen while the app loads, instead of a
+                // static microphone glyph.
                 Box(
                     modifier = Modifier.fillMaxSize(),
                     contentAlignment = Alignment.Center,
                     content = {
-                        Icon(
-                            imageVector = androidx.compose.material.icons.Icons.Default.Mic,
-                            contentDescription = null,
-                            modifier = Modifier.size(96.dp),
-                            tint = MaterialTheme.colorScheme.primary
-                        )
+                        BoxWithConstraints {
+                            ai.jarvislibre.ui.common.CallAvatar(
+                                pose = ai.jarvislibre.ui.common.CallPose.CONNECTING,
+                                size = maxWidth * 2f / 3f
+                            )
+                        }
                     }
                 )
             }

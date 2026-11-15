@@ -669,7 +669,7 @@ fun ChatScreen(
                                     else -> CallPose.CONNECTING
                                 }
                             },
-                            size = 72.dp,
+                            size = 144.dp,
                             modifier = Modifier.padding(top = 12.dp)
                         )
                         Spacer(modifier = Modifier.height(8.dp))

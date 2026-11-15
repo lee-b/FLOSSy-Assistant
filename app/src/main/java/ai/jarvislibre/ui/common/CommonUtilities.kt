@@ -48,9 +48,6 @@ fun recordAudioForSTT(
     val minBufferSize = android.media.AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
     if (minBufferSize <= 0) return null
 
-    // The headset input to steer this recorder at, if any exists.
-    val captureDevice = preferredCaptureDevice(context)
-
     val audioRecord = android.media.AudioRecord(
         MediaRecorder.AudioSource.VOICE_COMMUNICATION,
         sampleRate, channelConfig, audioFormat, minBufferSize * 4
@@ -60,11 +57,10 @@ fun recordAudioForSTT(
         audioRecord.release()
         return null
     }
-    // Steer this recorder alone at the headset input - per-recorder routing
-    // with no global side effects (no volume curve, no SCO toggling).
-    captureDevice?.let { device ->
-        runCatching { audioRecord.setPreferredDevice(device) }
-    }
+    // No steering: the recorder rides the framework's default input, which
+    // follows device connects and disconnects on its own. Enrollment and
+    // detection must hear the same microphone, and a preference of headset
+    // over built-in is what drifted them onto different ones.
 
     val buffer = ShortArray(minBufferSize / 2)
     val output = ByteArrayOutputStream()
@@ -204,15 +200,11 @@ class StreamingCallCapture(
             rec.release()
             return false
         }
-        // Steer this recorder alone at the headset input; the framework's
-        // default input is used as-is when there is nothing to steer at. No
-        // communication route is set or cleared anywhere: setting one toggles
-        // the SCO link, which yanks the headset's volume and knocks out
-        // whatever media is playing.
-        preferredCaptureDevice(context)?.let { device ->
-            runCatching { rec.setPreferredDevice(device) }
-                .onFailure { android.util.Log.w("VAD", "Could not steer capture device: ${it.message}") }
-        }
+        // No steering here either: the framework's default input is used
+        // as-is, so enrollment and live detection always share one
+        // microphone. No communication route is set or cleared anywhere:
+        // setting one toggles the SCO link, which yanks the headset's volume
+        // and knocks out whatever media is playing.
         record = rec
         rec.startRecording()
         thread = Thread {
@@ -394,9 +386,6 @@ fun recordAudioWithVAD(
         return null
     }
 
-    // The headset input to steer this recorder at, if any exists.
-    val captureDevice = preferredCaptureDevice(context)
-
     val audioRecord = android.media.AudioRecord(
         MediaRecorder.AudioSource.VOICE_COMMUNICATION,
         sampleRate, channelConfig, audioFormat, minBufferSize * 4
@@ -407,11 +396,8 @@ fun recordAudioWithVAD(
         audioRecord.release()
         return null
     }
-    // Steer this recorder alone at the headset input - per-recorder routing
-    // with no global side effects (no volume curve, no SCO toggling).
-    captureDevice?.let { device ->
-        runCatching { audioRecord.setPreferredDevice(device) }
-    }
+    // No steering: the framework's default input, so every recorder in the
+    // app hears the same microphone.
 
     val audioBuffers = mutableListOf<Short>()
     val buffer = ShortArray(minBufferSize / 2)
@@ -832,33 +818,24 @@ class ReplyAudioPlayer(
 
     private fun drain() {
         val t = track ?: return
+        val written = totalFrames
+        val rateNow = rate
+        var head = 0L
         try {
-            t.stop()
-            // The poll is only a release guard - its deadline is the audio's
-            // own length plus slack, and the frame count it waits for is the
-            // count the track actually received, so nothing is cut.
-            val drainMs = if (rate > 0) totalFrames * 1000 / rate + 500 else 500L
-            val deadline = System.currentTimeMillis() + drainMs
-            var lastHead = -1L
-            var stalledFor = 0L
-            while (System.currentTimeMillis() < deadline) {
-                val head = t.playbackHeadPosition.toLong()
-                if (head >= totalFrames) break
-                if (head == lastHead) {
-                    stalledFor += 20
-                    // A head that has not moved for a second will never move
-                    // again - waiting out the full deadline of a dead track
-                    // is what froze the UI here before the dispatcher fix.
-                    if (stalledFor >= 1000) break
-                } else {
-                    stalledFor = 0
-                    lastHead = head
-                }
-                Thread.sleep(20)
-            }
+            // The head is polled while the track is still playing: streaming
+            // stop() resets it to zero, so stopping first would make the poll
+            // read 0 forever and cut the reply's tail (see playOutThenStop).
+            head = playOutThenStop(t, written, rateNow)
         } catch (e: Exception) {
             android.util.Log.w("TTS", "Drain failed: ${e.message}")
         }
+        // Diagnostic for the reported reply truncation: how many frames the
+        // track actually received versus how far its playback head got before
+        // the stop. A head short of the written count means the tail was cut
+        // at the mixer, not in the producer.
+        android.util.Log.i("TTS",
+            "Reply drained: wrote ${written * 2} bytes (${written} frames @${rateNow}Hz), " +
+                "head reached ${head} frames, undrained ${written - head} frames")
         try { t.release() } catch (_: Exception) {}
         track = null
         totalFrames = 0
@@ -887,6 +864,74 @@ class ReplyAudioPlayer(
  *   wake word can take over mid-reply.
  * @return true if any audio was played.
  */
+/**
+ * Plays a streaming [AudioTrack] out and only then stops it, and returns the
+ * playback head as it stood just before the stop.
+ *
+ * The order here is the whole fix: streaming stop() resets the playback head
+ * to zero, so a drain that stops first and polls afterwards reads 0 forever,
+ * mistakes the frozen counter for a dead track, and releases the track while
+ * the reply's tail is still unplayed - the device-verified truncation. The
+ * head is therefore polled while the track is still playing, and stop() comes
+ * only after the head reached the frame count the track actually received (or
+ * the audio's own duration plus slack elapsed, which bounds a track the mixer
+ * never serves).
+ *
+ * Runs on the IO dispatcher - the poll sleeps on the playback head, and a
+ * caller on the main thread must never sleep in that wait (the ANR trace).
+ *
+ * @param totalFrames frames the track received (16-bit mono frames).
+ * @param rate sample rate in Hz, for the duration-scaled deadline.
+ * @return the head position observed while the track was still playing.
+ */
+internal fun playOutThenStop(track: android.media.AudioTrack, totalFrames: Long, rate: Int): Long {
+    val head = playOutUntilHead(
+        head = { track.playbackHeadPosition.toLong() },
+        totalFrames = totalFrames,
+        rate = rate,
+        onDone = { try { track.stop() } catch (_: Exception) {} }
+    )
+    return head
+}
+
+/**
+ * The drain loop itself, with the head read injected so a unit test can
+ * simulate a mixer (advancing, stalled, or stopped) without audio hardware.
+ * [stallLimitMs] is the head-frozen guard, 2.5s in production; tests pass
+ * something small so a dead track does not slow the suite.
+ */
+internal fun playOutUntilHead(
+    head: () -> Long,
+    totalFrames: Long,
+    rate: Int,
+    onDone: () -> Unit,
+    stallLimitMs: Long = 2500L
+): Long {
+    val drainMs = if (rate > 0) totalFrames * 1000L / rate + 500 else 500L
+    val deadline = System.currentTimeMillis() + drainMs
+    var lastHead = -1L
+    var stalledFor = 0L
+    var observed = 0L
+    while (System.currentTimeMillis() < deadline) {
+        observed = head()
+        if (observed >= totalFrames) break
+        if (observed == lastHead) {
+            stalledFor += 20
+            // A head frozen this long while the track is nominally playing
+            // means the mixer has stopped serving it (an underrun-disabled
+            // track nobody restarted) - waiting out the full deadline of a
+            // dead track is what froze the UI here before the dispatcher fix.
+            if (stalledFor >= stallLimitMs) break
+        } else {
+            stalledFor = 0
+            lastHead = observed
+        }
+        try { Thread.sleep(20) } catch (_: InterruptedException) { break }
+    }
+    onDone()
+    return observed
+}
+
 suspend fun playPcmAudio(pcmBytes: ByteArray, sampleRate: Int, abortSignal: AtomicBoolean? = null, player: ReplyAudioPlayer? = null): Boolean {
     if (pcmBytes.isEmpty()) return false
     if (player != null) return player.write(pcmBytes, pcmBytes.size, sampleRate)
@@ -970,21 +1015,11 @@ private fun playPcmAudioOnOwnTrack(pcmBytes: ByteArray, sampleRate: Int, abortSi
             // The write is blocking but only until the buffer accepts the data,
             // so returning here would leave the speaker still sounding the tail
             // - which the freshly re-armed microphone then hears as speech and
-            // turns into phantom utterances. stop() plays out what was written
-            // (flush() would discard it), and the head position is polled until
-            // every frame has actually left the speaker.
-            audioTrack.stop()
+            // turns into phantom utterances. The head is polled while the track
+            // is still playing and only then stopped: stop() first would reset
+            // the streaming head to zero and cut the tail (see playOutThenStop).
             val totalFrames = totalWritten / 2L
-            // The drain waits as long as the audio itself lasts plus a beat of
-            // slack - a fixed cap truncates every sentence longer than the cap,
-            // which is exactly the "reply cut off at the end of each portion"
-            // a fixed two-second deadline used to produce on long sentences.
-            val drainMs = totalFrames * 1000L / rate + 500
-            val deadline = System.currentTimeMillis() + drainMs
-            while (System.currentTimeMillis() < deadline) {
-                if (audioTrack.playbackHeadPosition >= totalFrames) break
-                Thread.sleep(20)
-            }
+            playOutThenStop(audioTrack, totalFrames, rate)
             audioTrack.release()
             android.util.Log.d("TTS", "Played ${totalWritten} bytes at ${rate}Hz")
             return true
@@ -1321,63 +1356,6 @@ private suspend fun playPlopCue(fromHz: Double, toHz: Double): Boolean {
     }
     return playPcmAudio(pcm, WAITING_CUE_SAMPLE_RATE)
 }
-
-/**
- * Routes microphone capture through the audio manager's communication routing,
- * which is the meta input that follows whatever the user is actually using -
- * Bluetooth headphones, a wired headset, or the phone's own mic.
- *
- * AudioSource.VOICE_COMMUNICATION keeps recording the phone's own mic unless
- * the audio manager is told where communication audio belongs, so with modern
- * Bluetooth headphones (Sony XM5 and friends) the recorder either reads the
- * phone mic or silence - the STT then hears nothing or hears the room.
- *
- * A headset mic is always claimed explicitly when one is available. Trusting
- * the framework's [AudioManager.getCommunicationDevice] is not enough: on a
- * modern Bluetooth headset the framework reports the A2DP output as the
- * "active communication device" (audio_flinger then shows Input device:
- * AUDIO_DEVICE_IN_BUILTIN_MIC), so the output plays through the headphones
- * while the input rides the phone mic - the mismatch this function exists to
- * fix. Only when no headset candidate exists at all does the built-in mic
- * carry the capture.
- *
- * Returns a restore runnable callers run in a finally block; it undoes
- * exactly what was set here.
- */
-/**
- * Finds the input device the recorder should ride, and nothing else.
- *
- * This used to *set* the global communication route
- * ([AudioManager.setCommunicationDevice]) before every capture and clear it
- * after, which is the root of two user-visible harms: every set/clear cycle
- * toggles the Bluetooth SCO link, and SCO activation yanks the headset onto
- * the call volume curve - the volume changes the user never asked for - and
- * tears down A2DP, which stutters a podcast mid-playback. The route is also
- * simply not ours to touch: other apps are playing through the very link we
- * kept flipping.
- *
- * Now the device is only *read*: the same preference order (headset, then
- * built-in mic) is returned and the caller aims its own recorder at it with
- * [AudioRecord.setPreferredDevice], which steers one capture without any
- * global routing, volume or SCO side effects.
- *
- * @return the preferred input device, or null when there is nothing to steer
- *   at - the recorder then just uses the framework's default input.
- */
-fun preferredCaptureDevice(context: Context): AudioDeviceInfo? {
-    val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-        ?: return null
-    val candidates = audioManager.getAvailableCommunicationDevices()
-    // Prefer the headset the user is actually wearing; fall back to the
-    // built-in mic only when there is nothing else.
-    return candidates.firstOrNull {
-        it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
-            it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
-            it.type == AudioDeviceInfo.TYPE_USB_HEADSET
-    } ?: candidates.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
-}
-
-
 
 /**
  * Plays the busy cue: three light, quick "tippy-tap" ticks, like a small
@@ -1744,18 +1722,14 @@ suspend fun playAudioBytes(data: ByteArray, abortSignal: AtomicBoolean? = null, 
             // Same drain discipline as playPcmAudio: stop() plays out what is
             // already written (flush() would cut the reply's tail), and the head
             // position is polled until the speaker has actually finished.
-            track?.stop()
-            val totalFrames = totalWritten / 2L
             // Duration-scaled, like playPcmAudio: a fixed cap amputates the
             // tail of every sentence that outlives it. The decoder names the
             // rate its PCM really plays at - the old hardcoded guess is what
-            // cut long sentences short.
-            val drainMs = totalFrames * 1000L / decodedRate + 500
-            val drainDeadline = System.currentTimeMillis() + drainMs
-            while (System.currentTimeMillis() < drainDeadline) {
-                if (track?.playbackHeadPosition ?: 0 >= totalFrames) break
-                Thread.sleep(20)
-            }
+            // cut long sentences short. The head is polled while the track is
+            // still playing (stop() first resets it to zero - playOutThenStop).
+            val totalFrames = totalWritten / 2L
+            val t = track
+            if (t != null) playOutThenStop(t, totalFrames, decodedRate)
             track?.release()
             codec.stop()
             codec.release()

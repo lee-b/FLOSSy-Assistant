@@ -1,6 +1,7 @@
 package ai.jarvislibre.data.tools
 
 import ai.jarvislibre.data.remote.McpClient
+import ai.jarvislibre.notification.NotificationCapture
 import ai.jarvislibre.domain.model.AppSettings
 import ai.jarvislibre.domain.model.ToolInstance
 import ai.jarvislibre.domain.model.ToolTypes
@@ -137,7 +138,9 @@ object ToolRegistry {
         ToolTypes.TYPE_GET_DATETIME,
         ToolTypes.TYPE_GET_LOCALE,
         ToolTypes.TYPE_GET_URL,
-        ToolTypes.TYPE_ROLL_DICE -> true
+        ToolTypes.TYPE_ROLL_DICE,
+        ToolTypes.TYPE_READ_BLOOD_SUGAR,
+        ToolTypes.TYPE_READ_NOTIFICATIONS -> true
         else -> false
     }
 
@@ -181,6 +184,14 @@ object ToolRegistry {
             ToolTypes.TYPE_ROLL_DICE -> Pair(
                 "Roll dice for games or decisions. The expression is a sum like 3d8+4 (three eight-sided dice plus four), d20 for one die, or 2d6-1.",
                 "{\"type\": \"object\", \"properties\": {\"dice\": {\"type\": \"string\", \"description\": \"The dice expression, for example 3d8+4\"}}, \"required\": [\"dice\"]}"
+            )
+            ToolTypes.TYPE_READ_BLOOD_SUGAR -> Pair(
+                "Read the current blood sugar value and its trend arrow from the CamAPS FX diabetes app on this device. Call this when the user asks about their sugar, glucose or sensor reading.",
+                "{\"type\": \"object\", \"properties\": {}}"
+            )
+            ToolTypes.TYPE_READ_NOTIFICATIONS -> Pair(
+                "Read the most recent notifications on the device, newest first, from the apps the user allows. Call this when the user asks what notifications they have or what an app just said.",
+                "{\"type\": \"object\", \"properties\": {}}"
             )
             else -> Pair(instance.type, "{\"type\": \"object\", \"properties\": {}}")
         }
@@ -229,7 +240,41 @@ object ToolRegistry {
             }
             ToolTypes.TYPE_GET_URL -> fetchUrl(arguments.optString("url", ""))
             ToolTypes.TYPE_ROLL_DICE -> DiceParser.roll(arguments.optString("dice", "1d20"))
+            ToolTypes.TYPE_READ_BLOOD_SUGAR -> runBloodSugar(instance)
+            ToolTypes.TYPE_READ_NOTIFICATIONS -> runReadNotifications()
             else -> "This tool has no handler."
+        }
+    }
+
+    // ---------- Notification-backed tools ----------
+
+    /**
+     * The blood-sugar answer from the CamAPS FX capture. The tool itself is
+     * enabled or not - this only runs when advertised - and the capture is
+     * answered from what the listener has seen, so a missing notification
+     * access grant or a stopped app reads as a sentence, never an exception.
+     */
+    private suspend fun runBloodSugar(instance: ToolInstance): String {
+        val capture = NotificationCapture.latestFrom(CamApsFxTool.CAMAPS_PACKAGE)
+        return CamApsFxTool.answer(capture)
+    }
+
+    /**
+     * The general notification read: every captured package the watcher set
+     * allows, newest first, with the text the capture could see. Nothing is
+     * listed that was never watched, and an empty store says so in words.
+     */
+    private suspend fun runReadNotifications(): String {
+        val captures = NotificationCapture.knownPackages().mapNotNull {
+            NotificationCapture.latestFrom(it)
+        }
+        if (captures.isEmpty()) {
+            return "I have no captured notifications. Make sure notification access is granted and that at least one app's notifications are being watched."
+        }
+        return captures.joinToString("\n\n") { capture ->
+            val heading = capture.title.ifBlank { capture.packageName }
+            val body = capture.text.ifBlank { capture.subText }.ifBlank { capture.remoteViewsText }
+            "$heading: ${body.ifBlank { "(no text)" }}"
         }
     }
 

@@ -2,6 +2,7 @@ package ai.jarvislibre.service
 
 import android.Manifest
 import android.app.*
+import android.content.Context
 import android.content.Intent
 import android.os.Bundle
 import android.os.IBinder
@@ -325,6 +326,7 @@ class WakeChatService : VoiceInteractionService() {
         notificationManager = getSystemService(NotificationManager::class.java)
 
         createNotificationChannel()
+        registerTriggerReceiver()
         startForeground(NOTIFICATION_ID, buildNotification(PHASE_IDLE))
 
         // One "Awaiting connection..." per rate-limit episode, not per retry: the
@@ -344,6 +346,41 @@ class WakeChatService : VoiceInteractionService() {
                 }
             }
         }
+    }
+
+    /**
+     * The external trigger seam.
+     *
+     * The service itself cannot be started from outside: it is a
+     * VoiceInteractionService gated by BIND_VOICE_INTERACTION, so a shell or an
+     * automation tool calling startService is refused. What they can do is
+     * send a broadcast, so the running service registers one exported receiver
+     * per command and dispatches it through the same onStartCommand switch the
+     * app's own paths use - one trigger action, one behaviour, no second
+     * pipeline.
+     */
+    private val triggerReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: android.content.Context, intent: android.content.Intent) {
+            when (intent.action) {
+                ACTION_TRIGGER_EXCHANGE -> triggerExchange()
+                ACTION_END_CALL -> {
+                    VoiceCallEngine.instance(applicationContext).hangUp("external end call")
+                    serviceScope.launch { endExchange() }
+                }
+            }
+        }
+    }
+
+    private fun registerTriggerReceiver() {
+        val filter = android.content.IntentFilter().apply {
+            addAction(ACTION_TRIGGER_EXCHANGE)
+            addAction(ACTION_END_CALL)
+        }
+        // Exported so automation tools (Tasker, adb shell am broadcast) reach
+        // it; the actions are namespaced under the package, which is the
+        // boundary - anyone who knows the action may start an exchange, which
+        // the mic gate already treats as a user speaking.
+        registerReceiver(triggerReceiver, filter, Context.RECEIVER_EXPORTED)
     }
 
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
@@ -867,8 +904,11 @@ class WakeChatService : VoiceInteractionService() {
             // draw from the same store while this conversation is live, and
             // outside a call neither draws any of it.
             // One call, one conversation: beginCall() marks the call live in
-            // the engine and, when no call was live, clears the old turns -
-            // a fresh wake phrase starts a fresh conversation.
+            // the engine and, when the conversation has truly ended, clears
+            // the old turns - a fresh wake phrase after that starts a fresh
+            // conversation, while a phrase with the conversation still open
+            // (any surface showing it) resumes the same one.
+            ConversationStore.setPopupSurfaceOpen(true)
             engine.beginCall()
             setPhase(PHASE_LISTENING)
             // The window is raised the moment the phrase is heard, before the
@@ -1249,6 +1289,9 @@ class WakeChatService : VoiceInteractionService() {
      * can act on survives the animation.
      */
     private suspend fun endExchange() {
+        // The mini popup surface is going down with the card: the mini mode
+        // is closed for the conversation-lifetime bookkeeping.
+        ConversationStore.setPopupSurfaceOpen(false)
         // The engine's call flag drops with it, so the next wake phrase
         // begins a fresh conversation - but only when the wake service owns
         // the call: a chat-screen call keeps its capture (the chat-hangup
@@ -1450,6 +1493,7 @@ class WakeChatService : VoiceInteractionService() {
         super.onDestroy()
         isRunning = false
         android.util.Log.d("WakeChatService", "Service destroying - stopping the listening loop")
+        runCatching { unregisterReceiver(triggerReceiver) }
         connectionWaitingScope.cancel()
         stopListening()
     }

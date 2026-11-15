@@ -53,13 +53,17 @@ data class ToolInstance(
     /**
      * Whether the type's required settings are populated. An unconfigured
      * instance can sit in the list but its enable check is ghosted: a tool
-     * the model cannot reach must never be advertised.
+     * the model cannot reach must never be advertised. For the notification
+     * tools "configured" means the tool's target app is installed (the blood
+     * sugar tool reads a CamAPS FX notification, and a general reader has
+     * nothing to read from a missing app either).
      */
     val configured: Boolean
         get() = when (type) {
             ToolTypes.TYPE_SEARXNG -> searxngUrl.isNotBlank()
             ToolTypes.TYPE_BRAVE -> braveApiKey.isNotBlank()
             ToolTypes.TYPE_MCP -> mcpUrl.isNotBlank()
+            ToolTypes.TYPE_READ_BLOOD_SUGAR, ToolTypes.TYPE_READ_NOTIFICATIONS -> true
             else -> true
         }
 
@@ -88,6 +92,8 @@ object ToolTypes {
     const val TYPE_GET_LOCALE = "get_locale"
     const val TYPE_GET_URL = "get_url"
     const val TYPE_ROLL_DICE = "roll_dice"
+    const val TYPE_READ_BLOOD_SUGAR = "read_blood_sugar"
+    const val TYPE_READ_NOTIFICATIONS = "read_notifications"
     const val TYPE_SEARXNG = "searxng"
     const val TYPE_BRAVE = "brave"
     const val TYPE_MCP = "mcp"
@@ -105,6 +111,8 @@ object ToolTypes {
         Spec(TYPE_GET_LOCALE, "Locale", "The device and app locales the assistant should answer in", false),
         Spec(TYPE_GET_URL, "Fetch URL", "Retrieve a web page the model is given, with strict size limits", false),
         Spec(TYPE_ROLL_DICE, "Dice roller", "Roll dice expressed as NdM+K, for example 3d8+4", false),
+        Spec(TYPE_READ_BLOOD_SUGAR, "Blood sugar (CamAPS FX)", "Read the blood sugar and trend arrow from the CamAPS FX app's ongoing notification, on this device", false),
+        Spec(TYPE_READ_NOTIFICATIONS, "Read notifications", "Read the most recent notifications from the device, for the apps the user allows", false),
         Spec(TYPE_SEARXNG, "SearXNG search", "Search the web through a SearXNG instance returning JSON", true),
         Spec(TYPE_BRAVE, "Brave search", "Search the web through the Brave Search API", true),
         Spec(TYPE_MCP, "MCP server", "Every tool one Model Context Protocol server offers", true)
@@ -182,7 +190,9 @@ data class ToolsConfig(val instances: List<ToolInstance> = emptyList()) {
                 ToolInstance("internal-get-datetime", ToolTypes.TYPE_GET_DATETIME, true, "{}"),
                 ToolInstance("internal-get-locale", ToolTypes.TYPE_GET_LOCALE, true, "{}"),
                 ToolInstance("internal-get-url", ToolTypes.TYPE_GET_URL, false, "{}"),
-                ToolInstance("internal-roll-dice", ToolTypes.TYPE_ROLL_DICE, true, "{}")
+                ToolInstance("internal-roll-dice", ToolTypes.TYPE_ROLL_DICE, true, "{}"),
+                ToolInstance("internal-read-blood-sugar", ToolTypes.TYPE_READ_BLOOD_SUGAR, false, "{}"),
+                ToolInstance("internal-read-notifications", ToolTypes.TYPE_READ_NOTIFICATIONS, false, "{}")
             )
         )
 

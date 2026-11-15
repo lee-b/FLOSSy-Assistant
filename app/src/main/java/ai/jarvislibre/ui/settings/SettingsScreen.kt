@@ -697,6 +697,9 @@ private fun EndpointsTab(
         // The TTS spells out leaked foreign characters one by one; this
         // drops them before synthesis so speech stays in the user's language.
         SettingSwitch("Forbid non-Latin characters in speech", settings.forbidNonLatinTts, { viewModel.updateSetting("forbidNonLatinTts", it) })
+        // Privacy by default: a headset coming off ends the call, unless the
+        // user opts into continuing on the phone's own mic and speaker.
+        SettingSwitch("Continue calls on phone when headset disconnects", settings.continueCallsOnPhoneWhenHeadsetDisconnects, { viewModel.updateSetting("continueCallsOnPhoneWhenHeadsetDisconnects", it) })
         TestButton("Test TTS", true, ttsTesting) { viewModel.runEndpointTest("tts") }
     }
 }
@@ -944,8 +947,20 @@ private fun ToolsTab(settings: AppSettings, viewModel: SettingsViewModel) {
         }
 
         instances.forEach { instance ->
+            // A notification-backed tool is ghosted with its reason spelled
+            // out when the device cannot serve it: the target app missing, or
+            // notification access ungranted.
+            val readiness = when (instance.type) {
+                ToolTypes.TYPE_READ_BLOOD_SUGAR -> ai.jarvislibre.data.tools.CamApsFxTool.readiness(context)
+                ToolTypes.TYPE_READ_NOTIFICATIONS -> {
+                    val granted = ai.jarvislibre.notification.NotificationCapture.isListenerEnabled(context)
+                    if (granted) Pair(true, "") else Pair(false, "Notification access has not been granted to Jarvis Libre")
+                }
+                else -> Pair(true, "")
+            }
             ToolInstanceRow(
                 instance = instance,
+                externalGhostReason = readiness.second,
                 onToggle = { enabled ->
                     viewModel.toggleToolInstance(instance.id, enabled)
                 },
@@ -1020,6 +1035,7 @@ private fun availableAddTypes(instances: List<ToolInstance>): List<ToolTypes.Spe
 @Composable
 private fun ToolInstanceRow(
     instance: ToolInstance,
+    externalGhostReason: String,
     onToggle: (Boolean) -> Unit,
     onConfigure: () -> Unit,
     onRemove: () -> Unit
@@ -1032,7 +1048,7 @@ private fun ToolInstanceRow(
         // The check is the enable/disable switch. It is ghosted while the
         // type's required settings are missing: a tool the model cannot
         // reach must not be offered.
-        val canEnable = instance.configured
+        val canEnable = instance.configured && externalGhostReason.isBlank()
         Checkbox(
             checked = instance.enabled,
             onCheckedChange = onToggle,
@@ -1045,7 +1061,10 @@ private fun ToolInstanceRow(
             )
             Text(
                 text = when {
-                    !canEnable -> "Needs configuration before it can be enabled"
+                    !canEnable -> when {
+                        externalGhostReason.isNotBlank() -> externalGhostReason
+                        else -> "Needs configuration before it can be enabled"
+                    }
                     instance.enabled -> "Enabled"
                     else -> spec?.description?.let { "$it" } ?: "Disabled"
                 },

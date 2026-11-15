@@ -38,6 +38,43 @@ class SettingsRepository(private val context: Context) {
     private val _settingsFlow = MutableStateFlow(loadSettings())
     val settingsFlow: StateFlow<ai.jarvislibre.domain.model.AppSettings> = _settingsFlow.asStateFlow()
 
+    init {
+        syncNotificationWatchers()
+    }
+
+    /**
+     * Rebuilds the notification watcher set from the enabled tools.
+     *
+     * The blood-sugar tool and the general notification reader are the two
+     * tool types whose data arrives through the platform's notification
+     * listener; when neither is enabled the set is empty and the capture
+     * service is a no-op that lets every post fall through untouched. Called
+     * whenever the committed settings change, so an enable switch flip is the
+     * only thing that decides whether CamAPS FX's notifications are read.
+     */
+    private fun syncNotificationWatchers() {
+        val instances = ai.jarvislibre.domain.model.ToolsConfig
+            .fromJson(_settingsFlow.value.toolsConfig).instances
+            .filter { it.enabled && it.configured }
+        val watchers = mutableListOf<ai.jarvislibre.notification.NotificationWatcher>()
+        if (instances.any { it.type == ai.jarvislibre.domain.model.ToolTypes.TYPE_READ_BLOOD_SUGAR }) {
+            watchers.add(ai.jarvislibre.data.tools.CamApsFxTool.watcher())
+        }
+        if (instances.any { it.type == ai.jarvislibre.domain.model.ToolTypes.TYPE_READ_NOTIFICATIONS }) {
+            // The general reader wants everything the listener can see, so its
+            // watcher is registered with a catch-all package filter handled by
+            // the capture: a null-package watcher means "any package".
+            watchers.add(
+                ai.jarvislibre.notification.NotificationWatcher(
+                    packageName = "",
+                    extract = ai.jarvislibre.notification.NotificationCapture.standardExtract
+                )
+            )
+        }
+        ai.jarvislibre.notification.NotificationCapture.setWatchers(watchers)
+        ai.jarvislibre.notification.JarvisLog.debug = _settingsFlow.value.debugLoggingEnabled
+    }
+
     /**
      * Load all settings from SharedPreferences.
      */
@@ -61,6 +98,7 @@ class SettingsRepository(private val context: Context) {
             ttsResponseFormat = sharedPreferences.getString("tts_response_format", defaults.ttsResponseFormat) ?: defaults.ttsResponseFormat,
             enableTtsStreaming = sharedPreferences.getBoolean("enable_tts_streaming", defaults.enableTtsStreaming),
             forbidNonLatinTts = sharedPreferences.getBoolean("forbid_non_latin_tts", defaults.forbidNonLatinTts),
+            continueCallsOnPhoneWhenHeadsetDisconnects = sharedPreferences.getBoolean("continue_calls_on_phone_headset_disconnect", defaults.continueCallsOnPhoneWhenHeadsetDisconnects),
             // The flat MCP fields are read only to upgrade an old install into
             // tool instances; once "tools_config" exists they are never
             // consulted again and the Tools tab owns the configuration.
@@ -123,6 +161,7 @@ class SettingsRepository(private val context: Context) {
             putString("tts_response_format", settings.ttsResponseFormat)
             putBoolean("enable_tts_streaming", settings.enableTtsStreaming)
             putBoolean("forbid_non_latin_tts", settings.forbidNonLatinTts)
+            putBoolean("continue_calls_on_phone_headset_disconnect", settings.continueCallsOnPhoneWhenHeadsetDisconnects)
             putString("tools_config", settings.toolsConfig)
 
             putBoolean("auto_tts_enabled", settings.autoTtsEnabled)

@@ -193,6 +193,16 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         val config = ai.jarvislibre.domain.model.ToolsConfig.fromJson(_settings.value.toolsConfig)
         val target = config.instances.firstOrNull { it.id == id } ?: return
         if (enabled && !target.configured) return
+        if (enabled) {
+            // A notification-backed tool needs its device prerequisites too:
+            // the app it reads from installed, notification access granted.
+            val ready = when (target.type) {
+                ai.jarvislibre.domain.model.ToolTypes.TYPE_READ_BLOOD_SUGAR ->
+                    ai.jarvislibre.data.tools.CamApsFxTool.readiness(getApplication()).first
+                else -> true
+            }
+            if (!ready) return
+        }
         mutateTools { list ->
             val index = list.indexOfFirst { it.id == id }
             if (index >= 0) list[index] = list[index].copy(enabled = enabled)
@@ -264,6 +274,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
             // TTS Settings
             "enableTtsStreaming" -> _settings.update { it.copy(enableTtsStreaming = value as Boolean) }
             "forbidNonLatinTts" -> _settings.update { it.copy(forbidNonLatinTts = value as Boolean) }
+            "continueCallsOnPhoneWhenHeadsetDisconnects" -> _settings.update { it.copy(continueCallsOnPhoneWhenHeadsetDisconnects = value as Boolean) }
 
             // The flat MCP fields are no longer edited: the Tools tab owns the
             // configuration through the tool instance actions above.
