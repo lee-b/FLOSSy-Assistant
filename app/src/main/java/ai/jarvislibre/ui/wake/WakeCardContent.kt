@@ -70,6 +70,15 @@ data class WakeCardSnapshot(
     val pose: CallPose,
     val alpha: Float,
     val fontScale: Float,
+
+    /**
+     * Whether the screen is locked. The one intentional visual difference
+     * between a locked and an unlocked popup: when this is true the open-app
+     * button is drawn ghosted and takes no tap - opening an activity over a
+     * lock screen is the security surface this app has chosen not to expose,
+     * so the ghost only tells the user the tap would work once unlocked.
+     */
+    val locked: Boolean = false,
     val onOpenApp: () -> Unit,
     val onEndChat: () -> Unit
 )
@@ -175,6 +184,15 @@ private fun BubbleThread(snap: WakeCardSnapshot, modifier: Modifier) {
     BubblePinEffect(listState, lastIndex, snap.streaming, snap.request.length, snap.reply.length)
 }
 
+/**
+ * How much of its ink the open-app button keeps when the screen is locked.
+ *
+ * A ghost reads as present but inert - the one intentional visual difference
+ * between a locked and an unlocked popup, set here because the affordance is
+ * Compose and the alpha modifier is its own fade.
+ */
+private const val GHOSTED = 0.35f
+
 /** The two ways out of the popup: opening the full app, and ending the exchange. */
 @Composable
 private fun ButtonRow(snap: WakeCardSnapshot) {
@@ -183,8 +201,8 @@ private fun ButtonRow(snap: WakeCardSnapshot) {
         horizontalArrangement = Arrangement.spacedBy(sdp(8f, snap))
     ) {
         Button(
-            onClick = snap.onOpenApp,
-            modifier = Modifier.weight(1f),
+            onClick = { if (!snap.locked) snap.onOpenApp() },
+            modifier = if (snap.locked) Modifier.weight(1f).alpha(GHOSTED) else Modifier.weight(1f),
             colors = ButtonDefaults.buttonColors(
                 containerColor = Color(GRUVBOX_SURFACE_LOW),
                 contentColor = Color(GRUVBOX_ON_SURFACE)

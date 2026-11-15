@@ -564,6 +564,31 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
     private var scale = 1f
 
     /**
+     * Whether the screen this exchange is drawn on is locked, read from the
+     * [android.app.KeyguardManager] on every show.
+     *
+     * The affordance's ghost is the one intentional visual difference between a
+     * locked and an unlocked popup: a mid-exchange lock or unlock has to flip it
+     * without a new session, so the state is re-read per show rather than cached.
+     */
+    private var locked = false
+
+    /**
+     * How many pixels of the stage extend past the visible bottom of the display,
+     * less the margin the design already reserves.
+     *
+     * The window is pinned to the raw frame bottom and the platform builds it with
+     * `setFitInsetsTypes(0)`, so on an unlocked screen the frame bottom is the nav
+     * bar the design's [BOTTOM_MARGIN] already clears and this stays 0. On a locked
+     * screen the keyguard environment lays the window out to a frame whose bottom
+     * is lower than the visible bottom, so the card's bottom rows - the buttons
+     * included - fall off-screen. Reading the overhang and lifting the card by it
+     * less the reserved margin is what makes the locked card sit where the
+     * unlocked one does, through one `foot` padding for both states.
+     */
+    private var bottomLift = 0
+
+    /**
      * What the next show must draw, wrapped once so the window and the paint
      * agree on how many lines there are.
      */
@@ -841,6 +866,21 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
         )
         card.addView(composeCard)
         foot.setPadding(0, px(BOTTOM_MARGIN), 0, 0)
+        // The lift is measured at draw time, not at wiring time: the window is
+        // laid out by the platform after this returns, so only the pre-draw pass
+        // sees where the stage really sits. On an unlocked screen the overhang is
+        // the nav bar the design's BOTTOM_MARGIN already clears, so the lift stays
+        // 0 and the shipped geometry is untouched; on a locked screen the keyguard
+        // frame pushes the window's bottom past the visible edge and the lift
+        // carries it back up - see [measureLift].
+        stage.viewTreeObserver.addOnPreDrawListener(
+            object : android.view.ViewTreeObserver.OnPreDrawListener {
+                override fun onPreDraw(): Boolean {
+                    measureLift()
+                    return true
+                }
+            }
+        )
         paint()
         return stage
     }
@@ -856,6 +896,11 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
      */
     private fun paint() {
         tint()
+        // The affordance's ghost is re-read on every show, because a screen that
+        // locks or unlocks mid-exchange flips it without a new session.
+        locked =
+            (context.getSystemService(android.content.Context.KEYGUARD_SERVICE) as? android.app.KeyguardManager)
+                ?.isKeyguardLocked ?: false
         val closed = state == SESSION_STATE_CLOSE && riseProgress <= 0f
         // The card wears the elevation halo; the Compose surface inside wears
         // the card surface, so the ring the panel used to show is still the
@@ -876,7 +921,9 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
             pose = pose(),
             alpha = riseProgress,
             fontScale = scale,
+            locked = locked,
             onOpenApp = {
+                if (locked) return@WakeCardSnapshot
                 try {
                     val launch = context.packageManager.getLaunchIntentForPackage(context.packageName)
                     if (launch != null) startAssistantActivity(launch)
@@ -1091,13 +1138,60 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
      * [SESSION_STATE_CLOSE], which [paint] already draws as nothing, so the
      * window is invisible even if finishing it only hides it.
      */
+    /**
+     * Keeps the card raised when the lock screen appears.
+     *
+     * The base implementation of this callback calls [hide], which un-raises the
+     * window the moment SystemUI says the keyguard is showing - so on a locked
+     * screen the card survives only through the wake loop's re-show churn and ends
+     * up drawn in the keyguard's frame instead of the one the first show laid out.
+     * Overriding it as a no-op is what lets the locked exchange keep the same
+     * geometry the unlocked one has; the card is already an assistant window above
+     * the keyguard, so nothing about the lock screen requires it to leave.
+     */
+    override fun onLockscreenShown() {
+        Log.i(
+            "WakeChatSessionService",
+            "The lock screen was shown over an open exchange; keeping the card raised"
+        )
+    }
+
     override fun onShow(args: android.os.Bundle?, showFlags: Int) {
         Log.i(
             "WakeChatSessionService",
-            "Shown state=$state scale=$scale stageW=${stage.width} stageH=${stage.height} " +
+            "Shown state=$state locked=$locked lift=$bottomLift scale=$scale stageW=${stage.width} stageH=${stage.height} " +
                 "cardW=${card.width} cardH=${card.height} composeW=${composeCard.width} composeH=${composeCard.height}"
         )
         if (state == SESSION_STATE_CLOSE) finish()
+    }
+
+    /**
+     * How far the stage's bottom sits past the visible bottom of the display,
+     * less the margin the design already reserves - see [bottomLift].
+     *
+     * Run from the stage's pre-draw pass, because the window is laid out by the
+     * platform after the content view is wired and only the draw pass sees where
+     * the stage really sits. The measured overhang is applied through the `foot`
+     * spacer's top padding, so the card floats [BOTTOM_MARGIN] above the *visible*
+     * bottom in both states - the nav bar on an unlocked screen costs nothing extra
+     * because the design already clears it, and the keyguard frame on a locked
+     * screen is lifted back above the edge instead of clipping the buttons.
+     */
+    private fun measureLift() {
+        if (stage.width <= 0) return
+        val loc = IntArray(2)
+        stage.getLocationOnScreen(loc)
+        val frame = android.graphics.Rect()
+        stage.getWindowVisibleDisplayFrame(frame)
+        val overhang = (loc[1] + stage.height) - frame.bottom
+        val lift = (overhang - px(BOTTOM_MARGIN)).coerceAtLeast(0)
+        if (lift == bottomLift) return
+        bottomLift = lift
+        foot.setPadding(0, px(BOTTOM_MARGIN) + bottomLift, 0, 0)
+        Log.i(
+            "WakeChatSessionService",
+            "Lifted the card by $bottomLift px: stage at y=${loc[1]} h=${stage.height}, visible bottom ${frame.bottom}, overhang $overhang"
+        )
     }
 
     /**
@@ -1156,6 +1250,8 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
         riseProgress = 0f
         measuredShortEdge = 0
         scale = 1f
+        locked = false
+        bottomLift = 0
     }
 
     /**

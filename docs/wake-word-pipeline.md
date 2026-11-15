@@ -235,3 +235,33 @@ are never written back to the device.
 Run the whole suite: `./gradlew test` (`--tests` is not a supported option here). Gradle truncates
 assertion messages in the console; the full text is in
 `app/build/reports/tests/testDebugUnitTest/ai.jarvislibre.test.<ClassName>/<testName>.html`.
+
+## 11. The lock screen — session geometry
+
+The exchange card is drawn by `WakeChatSession` (`service/WakeChatSessionService.kt`) as a
+`TYPE_VOICE_INTERACTION` window pinned to `Gravity.BOTTOM`, its bubbles and buttons drawn by
+`WakeCardContent` (Compose inside the legacy shell). Two platform facts make the locked screen
+different from the unlocked one, and both are handled:
+
+- **Insets are ignored by design.** The platform builds the session window with
+  `setFitInsetsTypes(0)` and `FLAG_LAYOUT_IN_SCREEN`, so the bottom pinning lands on the *window
+  frame's* bottom, not the visible bottom. Unlocked, the frame bottom is the nav bar the design's
+  `BOTTOM_MARGIN` already clears. Locked, the keyguard environment lays the window out to a lower
+  frame, so the card's bottom rows - the buttons included - fall off-screen. The fix measures the
+  overhang in a `ViewTreeObserver.OnPreDrawListener` on the stage (`stage.getLocationOnScreen` vs
+  `getWindowVisibleDisplayFrame`) and lifts the card by that overhang less the reserved margin,
+  through the `foot` spacer's padding (`bottomLift`).
+- **The platform hides the session when the lock screen shows.** `VoiceInteractionSession.
+  onLockscreenShown()`'s default implementation calls `hide()`, and SystemUI's
+  `AssistManager.onLockscreenShown()` fires it whenever the keyguard appears. `WakeChatSession`
+  overrides it as a no-op so the card keeps the geometry the first show laid out.
+
+The one intentional visual difference between the two states is the "Open app" button: when
+`KeyguardManager.isKeyguardLocked`, it is drawn ghosted (`WakeCardSnapshot.locked` ->
+`GHOSTED` alpha in `WakeCardContent`) and `onOpenApp` returns early. Unlocked, it opens the app
+through `VoiceInteractionSession.startAssistantActivity`, the platform route an assistant uses to
+raise an activity above the lock screen. Launching from a locked screen is deliberately not
+implemented; tool security on locked phones is a separate work item.
+
+Healthy-geometry log lines to compare across a locked and an unlocked run: `Lifted the card by …
+px: stage at y=…, visible bottom …, overhang …` and the `Shown state=… locked=… lift=…` dump.
