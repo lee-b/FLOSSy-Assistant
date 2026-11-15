@@ -528,6 +528,23 @@ class WakeChatService : VoiceInteractionService() {
         listening = true
         stopSignal.set(false)
         wakeAbortSignal.set(false)
+        // The assistant service may have taken the microphone before this
+        // service started (a boot that ran the boot receiver first, say). Two
+        // always-on listeners cannot share one microphone: while the
+        // assistant held APP mode the engine refused every startWakeMode, so
+        // the wake word never matched at all. Ask it to stand down first;
+        // its stop finds whoever still owns the engine and never hangs a
+        // call it does not own.
+        if (ai.jarvislibre.service.VoiceAssistantService.isRunning) {
+            runCatching {
+                applicationContext.startService(
+                    ai.jarvislibre.service.VoiceAssistantService.buildIntent(
+                        applicationContext,
+                        ai.jarvislibre.service.VoiceAssistantService.ACTION_PAUSE
+                    )
+                )
+            }
+        }
         // The popup is coming alive: the first state the user sees names the
         // startup itself, before the loop settles into its slumber. A phase of
         // its own, not a raw string - the loop's first pass moves it on, and
@@ -587,6 +604,27 @@ class WakeChatService : VoiceInteractionService() {
         setPhase(PHASE_SLEEPING)
         serviceScope = newServiceScope()
         enrollmentDiagnosed = false
+        // The assistant service may be sitting paused behind the wake loop it
+        // stood down for. When the user has turned wake detection off, the
+        // microphone is now free and the always-listening assistant is its
+        // owner again, so it is woken here - a wake stop that leaves the
+        // assistant paused with the mic unused would leave the device deaf
+        // until the user restarts something by hand.
+        if (runCatching {
+                ai.jarvislibre.data.settings.SettingsRepository(appContext)
+                    .settingsFlow.value.enableWakeWordDetection
+            }.getOrDefault(false) == false
+            && ai.jarvislibre.service.VoiceAssistantService.isRunning
+        ) {
+            runCatching {
+                applicationContext.startService(
+                    ai.jarvislibre.service.VoiceAssistantService.buildIntent(
+                        applicationContext,
+                        ai.jarvislibre.service.VoiceAssistantService.ACTION_RESUME
+                    )
+                )
+            }
+        }
     }
 
     /**

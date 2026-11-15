@@ -91,6 +91,21 @@ class VoiceCallEngineTest {
     }
 
     @Test
+    fun startAppModeWithoutBeginCallHoldsTheMicButNotACall() {
+        // The assistant service's idle listening holds the microphone with
+        // no call live: the screen's guards ("a wake conversation is live",
+        // "open a call on launch", the mic button) must keep working while
+        // it idles. Only an accepted utterance opens the call.
+        val host = FakeHost()
+        engine.startAppMode(host, beginCall = false)
+        assertEquals(VoiceCallEngine.MicState.APP, engine.micState)
+        assertFalse(engine.callActive)
+        // Taking the mic over from that idle listening does open a call.
+        engine.startAppMode(host)
+        assertTrue(engine.callActive)
+    }
+
+    @Test
     fun hangUpWithNoCallIsANoOp() {
         engine.hangUp("nothing live")
         assertFalse(engine.callActive)

@@ -284,18 +284,20 @@ fun ChatScreen(
         if (viewModel.dialogState.value.isListening) return
         // A wake conversation is already a live call: the microphone belongs
         // to it, and this screen is simply one of its views. Starting a second
-        // call here would steal an exchange the popup is mid-way through.
-        if (ConversationStore.callActive.value || knownMicState != ai.jarvislibre.ui.common.VoiceCallEngine.MicState.IDLE) return
-        // Opening the call is one typed transition; every derived flag falls
-        // out of it.
-        viewModel.setDialogState(DialogMode.VOICE_CALL, VoiceCallPhase.LISTENING)
-        ttsAbortSignal.set(false)
-        // The background services would hear the same words and answer a second
-        // time (their replies never reach this chat), so while a voice call is
-        // open the screen owns the microphone - through the shared engine, which
-        // holds one capture for the whole call. Only already-running services
-        // are paused; starting one here would raise its foreground notification
-        // for nothing.
+        // call here would steal an exchange the popup is mid-way through. The
+        // check is the engine's own state, not just the call flag: a call the
+        // assistant service holds (wake chat disabled) is one this screen may
+        // take over, and the guard must not block that.
+        if (knownMicState == ai.jarvislibre.ui.common.VoiceCallEngine.MicState.WAKE &&
+            ConversationStore.callActive.value
+        ) return
+        // Only already-running services are paused, and they are paused
+        // BEFORE the screen's own state changes: the assistant service may
+        // hold the microphone (wake chat disabled, service started at boot or
+        // by the widget), and a screen call takes it over. Its stop finds the
+        // screen already owning the engine (the takeover below runs before
+        // the pause is delivered) and does not hang a call it does not own,
+        // so no late hang-up can reset this screen's state under it.
         if (ai.jarvislibre.service.VoiceAssistantService.isRunning) {
             runCatching {
                 context.applicationContext.startService(
@@ -306,6 +308,10 @@ fun ChatScreen(
                 )
             }
         }
+        // Opening the call is one typed transition; every derived flag falls
+        // out of it.
+        viewModel.setDialogState(DialogMode.VOICE_CALL, VoiceCallPhase.LISTENING)
+        ttsAbortSignal.set(false)
         // The wake service is no longer messaged at all: the engine owns the
         // microphone, and taking it for a screen call is a handoff the engine
         // performs, not a stop command the screen sends. The wake loop keeps
@@ -350,6 +356,21 @@ fun ChatScreen(
             // transition to IDLE publishes the store (the engine alone
             // writes call-liveness), so no direct store write here.
             engine.stopAppMode(handoffToWake = false)
+        }
+        // Wake detection off means the microphone's idle owner is the
+        // always-listening assistant: it was paused for this call, so it
+        // takes the mic back the moment the call ends - a wake-free device
+        // whose assistant stays paused after a screen call would sit deaf
+        // until something was restarted by hand.
+        if (!settings.enableWakeWordDetection && ai.jarvislibre.service.VoiceAssistantService.isRunning) {
+            runCatching {
+                context.applicationContext.startService(
+                    ai.jarvislibre.service.VoiceAssistantService.buildIntent(
+                        context.applicationContext,
+                        ai.jarvislibre.service.VoiceAssistantService.ACTION_RESUME
+                    )
+                )
+            }
         }
         // Cancel every coroutine still carrying the call on the screen side -
         // the spoken cues, any text-chat TTS - so nothing can speak after the
@@ -399,9 +420,18 @@ fun ChatScreen(
     // same call this screen shows, and starting a second one would fight it
     // for the microphone.
     LaunchedEffect(Unit) {
-        if (hasPermissions && settings.autoStartVoiceOnLaunch && !ConversationStore.callActive.value) {
-            startMicRecording()
-        }
+        if (!hasPermissions || !settings.autoStartVoiceOnLaunch) return@LaunchedEffect
+        // A wake conversation opened before the app was launched is the same
+        // call this screen shows, and starting a second one would fight it
+        // for the microphone - so launching leaves that one alone. A call the
+        // assistant service holds (wake chat disabled) is one this screen
+        // takes over: startMicRecording pauses the service and claims the
+        // mic, and the conversation itself keeps its turns.
+        val engine = ai.jarvislibre.ui.common.VoiceCallEngine.instance(context.applicationContext)
+        if (engine.micState == ai.jarvislibre.ui.common.VoiceCallEngine.MicState.WAKE &&
+            ConversationStore.callActive.value
+        ) return@LaunchedEffect
+        startMicRecording()
     }
 
     // If the window this call lives in goes away without any hang-up code
@@ -415,8 +445,31 @@ fun ChatScreen(
         onDispose {
             val engine = ai.jarvislibre.ui.common.VoiceCallEngine.instance(context.applicationContext)
             if (engine.micState == ai.jarvislibre.ui.common.VoiceCallEngine.MicState.APP) {
-                android.util.Log.d("ChatScreen", "Window gone mid-call: handing the call to the wake service")
-                engine.stopAppMode(handoffToWake = true)
+                if (settings.enableWakeWordDetection) {
+                    android.util.Log.d("ChatScreen", "Window gone mid-call: handing the call to the wake service")
+                    // The wake chat is the hands-free path that stays alive:
+                    // the conversation continues in the popup, the wake loop
+                    // adopting the capture on its next pass.
+                    engine.stopAppMode(handoffToWake = true)
+                } else {
+                    android.util.Log.d("ChatScreen", "Window gone mid-call: the assistant service takes the mic back")
+                    // Wake detection is off, so a handoff to the wake loop
+                    // would leave the microphone on a channel nobody drains
+                    // - deaf, and draining battery. The call ends and the
+                    // always-listening assistant takes the microphone back;
+                    // the transcript stays for its next utterance to resume.
+                    engine.stopAppMode(handoffToWake = false)
+                    if (ai.jarvislibre.service.VoiceAssistantService.isRunning) {
+                        runCatching {
+                            context.applicationContext.startService(
+                                ai.jarvislibre.service.VoiceAssistantService.buildIntent(
+                                    context.applicationContext,
+                                    ai.jarvislibre.service.VoiceAssistantService.ACTION_RESUME
+                                )
+                            )
+                        }
+                    }
+                }
             }
         }
     }

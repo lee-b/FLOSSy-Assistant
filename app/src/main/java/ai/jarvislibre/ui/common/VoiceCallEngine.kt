@@ -432,7 +432,7 @@ class VoiceCallEngine private constructor(context: Context?) {
      *   shared store, which the engine alone writes).
      */
     @Synchronized
-    fun transitionFromTo(currentState: MicState, newState: MicState): TransitionOutcome {
+    fun transitionFromTo(currentState: MicState, newState: MicState, openCall: Boolean = true): TransitionOutcome {
         val actual = micState
         if (currentState != actual) {
             log("Transition refused (stale): caller said $currentState, reality is $actual", level="w")
@@ -443,6 +443,10 @@ class VoiceCallEngine private constructor(context: Context?) {
             // one is reopened by the loop's next pass), IDLE has nothing to do.
             if (newState == MicState.WAKE || newState == MicState.APP) {
                 if (!ensureCapture()) return TransitionOutcome.CAPTURE_FAILED
+                // A same-state APP entry may open the call (the mic button
+                // re-arming), or explicitly not (the assistant service
+                // idling with the mic held): [openCall] carries that.
+                if (newState == MicState.APP && openCall) beginCall()
             }
             return TransitionOutcome.NOOP
         }
@@ -469,7 +473,7 @@ class VoiceCallEngine private constructor(context: Context?) {
                     }
                     return TransitionOutcome.CAPTURE_FAILED
                 }
-                if (newState == MicState.APP) beginCall()
+                if (newState == MicState.APP && openCall) beginCall()
             }
             MicState.IDLE -> {
                 teardownFor(from)
@@ -659,15 +663,17 @@ class VoiceCallEngine private constructor(context: Context?) {
      * rather than mis-transitioning. Passing null means "use the live
      * state", which is right when the caller has no better information.
      */
-    fun startAppMode(host: ExchangeHost, expectedState: MicState? = null) {
+    fun startAppMode(host: ExchangeHost, expectedState: MicState? = null, beginCall: Boolean = true) {
         val expected = expectedState ?: micState
         appHost = host
         val outcome = when {
-            // Re-entering a call the screen already owns is a no-op re-arm.
+            // Re-entering a call the screen already owns is a no-op re-arm;
+            // taking the mic from another APP holder (the idle assistant) is
+            // a takeover - the host is replaced above either way.
             micState == MicState.APP && (expected == MicState.APP || expected == null) ->
-                transitionFromTo(MicState.APP, MicState.APP)
+                transitionFromTo(MicState.APP, MicState.APP, openCall = beginCall)
             micState == MicState.APP -> TransitionOutcome.STALE_EXPECTATION
-            else -> transitionFromTo(expected, MicState.APP)
+            else -> transitionFromTo(expected, MicState.APP, openCall = beginCall)
         }
         if (!outcome.ok) {
             appHost = null
@@ -789,6 +795,13 @@ class VoiceCallEngine private constructor(context: Context?) {
             // with no latch to forget.
             currentExchange = exchange
             try {
+                // An utterance the engine accepted implies a live call in APP
+                // mode: the always-listening service owns the mic across
+                // utterances with no call live, so after a true end the next
+                // accepted utterance opens a fresh conversation. The screen
+                // and the wake service open their calls explicitly; for them
+                // this is a no-op.
+                if (micState == MicState.APP) beginCall()
                 // Fold the owner's external abort (the wake interrupt) into
                 // the exchange's own flag, so the TTS runner polls one
                 // AtomicBoolean regardless of who asked to stop.

@@ -1195,7 +1195,8 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
         )
     }
 
-         * Drops the exchange when the session ends.
+    /**
+     * Drops the exchange when the session ends.
      *
      * The session is created per exchange, so this is the only place its state
      * is released.
