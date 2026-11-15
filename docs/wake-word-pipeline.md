@@ -235,3 +235,30 @@ are never written back to the device.
 Run the whole suite: `./gradlew test` (`--tests` is not a supported option here). Gradle truncates
 assertion messages in the console; the full text is in
 `app/build/reports/tests/testDebugUnitTest/com.localassistant.app.test.<ClassName>/<testName>.html`.
+
+## 11. The lock screen — session geometry
+
+The exchange card is drawn by `WakeChatSession` (in `service/WakeChatSessionService.kt`) as a
+`TYPE_VOICE_INTERACTION` window pinned to `Gravity.BOTTOM`. Two platform facts make the locked
+screen different from the unlocked one, and both are now handled:
+
+- **Insets are ignored by design.** The platform builds the session window with
+  `setFitInsetsTypes(0)` and `FLAG_LAYOUT_IN_SCREEN`, so `sizeWindow()`'s bottom pinning lands on
+  the *window frame's* bottom, not the visible bottom. Unlocked, the frame bottom is the nav bar
+  the design's `BOTTOM_MARGIN` already clears. Locked, the keyguard environment lays the window
+  out to a lower frame, so the card's bottom rows fall off-screen. The fix reads the overhang in
+  `onShow()` (`stage.getLocationOnScreen` vs `getWindowVisibleDisplayFrame`) and lifts the card by
+  that overhang less the reserved margin, through the `foot` spacer's padding (`bottomLift`).
+- **The platform hides the session when the lock screen shows.** `VoiceInteractionSession.
+  onLockscreenShown()`'s default implementation calls `hide()`, and SystemUI's
+  `AssistManager.onLockscreenShown()` fires it whenever the keyguard appears. `WakeChatSession`
+  overrides it as a no-op so the card keeps the geometry the first show laid out.
+
+The one intentional visual difference between the two states is the "Open LocalAssistant" pill at
+the card's bottom edge: clickable when unlocked (the notification's launch intent), ghosted —
+`dim(token, GHOST_SHARE)`, no click handler — when `KeyguardManager.isKeyguardLocked`. Launching an
+activity over a lock screen is deliberately not implemented; tool security on locked phones is a
+separate work item.
+
+Healthy-geometry log lines to compare across a locked and an unlocked run: `Locked …; stage at
+y=…, visible bottom …, overhang …, lift …` and the long `Shown …` geometry dump.

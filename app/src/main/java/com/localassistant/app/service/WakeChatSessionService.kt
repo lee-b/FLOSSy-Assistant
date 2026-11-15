@@ -223,7 +223,9 @@ private const val CARD_HEIGHT = 620
  * is allowed to show, so the last line of a reply is never cut off by the ceiling
  * itself - only by [REPLY_MAX_LINES].
  */
-private const val MAX_CARD_HEIGHT = 960
+private const val MAX_CARD_HEIGHT = 960 + 108
+// The ceiling grows by exactly the room the open-app affordance needs, so a full
+// reply never has a line cut by the ceiling itself - only by REPLY_MAX_LINES.
 
 /**
  * How much of the window the platform keeps for itself around the card.
@@ -372,6 +374,30 @@ private const val BUBBLE_GAP = 24
 private const val STATUS_DOT_GAP = 18
 
 /**
+ * The open-app affordance the card carries at its bottom edge.
+ *
+ * One row, one pill, one label: "Open LocalAssistant". On an unlocked screen the
+ * pill is clickable and launches the app - the same launch intent the persistent
+ * notification's content intent uses. On a locked screen the pill is drawn ghosted
+ * and takes no tap: launching an activity over a lock screen is exactly the
+ * security surface this app has chosen not to open yet, so the affordance only
+ * tells the user the tap would work once the phone is unlocked.
+ *
+ * The ghost is the card's own fade mechanism: a palette token dimmed to a fixed
+ * share of its ink (see [dim]), never an animation API.
+ */
+private const val OPEN_TEXT_SIZE = 17f
+private const val OPEN_PILL_PADDING = 18
+private const val OPEN_GAP = BUBBLE_GAP
+
+/**
+ * How much of its ink the affordance keeps when the screen is locked.
+ *
+ * A low share reads as present but inert, which is what a ghosted affordance is.
+ */
+private const val GHOST_SHARE = 0.30f
+
+/**
  * The main-axis orientation every container in the card is forced to.
  *
  * The one-argument [android.widget.LinearLayout] constructor does **not** stack
@@ -516,6 +542,26 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
     private var scale = 1f
 
     /**
+     * Whether the screen this show is drawn on is locked, read from the
+     * [android.app.KeyguardManager] on every show - a mid-exchange lock or unlock
+     * has to flip the affordance's ghost without a new session.
+     */
+    private var locked = false
+
+    /**
+     * How many pixels of the stage extend past the visible bottom of the display,
+     * less the margin the design already reserves.
+     *
+     * On an unlocked screen the window frame's bottom coincides with the nav bar,
+     * which the design's [BOTTOM_MARGIN] already clears, so this stays 0 and the
+     * card keeps the shipped geometry. On a locked screen the keyguard environment
+     * lays the window out to a frame whose bottom is lower than the visible bottom,
+     * so this carries the overhang and lifts the card back above the edge - the
+     * one correction that makes the locked card sit where the unlocked one does.
+     */
+    private var bottomLift = 0
+
+    /**
      * Whether the next show is still the one that measures the display.
      *
      * Only the first show of an exchange can do the measuring, and it gets one
@@ -559,6 +605,14 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
      * glyph could not be used.
      */
     private val phaseChip = LinearLayout(context)
+
+    /**
+     * The open-app affordance row, pill and label - see the OPEN_* constants for
+     * why the pill is a padding-sized widget like the chip and the foot.
+     */
+    private val openRow = LinearLayout(context)
+    private val openPill = LinearLayout(context)
+    private val openLabel = TextView(context)
     private val userBubble = LinearLayout(context)
     private val userLines = (0 until USER_MAX_LINES).map { _ -> TextView(context) }
     private val replyBubble = LinearLayout(context)
@@ -784,12 +838,19 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
     private fun metrics() {
         panel.setPadding(px(CARD_SIDE_PADDING), px(CARD_TOP_PADDING), px(CARD_SIDE_PADDING), px(CARD_BOTTOM_PADDING))
         ruler.setPadding(px(CARD_WIDTH) / 2, 0, px(CARD_WIDTH) / 2, 0)
-        foot.setPadding(0, px(BOTTOM_MARGIN), 0, 0)
+        foot.setPadding(0, px(BOTTOM_MARGIN) + bottomLift, 0, 0)
         card.setPadding(px(CARD_ELEVATION), px(CARD_ELEVATION), px(CARD_ELEVATION), px(CARD_ELEVATION))
         statusRow.setPadding(0, 0, 0, px(BUBBLE_GAP))
         phaseChip.setPadding(px(CHIP_SIZE / 2), px(CHIP_SIZE / 2), px(CHIP_SIZE / 2), px(CHIP_SIZE / 2))
         statusLine.setPadding(px(STATUS_DOT_GAP), 0, 0, 0)
         statusLine.textSize = pt(STATUS_SIZE)
+        openPill.setPadding(
+            px(OPEN_PILL_PADDING),
+            px(OPEN_PILL_PADDING),
+            px(OPEN_PILL_PADDING),
+            px(OPEN_PILL_PADDING)
+        )
+        openLabel.textSize = pt(OPEN_TEXT_SIZE)
         divider.setPadding(0, px(DIVIDER_HEIGHT / 2), 0, px(DIVIDER_HEIGHT / 2))
         userLines.forEach { line -> line.textSize = pt(USER_TEXT_SIZE) }
         replyLines.forEach { line -> line.textSize = pt(REPLY_TEXT_SIZE) }
@@ -871,6 +932,23 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
             line.setTextColor(GRUVBOX_PRIMARY)
         }
         replyBubble.addView(caret)
+        panel.addView(openRow)
+        openRow.setGravity(Gravity.RIGHT)
+        openRow.addView(openPill)
+        openPill.setOrientation(VERTICAL)
+        openPill.addView(openLabel)
+        openLabel.setGravity(Gravity.CENTER)
+        openLabel.setTextColor(GRUVBOX_ON_SURFACE)
+        // The affordance is wired once like every other child of the card; whether
+        // the tap works is re-read on every show in [paint] from the keyguard.
+        openPill.setOnClickListener {
+            if (locked) return@setOnClickListener
+            val intent =
+                context.packageManager.getLaunchIntentForPackage(context.packageName)
+                    ?: return@setOnClickListener
+            intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(intent)
+        }
         metrics()
         if (measuring) clearCard() else paint()
         return stage
@@ -887,6 +965,11 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
      * always says what it is doing even before a word has been heard.
      */
     private fun paint() {
+        // The affordance's ghost is re-read on every show, because a screen that
+        // locks or unlocks mid-exchange flips it without a new session.
+        locked =
+            (context.getSystemService(android.content.Context.KEYGUARD_SERVICE) as? android.app.KeyguardManager)
+                ?.isKeyguardLocked ?: false
         statusLine.text = ""
         userLines.forEach { line -> line.text = "" }
         replyLines.forEach { line -> line.text = "" }
@@ -912,6 +995,21 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
         caret.setPadding(0, caretPad, 0, caretPad)
         caret.background =
             if (state == SESSION_STATE_STREAMING && caretFrame % 2 == 0) caretShape else clearShape
+        val openPad = if (closed) 0 else px(OPEN_PILL_PADDING)
+        openPill.setPadding(openPad, openPad, openPad, openPad)
+        openRow.setPadding(0, if (closed) 0 else px(OPEN_GAP), 0, 0)
+        openPill.background =
+            if (closed) clearShape
+            else if (locked) rounded(dim(WAKE_USER_BUBBLE, GHOST_SHARE), pt(USER_RADIUS))
+            else userShape
+        openLabel.text = if (closed) "" else "Open LocalAssistant"
+        openLabel.setTextColor(
+            when {
+                closed -> TRANSPARENT
+                locked -> dim(GRUVBOX_ON_SURFACE, GHOST_SHARE)
+                else -> GRUVBOX_ON_SURFACE
+            }
+        )
         userShown.forEachIndexed { index, line ->
             if (index < userLines.size) userLines[index].text = line
         }
@@ -962,6 +1060,18 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
     }
 
     /**
+     * A palette token carrying a fixed share of its ink, whatever the climb is
+     * doing - the alpha-dimmed ghost the locked affordance wears.
+     *
+     * [ink] scales a token by the exchange's motion; [dim] scales it by a constant,
+     * which is why the affordance stays at the same ghost depth on every frame.
+     */
+    private fun dim(argb: Int, share: Float): Int {
+        val alpha = ((argb ushr 24) * share).toInt()
+        return (argb and 0x00FFFFFF) or (alpha shl 24)
+    }
+
+    /**
      * How tall the card has to be to hold the lines it is showing, padding
      * included and nothing clamped away.
      *
@@ -979,9 +1089,16 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
         val answer =
             if (replyLineCount == 0) 0
             else px(BUBBLE_PADDING) * 2 + replyLineCount * px(LINE_HEIGHT) + px(CARET_HEIGHT)
+        // The affordance is always on the card but never on a closed one - see the
+        // OPEN_* constants - and MAX_CARD_HEIGHT carries its room so a full reply
+        // is never cut by the ceiling itself.
+        val open =
+            if (state == SESSION_STATE_CLOSE) 0
+            else px(OPEN_PILL_PADDING) * 2 + px(STATUS_HEIGHT) + px(OPEN_GAP)
         // The rule measures to its own padding whatever it paints, so it always
         // costs the card this much room.
-        return px(CARD_TOP_PADDING) + px(CARD_BOTTOM_PADDING) + status + px(DIVIDER_HEIGHT) + user + answer
+        return px(CARD_TOP_PADDING) + px(CARD_BOTTOM_PADDING) + status + px(DIVIDER_HEIGHT) +
+            user + answer + open
     }
 
     /**
@@ -1103,6 +1220,25 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
      * measurement available to a session (see [BASE_SHORT_EDGE]). A card that
      * reads back nothing leaves the scale at 1, which is the shipped design.
      */
+    /**
+     * Keeps the card raised when the lock screen appears.
+     *
+     * The base implementation of this callback calls [hide], which un-raises the
+     * window the moment SystemUI says the keyguard is showing - so on a locked
+     * screen the card survives only through the wake loop's re-show churn and ends
+     * up drawn in the keyguard's frame instead of the one the unlocked first show
+     * laid out. Overriding it as a no-op is what lets the locked exchange keep
+     * the same geometry the unlocked one has; the card is already an assistant
+     * window above the keyguard, so nothing about the lock screen requires it to
+     * leave.
+     */
+    override fun onLockscreenShown() {
+        Log.i(
+            "WakeChatSessionService",
+            "The lock screen was shown over an open exchange; keeping the card raised"
+        )
+    }
+
     override fun onShow(args: android.os.Bundle?, showFlags: Int) {
         if (measuring) {
             measuring = false
@@ -1120,6 +1256,22 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
                 )
             }
         }
+        // How far the stage's bottom sits past the visible bottom of the display,
+        // less the margin the design already reserves - see [bottomLift].
+        val loc = IntArray(2)
+        stage.getLocationOnScreen(loc)
+        val frame = android.graphics.Rect()
+        stage.getWindowVisibleDisplayFrame(frame)
+        val overhang = (loc[1] + stage.height) - frame.bottom
+        val lift = (overhang - px(BOTTOM_MARGIN)).coerceAtLeast(0)
+        if (lift != bottomLift) {
+            bottomLift = lift
+            foot.setPadding(0, px(BOTTOM_MARGIN) + bottomLift, 0, 0)
+        }
+        Log.i(
+            "WakeChatSessionService",
+            "Locked $locked; stage at y=${loc[1]} h=${stage.height}, visible bottom ${frame.bottom}, overhang $overhang, lift $bottomLift"
+        )
         Log.i(
             "WakeChatSessionService",
             "Shown state=$state scale=$scale stageW=${stage.width} stageH=${stage.height} cardW=${card.width} cardH=${card.height} panelW=${panel.width} panelH=${panel.height} rowW=${statusRow.width} chipW=${phaseChip.width} chipH=${phaseChip.height} statusW=${statusLine.width} statusH=${statusLine.height} divH=${divider.height} u0W=${userLines[0].width} u0H=${userLines[0].height} u0T=${userLines[0].text.length} r0T=${replyLines[0].text.length} userBW=${userBubble.width} userBH=${userBubble.height} replyBW=${replyBubble.width} replyBH=${replyBubble.height} userRowW=${userRow.width} replyRowW=${replyRow.width}"
@@ -1172,6 +1324,8 @@ private class WakeChatSession(private val context: android.app.Service) : VoiceI
         measuring = true
         measuredShortEdge = 0
         scale = 1f
+        locked = false
+        bottomLift = 0
     }
 
     /**
