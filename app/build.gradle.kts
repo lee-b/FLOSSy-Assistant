@@ -5,7 +5,7 @@ plugins {
 }
 
 android {
-    namespace = "ai.flossyapp"
+    namespace = "ai.jarvislibre"
     
     // compileSdk 35 for Android 15.0 (API 35) compatibility
     // Unit tests run on a plain JVM without an Android device: Android
@@ -17,7 +17,7 @@ android {
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "ai.flossyapp"
+        applicationId = "ai.jarvislibre"
         minSdk = 35
         targetSdk = 35
         versionCode = 1

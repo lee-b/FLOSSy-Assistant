@@ -1,14 +1,14 @@
-# FLOSSy Assistant - On-Device AI Voice Assistant
+# Jarvis Libre - On-Device AI Voice Assistant
 
-<img src="docs/images/app-icon.webp" alt="FLOSSy Assistant logo" width="128" align="left" />
+<img src="docs/images/app-icon.webp" alt="Jarvis Libre logo" width="128" align="left" />
 
 A privacy-first, fully local AI voice assistant for Android that connects to your own running
 services. No cloud dependencies, no telemetry, no data leaves your device.
 
-## Differences from upstream (smoluu/LocalAssistant - hard-forked as FLOSSy Assistant)
+## Differences from upstream (smoluu/LocalAssistant - hard-forked as Jarvis Libre)
 
-FLOSSy Assistant is a hard fork of [smoluu/LocalAssistant](https://github.com/smoluu/LocalAssistant):
-same project, different package and application id (`ai.flossyapp`), renamed because the voice
+Jarvis Libre is a hard fork of [smoluu/LocalAssistant](https://github.com/smoluu/LocalAssistant):
+same project, different package and application id (`ai.jarvislibre`), renamed because the voice
 pipeline has diverged too far for a soft fork to claim. The changes, mostly around making voice
 mode genuinely hands-free and resilient:
 
@@ -141,7 +141,7 @@ mode genuinely hands-free and resilient:
 - Microphone access
 - Network access to your local AI services
 - **To use the hands-free overlay**, the platform must host hands-free conversations: open the
-  system's "Default digital assistant" page and select FLOSSy Assistant. Without that selection the
+  system's "Default digital assistant" page and select Jarvis Libre. Without that selection the
   app still runs its own pipeline, but the system refuses to draw the card outside the app.
 
 ### Local AI Services
@@ -190,7 +190,7 @@ curl -X POST http://192.168.1.100:8087/v1/audio/speech \
 
 ### 1. Clone and Build
 ```bash
-cd /path/to/FLOSSyAssistant
+cd /path/to/JarvisLibre
 ./gradlew assembleDebug
 ```
 
@@ -242,7 +242,7 @@ Configure all aspects of the assistant:
 ### Debugging From adb
 Trigger an exchange without going through the menus or saying the phrase:
 ```bash
-adb shell "am start -W -a ai.flossyapp.TRIGGER_WAKE_CHAT ai.flossyapp/.ui.MainActivity"
+adb shell "am start -W -a ai.jarvislibre.TRIGGER_WAKE_CHAT ai.jarvislibre/.ui.MainActivity"
 ```
 The service logs its own phase, so `adb logcat` filtered on the class name is the running trace:
 ```bash
@@ -260,15 +260,15 @@ like when a wake word refuses to fire.
 
 ```
 app/
-├── src/main/java/ai/flossyapp/
-│   ├── FlossyApplication.kt            # Application class
+├── src/main/java/ai/jarvislibre/
+│   ├── JarvisApplication.kt            # Application class
 │   ├── domain/
 │   │   └── model/                      # Data models
 │   │       ├── ChatMessage.kt          # Message entity
 │   │       └── AppSettings.kt          # Settings data class
 │   ├── data/
 │   │   ├── local/                      # Room database
-│   │   │   ├── FlossyDatabase.kt
+│   │   │   ├── JarvisDatabase.kt
 │   │   │   └── ChatMessageDao.kt
 │   │   ├── remote/                     # API clients
 │   │   │   └── ApiClient.kt            # HTTP client for LLM/STT/TTS
@@ -332,7 +332,7 @@ app/
 
 ### The Card Only Renders Inside the App
 The session window is drawn by the platform, so the app has to hold the assistant role. Open the
-system's "Default digital assistant" page and select FLOSSy Assistant, then start the service again -
+system's "Default digital assistant" page and select Jarvis Libre, then start the service again -
 `adb install` force-stops the running process. The service logs
 `onReady: the system has bound this app as its voice interaction service` once the platform has
 really bound it; if that line never appears, the selection is the problem, not the code.
