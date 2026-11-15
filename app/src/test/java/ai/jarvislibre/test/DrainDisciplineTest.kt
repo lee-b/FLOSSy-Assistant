@@ -78,4 +78,34 @@ class DrainDisciplineTest {
             System.currentTimeMillis() - startedAt < 1_000
         )
     }
+
+    @Test
+    fun anAbortRaisedMidDrainCutsTheWaitAtOnce() {
+        // The hang-up landed after the reply was fully written: the drain was
+        // already polling the head when the abort fired. The poll must break
+        // immediately instead of playing the buffered tail out - playing it
+        // out is what leaked one session's reply into the next one's opening.
+        val aborted = java.util.concurrent.atomic.AtomicBoolean(false)
+        val totalFrames = 100_000L
+        var stopCalls = 0
+        val startedAt = System.currentTimeMillis()
+        // The abort arrives one poll (~20ms) into the drain.
+        java.util.concurrent.Executors.newSingleThreadExecutor().submit {
+            Thread.sleep(40)
+            aborted.set(true)
+        }.get()
+        val observed = playOutUntilHead(
+            head = { if (aborted.get()) 0L else 2_000L },
+            totalFrames = totalFrames,
+            rate = 24_000,
+            onDone = { stopCalls++ },
+            aborted = { aborted.get() }
+        )
+        assertEquals(1, stopCalls)
+        assertTrue(
+            "an aborted drain must cut now, not play the tail out " +
+                "(${System.currentTimeMillis() - startedAt}ms)",
+            System.currentTimeMillis() - startedAt < 1_000
+        )
+    }
 }

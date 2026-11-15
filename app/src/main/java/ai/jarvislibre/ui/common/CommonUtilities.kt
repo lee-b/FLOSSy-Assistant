@@ -820,12 +820,26 @@ class ReplyAudioPlayer(
         val t = track ?: return
         val written = totalFrames
         val rateNow = rate
+        // An abort raised between the last write and this drain (the hang-up
+        // landed while the reply was already fully written to the ring) must
+        // silence the speaker immediately - playing the buffered tail out is
+        // what leaked one session's reply into the next one's opening.
+        if (abortSignal?.get() == true) {
+            cutNow()
+            android.util.Log.d("TTS", "Reply drain aborted; speaker cut now")
+            return
+        }
         var head = 0L
         try {
             // The head is polled while the track is still playing: streaming
             // stop() resets it to zero, so stopping first would make the poll
             // read 0 forever and cut the reply's tail (see playOutThenStop).
-            head = playOutThenStop(t, written, rateNow)
+            // The abort check rides the poll, so a hang-up mid-drain cuts too.
+            head = playOutThenStop(t, written, rateNow, aborted = { abortSignal?.get() == true })
+            if (abortSignal?.get() == true) {
+                // The poll broke early on the abort: flush whatever is left.
+                try { t.pause(); t.flush() } catch (_: Exception) {}
+            }
         } catch (e: Exception) {
             android.util.Log.w("TTS", "Drain failed: ${e.message}")
         }
@@ -884,12 +898,18 @@ class ReplyAudioPlayer(
  * @param rate sample rate in Hz, for the duration-scaled deadline.
  * @return the head position observed while the track was still playing.
  */
-internal fun playOutThenStop(track: android.media.AudioTrack, totalFrames: Long, rate: Int): Long {
+internal fun playOutThenStop(
+    track: android.media.AudioTrack,
+    totalFrames: Long,
+    rate: Int,
+    aborted: () -> Boolean = { false }
+): Long {
     val head = playOutUntilHead(
         head = { track.playbackHeadPosition.toLong() },
         totalFrames = totalFrames,
         rate = rate,
-        onDone = { try { track.stop() } catch (_: Exception) {} }
+        onDone = { try { track.stop() } catch (_: Exception) {} },
+        aborted = aborted
     )
     return head
 }
@@ -905,7 +925,8 @@ internal fun playOutUntilHead(
     totalFrames: Long,
     rate: Int,
     onDone: () -> Unit,
-    stallLimitMs: Long = 2500L
+    stallLimitMs: Long = 2500L,
+    aborted: () -> Boolean = { false }
 ): Long {
     val drainMs = if (rate > 0) totalFrames * 1000L / rate + 500 else 500L
     val deadline = System.currentTimeMillis() + drainMs
@@ -913,6 +934,10 @@ internal fun playOutUntilHead(
     var stalledFor = 0L
     var observed = 0L
     while (System.currentTimeMillis() < deadline) {
+        // An abort raised while the tail is draining (the hang-up landed after
+        // the last write) must cut the sound now, not let the buffered reply
+        // play into the next session.
+        if (aborted()) break
         observed = head()
         if (observed >= totalFrames) break
         if (observed == lastHead) {
